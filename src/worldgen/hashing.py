@@ -64,6 +64,54 @@ def unit_hash(*parts: Any) -> float:
     return stable_u64(*parts) / 2.0**64
 
 
+# --------------------------------------------------------------------------------------
+# portable counter-based hash (vectorised; specified in docs/vegetation.md)
+
+_U64_MASK = 0xFFFFFFFFFFFFFFFF
+_GOLDEN = np.uint64(0x9E3779B97F4A7C15)
+_MIX1 = np.uint64(0xBF58476D1CE4E5B9)
+_MIX2 = np.uint64(0x94D049BB133111EB)
+
+
+def _as_u64(word: Any) -> np.ndarray:
+    """An integer word (scalar or array) as uint64, two's complement for negative values."""
+    if isinstance(word, (int, np.integer)) and not isinstance(word, np.ndarray):
+        return np.array([int(word) & _U64_MASK], dtype=np.uint64)
+    a = np.asarray(word)
+    if a.dtype == np.uint64:
+        return a
+    if a.dtype.kind in "iub":
+        return a.astype(np.int64).astype(np.uint64)
+    raise TypeError(f"hash words must be integers, got {a.dtype}")
+
+
+def hash_u64(*words: Any) -> np.ndarray:
+    """Portable 64-bit hash of integer words (scalars or arrays, broadcast together).
+
+    ``h = 0; for w in words: h = mix64((h XOR w) + 0x9E3779B97F4A7C15)``, all modulo 2**64,
+    with ``mix64`` the splitmix64 finaliser (xor-shift 30, * 0xBF58476D1CE4E5B9, xor-shift 27,
+    * 0x94D049BB133111EB, xor-shift 31) and words taken as two's-complement 64-bit integers.
+    Unlike ``stable_u64`` it is cheap per element and simple to reproduce in other languages
+    (the viewer's runtime generators use the same function). Returns a uint64 array (shape
+    (1,) when every word is a scalar).
+    """
+    arrays = [_as_u64(w) for w in words]
+    h = np.zeros(np.broadcast_shapes(*(a.shape for a in arrays)), dtype=np.uint64)
+    for a in arrays:
+        h = (h ^ a) + _GOLDEN
+        h ^= h >> np.uint64(30)
+        h *= _MIX1
+        h ^= h >> np.uint64(27)
+        h *= _MIX2
+        h ^= h >> np.uint64(31)
+    return h
+
+
+def hash_unit(*words: Any) -> np.ndarray:
+    """``hash_u64`` mapped to [0, 1): the top 53 bits divided by 2**53."""
+    return (hash_u64(*words) >> np.uint64(11)).astype(np.float64) * (1.0 / float(1 << 53))
+
+
 def round_floats(obj: Any, ndigits: int = 6) -> Any:
     """Round floats recursively so tiny numeric noise does not change hashes."""
     if isinstance(obj, float):

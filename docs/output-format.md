@@ -5,6 +5,15 @@ consumer of a compiled world: the bundled viewer, engine adapters and external
 tools. All JSON documents carry a `schema` name and a semantic `schema_version`;
 consumers must reject major versions they do not understand.
 
+Version history (minor versions keep the layout; consumers of 1.0 read 1.x):
+
+* **1.1.0** — procedural vegetation draws its random numbers from a counter-based
+  hash (`docs/vegetation.md`, *Random numbers*): for the same seed, generated tree
+  and ground-cover positions, ids and seeds differ from 1.0.0 (same statistics);
+  canopy-height noise is world-space. `world.glb` is written only up to
+  `export.combined_glb_max_tiles` tiles.
+* **1.0.0** — initial format.
+
 ## Directory layout
 
 ```text
@@ -55,7 +64,7 @@ covers local `x ∈ [i·T, (i+1)·T)`, `y ∈ [j·T, (j+1)·T)` where `T` is the
 
 ```jsonc
 {
-  "schema": "worldgen.manifest", "schema_version": "1.0.0",
+  "schema": "worldgen.manifest", "schema_version": "1.1.0",
   "compiler": {"name": "worldgen", "version": "0.1.0"},
   "build": {"created_utc": "...", "duration_s": 12.3},          // not deterministic
   "region": {"center": {"lat": 25.033, "lon": 121.5654}, "radius_m": 1000,
@@ -96,7 +105,7 @@ listed in `outputs`.
 
 ```jsonc
 {
-  "schema": "worldgen.tile_index", "schema_version": "1.0.0",
+  "schema": "worldgen.tile_index", "schema_version": "1.1.0",
   "tile_size": 256,
   "ortho": {                                    // null when no imagery was baked
     "format": "image/jpeg", "pixels": 32,       // every ortho image is pixels x pixels
@@ -194,7 +203,7 @@ service, licence, attribution, resolution) is the `imagery` entry of
 
 ```jsonc
 {
-  "schema": "worldgen.tile_meta", "schema_version": "1.0.0",
+  "schema": "worldgen.tile_meta", "schema_version": "1.1.0",
   "tile": "0_0",
   "entities": {
     "building:osm:way/123": {
@@ -220,7 +229,7 @@ appears only in `inferred` is an estimate, a key in `missing` is unknown.
 
 ```jsonc
 {
-  "schema": "worldgen.road_graph", "schema_version": "1.0.0",
+  "schema": "worldgen.road_graph", "schema_version": "1.1.0",
   "origin": {"lat": .., "lon": .., "height": 0}, "crs": {"local": "+proj=..."},
   "nodes": [{"id": "n:osm:123", "osm_id": 123, "kind": "intersection",   // intersection|dead_end|
              "x": 1.0, "y": 2.0, "z": 3.0, "lon": .., "lat": .., "degree": 3}],  // connector|boundary
@@ -258,7 +267,7 @@ carry their densified deck profile in `geometry`.
 
 ```jsonc
 {
-  "schema": "worldgen.diagnostics", "schema_version": "1.0.0",
+  "schema": "worldgen.diagnostics", "schema_version": "1.1.0",
   "summary": {"errors": 0, "warnings": 3, "info": 10,
               "checks": {"road_graph_connectivity": {"status": "pass", "issues": 0}}},
   "issues": [{"id": "false_intersection:0007", "check": "false_intersection",
@@ -272,7 +281,7 @@ carry their densified deck profile in `geometry`.
 ## terrain/heightfield.json
 
 ```jsonc
-{"schema": "worldgen.heightfield", "schema_version": "1.0.0",
+{"schema": "worldgen.heightfield", "schema_version": "1.1.0",
  "xmin": -1024, "ymin": -1024, "resolution": 4.0, "cols": 513, "rows": 513,
  "dtype": "float32", "byte_order": "little", "row_order": "south_to_north",
  "vertical_datum": "EGM2008", "units": "m", "file": "heightfield.f32",

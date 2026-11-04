@@ -42,8 +42,9 @@ Categories: `dense_forest`, `sparse_woodland`, `shrubland`, `grassland`,
   wins where both have data; cells where both agree are attributed to both.
 * Water areas are never vegetated.
 * Canopy height comes from the CHM where available (`canopy_observed`), else
-  from the category default modulated by smooth deterministic noise and is
-  then inferred. Measured canopy below 2 m in a tree category cuts coverage.
+  from the category default modulated by ±20 % of smooth world-space value
+  noise (100 m wavelength, the same at a position whatever region is built) and
+  is then inferred. Measured canopy below 2 m in a tree category cuts coverage.
 
 ### Smoothing (`landcover/smoothing.py`)
 
@@ -64,8 +65,11 @@ regions keep the minimum area `2 × vegetation.resolution²`.
 
 Deterministic and tile-independent:
 
-1. Sampling cells of `vegetation.cell_size` metres on a global lattice; each
-   cell's random stream is seeded only by `(seed, i, j)`.
+1. Sampling cells of `vegetation.cell_size` metres on a global lattice. A
+   cell's candidate count and every candidate's uniforms are counter-based
+   hashes of `(seed, salt, i, j[, k, column])` (see *Random numbers* below), so
+   all cells are generated at once with array arithmetic and any window of the
+   world yields the same candidates.
 2. Target stem density from coverage and crown radius (allometry from canopy
    height), converted to the candidate intensity of a **Matérn type-II
    hard-core process** (`λ0 = −ln(1 − λπδ²)/(πδ²)`), with the hard-core
@@ -87,6 +91,35 @@ Mapped OSM trees keep their exact position and tagged attributes and are
 mapped tree rows are placed at `tree_row_spacing` and marked inferred
 (`position`). Shrubs and grass clusters come from a separate per-cell process
 capped by `ground_cover.max_instances`.
+
+### Random numbers
+
+Every random value of placement is a counter-based hash, so it depends only on
+its own key and is cheap to evaluate for millions of candidates at once (and to
+reproduce in other languages: the viewer's runtime generators use the same
+function):
+
+```text
+hash_u64(w0, w1, …): h = 0; for each word w: h = mix64((h XOR w) + 0x9E3779B97F4A7C15)
+mix64(h):  h ^= h >> 30; h *= 0xBF58476D1CE4E5B9; h ^= h >> 27; h *= 0x94D049BB133111EB; h ^= h >> 31
+hash_unit(…) = (hash_u64(…) >> 11) / 2^53        ∈ [0, 1)
+```
+
+All arithmetic is modulo 2⁶⁴; words are two's-complement 64-bit integers.
+Test vectors: `hash_u64(0) = 0xE220A8397B1DCDAF`,
+`hash_u64(1337, 2, −3, 5, 7, 6) = 0x90C054CD94FB42C3`
+(`src/worldgen/hashing.py`, `tests/unit/test_vegetation_vectorised.py`).
+
+| value | key |
+|---|---|
+| candidates in sampling cell `(i, j)` | Poisson inverse CDF of `hash_unit(seed, 1, i, j)` |
+| uniforms of tree candidate `k` (columns 0–6: x, y, thinning, height, archetype, mark, yaw) | `hash_unit(seed, 2, i, j, k, column)` |
+| published per-tree `seed` | `hash_u64(seed, 3, i, j, k) & 0x7FFFFFFFFFFFFFFF` |
+| ground cover (count, uniforms 0–4: x, y, thinning, height, yaw, seed) | salts 4, 5, 6 likewise |
+| tree instance budget | `hash_unit(seed, 7, tree seed)` |
+
+Tree ids stay `tree:gen:{i}_{j}_{k}` (ground cover `…_g{k}`); `k` is the
+candidate's index in its cell before thinning.
 
 ### Terrain integration
 

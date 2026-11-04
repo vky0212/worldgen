@@ -18,7 +18,7 @@ from rasterio import features as rfeatures
 from scipy import ndimage
 
 from worldgen.config import VegetationConfig
-from worldgen.hashing import rng_for
+from worldgen.noise import value_noise
 from worldgen.spatial.raster import GeoRaster, rasterize_window
 from worldgen.spatial.region import Region
 from worldgen.world.model import LandcoverArea, Waterbody
@@ -83,13 +83,8 @@ def _rasterize(grid_shape: tuple[int, int], transform: Affine, geoms: list, valu
                                fill=0, dtype="uint8").astype(bool)
 
 
-def _value_noise(shape: tuple[int, int], seed: int, scale_cells: float) -> np.ndarray:
-    """Smooth deterministic noise in [-1, 1] (stable for a given world and seed)."""
-    rng = rng_for("canopy-noise", seed, shape)
-    n = rng.standard_normal(shape)
-    n = ndimage.gaussian_filter(n, sigma=max(scale_cells, 0.5), mode="wrap")
-    s = np.std(n)
-    return np.clip(n / (s * 2.5 if s > 0 else 1.0), -1.0, 1.0)
+# Feature size of the canopy-height variation where no canopy-height raster covers a cell.
+CANOPY_NOISE_WAVELENGTH_M = 100.0
 
 
 def classify_vegetation(
@@ -190,7 +185,8 @@ def classify_vegetation(
             sel = category == CAT[name]
             default_h[sel] = cc.canopy_height
             default_cov[sel] = cc.coverage
-    noise = _value_noise(shape, cfg.seed, scale_cells=40.0 / res)
+    # World-space noise: the same at a position whatever region or window is classified.
+    noise = value_noise(gx, gy, CANOPY_NOISE_WAVELENGTH_M, cfg.seed * 7919 + 17)
     est_h = default_h * (1.0 + 0.2 * noise)
     canopy_h = est_h.astype(np.float32)
     observed = np.zeros(shape, dtype=bool)
