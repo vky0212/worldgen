@@ -109,9 +109,19 @@ class Heightfield:
 
     def vertex_normals(self) -> np.ndarray:
         """Central-difference normals at every node, (rows, cols, 3)."""
-        gy, gx = np.gradient(self.z, self.resolution)
-        n = np.dstack([-gx, -gy, np.ones_like(self.z)])
-        return n / np.linalg.norm(n, axis=2, keepdims=True)
+        return _normals(self.z, self.resolution)
+
+    def normals_window(self, r0: int, r1: int, c0: int, c1: int) -> np.ndarray:
+        """``vertex_normals()[r0:r1 + 1, c0:c1 + 1]`` from a window with a one-node margin.
+
+        Central differences only reach one node, and the window is clipped exactly where the
+        grid ends (one-sided differences there, as in the whole grid), so the values are
+        identical while the cost follows the window instead of the whole grid.
+        """
+        wr0, wr1 = max(r0 - 1, 0), min(r1 + 1, self.rows - 1)
+        wc0, wc1 = max(c0 - 1, 0), min(c1 + 1, self.cols - 1)
+        n = _normals(self.z[wr0:wr1 + 1, wc0:wc1 + 1], self.resolution)
+        return n[r0 - wr0:r1 - wr0 + 1, c0 - wc0:c1 - wc0 + 1]
 
     # -- meshing -------------------------------------------------------------------------
     def tile_mesh(self, x0: float, y0: float, x1: float, y1: float, stride: int = 1,
@@ -140,8 +150,10 @@ class Heightfield:
         ys = self.ymin + rr * r
         zs = self.z[rr, cc]
         pos = np.column_stack([xs.ravel(), ys.ravel(), zs.ravel()])
-        nrm = normals if normals is not None else self.vertex_normals()
-        nor = nrm[rr, cc].reshape(-1, 3)
+        if normals is not None:
+            nor = normals[rr, cc].reshape(-1, 3)
+        else:
+            nor = self.normals_window(r0, r1, c0, c1)[rr - r0, cc - c0].reshape(-1, 3)
         k = (np.arange(nr - 1)[:, None] * nc + np.arange(nc - 1)[None, :]).ravel()
         v00, v10, v01, v11 = k, k + 1, k + nc, k + nc + 1
         tri = np.concatenate([np.column_stack([v00, v10, v11]), np.column_stack([v00, v11, v01])])
@@ -150,6 +162,13 @@ class Heightfield:
         if colors is not None:
             col = colors[rr, cc].reshape(-1, colors.shape[-1])
         return Mesh(pos, tri.astype(np.int64), normals=nor, uvs=uvs, colors=col)
+
+
+def _normals(z: np.ndarray, resolution: float) -> np.ndarray:
+    """Central-difference unit normals (one-sided at the array border), (rows, cols, 3)."""
+    gy, gx = np.gradient(z, resolution)
+    n = np.dstack([-gx, -gy, np.ones_like(z)])
+    return n / np.linalg.norm(n, axis=2, keepdims=True)
 
 
 def fill_nodata(z: np.ndarray, valid: np.ndarray, default: float = 0.0) -> np.ndarray:

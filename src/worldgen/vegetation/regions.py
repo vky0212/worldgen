@@ -12,6 +12,7 @@ from shapely.geometry import shape as shapely_shape
 from worldgen.config import VegetationConfig
 from worldgen.geometry.mesh import Mesh, merge_meshes
 from worldgen.geometry.shapes import cone, cylinder, icosphere, line_strip_mesh, polygons_of
+from worldgen.spatial.raster import rasterize_window
 from worldgen.terrain.heightfield import Heightfield
 from worldgen.tiling.grid import Piece, TileGrid
 from worldgen.vegetation.classify import CAT, CATEGORIES, SOURCE_NAMES, VegetationGrid
@@ -35,13 +36,17 @@ def extract_regions(grid: VegetationGrid, landcover: list[LandcoverArea], cfg: V
     for name, g in polys:
         k = counters.get(name, 0)
         counters[name] = k + 1
-        mask = rfeatures.rasterize([(g, 1)], out_shape=grid.shape, transform=grid.transform(), fill=0,
-                                   dtype="uint8").astype(bool) & (grid.category == CAT[name])
+        # Statistics over the region's own window: a full-grid mask per region costs regions x cells.
+        hit = rasterize_window(g, grid.shape, grid.transform())
+        if hit is None:
+            continue
+        win, mask = hit
+        mask &= grid.category[win] == CAT[name]
         if not mask.any():
             continue
-        h = grid.canopy_height[mask]
-        cov = grid.coverage[mask]
-        src = grid.source[mask]
+        h = grid.canopy_height[win][mask]
+        cov = grid.coverage[win][mask]
+        src = grid.source[win][mask]
         props = {
             "category": name,
             "area_m2": round(float(g.area), 1),
@@ -54,17 +59,17 @@ def extract_regions(grid: VegetationGrid, landcover: list[LandcoverArea], cfg: V
         }
         rc = max(0.8, 0.32 * max(props["canopy_height_mean"], 3.0) ** 0.85)
         props["density_stems_per_ha"] = round(props["coverage_fraction"] / (math.pi * rc * rc) * 1e4, 1)
-        canopy_obs = float(np.mean(grid.canopy_observed[mask]))
+        canopy_obs = float(np.mean(grid.canopy_observed[win][mask]))
         props["canopy_height_observed_fraction"] = round(canopy_obs, 3)
         weights = dict(cfg.categories[name].archetypes) if name in cfg.categories else {}
-        lt = grid.leaf_type[mask]
+        lt = grid.leaf_type[win][mask]
         if (lt == 2).mean() > 0.5:
             weights = {"conifer": 0.9, "broadleaf": 0.1}
         elif (lt == 1).mean() > 0.5:
             weights = {"broadleaf": 0.95, "conifer": 0.05}
         reg = VegetationRegion(id=f"vegetation:{name}:{k}", geometry=g, properties=props,
                                source="derived", source_id="+".join(sorted(props["sources"])),
-                               confidence=round(float(np.mean(grid.confidence[mask])), 3))
+                               confidence=round(float(np.mean(grid.confidence[win][mask])), 3))
         reg.infer("archetype_distribution", weights, "category_defaults" if not (lt > 0).any() else "osm_leaf_type", 0.4)
         reg.mark_missing("species_distribution")
         if canopy_obs < 0.5:

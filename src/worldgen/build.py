@@ -22,11 +22,14 @@ from worldgen.export.ortho import ortho_baker
 from worldgen.export.tiles import (
     LAYER_ORDER,
     NO_TREES,
+    PieceSelector,
     archetypes_for,
     build_tile_assets,
     entity_strtree,
     generate_pieces,
-    terrain_render_inputs,
+    terrain_vertex_colors,
+    tile_blocks,
+    tile_config_hash,
     tile_input_hash,
     trees_by_tile,
     world_tiles,
@@ -48,6 +51,9 @@ from worldgen.vegetation.regions import environmental_fields
 from worldgen.world.world import CanonicalWorld
 
 log = get_logger("build")
+
+# Dirty tiles are exported in square blocks of this many tiles per side.
+EXPORT_BLOCK_TILES = 8
 
 
 @dataclass
@@ -140,7 +146,8 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
     # World-level indexes, built once: per-tile lookups must not scan every tree or entity.
     etree = entity_strtree(world)
     tindex = trees_by_tile(world)
-    hashes = {t: tile_input_hash(world, t, etree, tindex) for t in tiles}
+    chash = tile_config_hash(cfg)
+    hashes = {t: tile_input_hash(world, t, etree, tindex, chash) for t in tiles}
     baker = ortho_baker(world)
     dirty = []
     for t in tiles:
@@ -162,31 +169,39 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
     total_steps = len(dirty)
     progress.step("export", 0, total_steps, "generating geometry")
 
-    pieces = generate_pieces(world, set(dirty)) if dirty else {}
-    normals, rgba = terrain_render_inputs(world)
+    # Dirty tiles are generated and written block by block, so the mesh pieces held in memory
+    # cover one block instead of the whole world; the selector hands each block only the
+    # entities that can own pieces in it.
+    selector = PieceSelector(world) if dirty else None
+    rgba = terrain_vertex_colors(world)
     arche = archetypes_for(world)
     eindex = world.entity_index()
+    built: dict[str, dict[str, Any]] = {}
+    for block in tile_blocks(dirty, EXPORT_BLOCK_TILES):
+        pieces = generate_pieces(world, set(block), selector)
+        for t in block:
+            progress.tile(t, "building")
+            assets = build_tile_assets(world, t, pieces.pop(t, []), None, rgba, arche,
+                                       trees_in_tile=tindex.get(t, NO_TREES), entity_index=eindex)
+            (out / "tiles" / f"{t}.glb").write_bytes(assets["glb"])
+            col = out / "tiles" / f"{t}.collision.glb"
+            if assets["collision"] is not None:
+                col.write_bytes(assets["collision"])
+            elif col.exists():
+                col.unlink()
+            _write_json(out / "tiles" / f"{t}.meta.json", assets["meta"])
+            ortho = out / "tiles" / f"{t}.ortho.jpg"
+            if baker is not None:
+                ortho.write_bytes(baker.bake(grid.bounds(t)))
+            elif ortho.exists():
+                ortho.unlink()
+            built[t] = {"hash": hashes[t], "counts": assets["counts"], "zrange": assets["zrange"],
+                        "collision": assets["collision"] is not None, "ortho": baker is not None}
+            progress.tile(t, "built")
+            progress.step("export", len(built), total_steps, f"tile {t}")
     tile_state = dict(prev_tiles)
-    for k, t in enumerate(dirty):
-        progress.tile(t, "building")
-        assets = build_tile_assets(world, t, pieces.get(t, []), normals, rgba, arche,
-                                   trees_in_tile=tindex.get(t, NO_TREES), entity_index=eindex)
-        (out / "tiles" / f"{t}.glb").write_bytes(assets["glb"])
-        col = out / "tiles" / f"{t}.collision.glb"
-        if assets["collision"] is not None:
-            col.write_bytes(assets["collision"])
-        elif col.exists():
-            col.unlink()
-        _write_json(out / "tiles" / f"{t}.meta.json", assets["meta"])
-        ortho = out / "tiles" / f"{t}.ortho.jpg"
-        if baker is not None:
-            ortho.write_bytes(baker.bake(grid.bounds(t)))
-        elif ortho.exists():
-            ortho.unlink()
-        tile_state[t] = {"hash": hashes[t], "counts": assets["counts"], "zrange": assets["zrange"],
-                         "collision": assets["collision"] is not None, "ortho": baker is not None}
-        progress.tile(t, "built")
-        progress.step("export", k + 1, total_steps, f"tile {t}")
+    for t in dirty:  # in tile order, as build_state.json has always been written
+        tile_state[t] = built[t]
     for t in list(tile_state):
         if t not in tiles:
             tile_state.pop(t)
@@ -209,10 +224,17 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
     _write_json(out / "tiles" / "index.json", index, indent=1)
     _write_json(state_path, {"world_key": _world_key(world), "tiles": tile_state}, indent=1)
 
-    if cfg.export.combined_glb:
+    combined = out / "world.glb"
+    if _combined_glb_wanted(cfg, len(tiles)):
         files = [(out / "tiles" / f"{t}.glb").read_bytes() for t in tiles if (out / "tiles" / f"{t}.glb").is_file()]
         if files:
-            (out / "world.glb").write_bytes(merge_glbs(files, "world", {"origin": _origin(world)}))
+            combined.write_bytes(merge_glbs(files, "world", {"origin": _origin(world)}))
+    else:
+        if cfg.export.combined_glb:
+            log.info("world.glb not written: %d tiles exceed export.combined_glb_max_tiles=%d",
+                     len(tiles), cfg.export.combined_glb_max_tiles)
+        if combined.exists():
+            combined.unlink()  # a world.glb from an earlier build no longer matches the tiles
 
     _write_json(out / "graph" / "road_graph.json", world.graph.to_dict(world.region.frame, _origin(world)))
     if cfg.export.geoparquet:
@@ -224,6 +246,11 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
     _write_json(out / "diagnostics.json", report.to_dict(world), indent=1)
     (out / "ATTRIBUTION.txt").write_text(attribution_text(world), encoding="utf-8")
     return dirty, skipped
+
+
+def _combined_glb_wanted(cfg: WorldConfig, n_tiles: int) -> bool:
+    limit = cfg.export.combined_glb_max_tiles
+    return cfg.export.combined_glb and (limit <= 0 or n_tiles <= limit)
 
 
 def plan_payload(region: Region, cfg: WorldConfig) -> dict[str, Any]:
@@ -363,7 +390,7 @@ def write_manifest(world: CanonicalWorld, report: Report, opts: BuildOptions, du
         "validation": {"errors": summary["errors"], "warnings": summary["warnings"], "info": summary["info"],
                        "report": "diagnostics.json"},
         "files": {"graph": "graph/road_graph.json", "diagnostics": "diagnostics.json",
-                  "combined_glb": "world.glb" if cfg.export.combined_glb else None,
+                  "combined_glb": "world.glb" if (out / "world.glb").is_file() else None,
                   "heightfield": "terrain/heightfield.json", "fields": "fields/fields.json",
                   "vectors": "vectors/", "attribution": "ATTRIBUTION.txt"},
     }

@@ -424,6 +424,9 @@ class SmoothingConfig:
 @dataclass
 class ExportConfig:
     combined_glb: bool = True
+    # world.glb (every tile in one file) is only written up to this many tiles (0: no limit).
+    # Large worlds are streamed tile by tile, and GLB files cannot exceed 4 GiB.
+    combined_glb_max_tiles: int = 400
     geoparquet: bool = True
     collision: bool = True
     heightfield: bool = True
@@ -461,8 +464,12 @@ class WorldConfig:
     def hash(self) -> str:
         return sha256_json(self.to_dict())
 
-    def section_hash(self, *names: str) -> str:
+    def section_hash(self, *names: str, exclude: dict[str, tuple[str, ...]] | None = None) -> str:
+        """Hash of the named sections; ``exclude`` drops keys of a section (section -> keys)."""
         data = self.to_dict()
+        for section, keys in (exclude or {}).items():
+            for k in keys:
+                data[section].pop(k, None)
         return sha256_json({n: data[n] for n in names})
 
     def validate(self) -> None:

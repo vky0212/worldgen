@@ -6,7 +6,7 @@ import numpy as np
 
 from worldgen.spatial.raster import GeoRaster
 from worldgen.spatial.region import Region
-from worldgen.terrain.build import rasterize_mask
+from worldgen.terrain.build import node_mask_window, rasterize_mask
 from worldgen.terrain.heightfield import Heightfield
 from worldgen.world.model import LandcoverArea, Waterbody
 
@@ -46,7 +46,10 @@ def classify_terrain(hf: Heightfield, region: Region, worldcover: GeoRaster | No
         code = OSM_CLASS_TO_CODE.get(str(lc.properties.get("class")))
         if code is None:
             continue
-        codes[rasterize_mask(hf, [lc.geometry])] = code
+        hit = node_mask_window(hf, lc.geometry)
+        if hit is not None:
+            win, m = hit
+            codes[win][m] = code
     areas = [w.geometry for w in water if w.is_area]
     if areas:
         codes[rasterize_mask(hf, areas)] = 7

@@ -11,6 +11,9 @@ from typing import Any
 
 from worldgen.export.gltf import read_glb_json
 
+# GLB stores the file and chunk lengths as uint32.
+GLB_MAX_BYTES = 2**32 - 1
+
 
 def _split(data: bytes) -> tuple[dict[str, Any], bytes]:
     doc = read_glb_json(data)
@@ -100,5 +103,9 @@ def merge_glbs(files: list[bytes], root_name: str = "world", extras: dict[str, A
     js = json.dumps(out, separators=(",", ":")).encode("utf-8")
     while len(js) % 4:
         js += b" "
+    total = 12 + 8 + len(js) + 8 + len(blob)
+    if total > GLB_MAX_BYTES:
+        raise ValueError(f"combined GLB would be {total / 2**30:.2f} GiB; GLB lengths are 32-bit (max 4 GiB). "
+                         "Lower export.combined_glb_max_tiles or set export.combined_glb=false")
     chunks = struct.pack("<II", len(js), 0x4E4F534A) + js + struct.pack("<II", len(blob), 0x004E4942) + bytes(blob)
     return struct.pack("<III", 0x46546C67, 2, 12 + len(chunks)) + chunks
