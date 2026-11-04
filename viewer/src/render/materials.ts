@@ -180,6 +180,22 @@ export class MaterialPatcher {
     if (had !== st.hasOrtho) mat.needsUpdate = true;
   }
 
+  /** Frees the building style textures of the meshes under a tile root being unloaded. */
+  forgetTile(root: Object3D): void {
+    root.traverse((o) => {
+      if (!(o instanceof Mesh)) return;
+      const tex = this.styleTextures.get(o);
+      if (!tex) return;
+      tex.dispose();
+      this.styleTextures.delete(o);
+    });
+  }
+
+  /** Number of building style textures alive (for leak checks). */
+  get styleTextureCount(): number {
+    return this.styleTextures.size;
+  }
+
   dispose(): void {
     for (const t of this.styleTextures.values()) t.dispose();
     this.styleTextures.clear();

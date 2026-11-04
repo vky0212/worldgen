@@ -14,7 +14,10 @@ import {
   Vector3,
   WebGLRenderer,
 } from 'three';
-import type { Material, Object3D } from 'three';
+import type { Group, Material, Object3D } from 'three';
+import { FlyBench } from './bench';
+import { autoPath, validatePath } from './benchPath';
+import type { BenchPath } from './benchPath';
 import { COLOR_MODES, ColorModeManager } from './colorModes';
 import { PhotorealRenderer } from './render/photoreal';
 import type { GroundMode, PhotorealStats } from './render/photoreal';
@@ -23,12 +26,21 @@ import type { LevelChoice } from './render/quality';
 import type { ColorMode } from './colorModes';
 import { CameraRig, isTyping } from './controls';
 import { GeoFrame, enuToThree, formatLatLon, formatMetres, parseLatLon, threeToEnu } from './geo';
-import { HttpError, TileLoader, checkSchema, errorText, fetchJson, fetchOptionalJson, resolveWorldBase, worldUrl } from './loader';
+import { HttpError, checkSchema, errorText, fetchJson, fetchOptionalJson, resolveWorldBase, worldUrl } from './loader';
 import { Highlighter, Picker, resolveEntityHit } from './picking';
 import type { EntityHit } from './picking';
+import { ShadowFitter } from './render/shadowFit';
 import { RouteView } from './routeView';
 import { Router } from './routing';
 import type { TravelMode } from './routing';
+import { DEFAULT_GPU_BUDGET, parseBudgetMb } from './stream/cache';
+import { MetaCache } from './stream/metaCache';
+import type { NearTile } from './stream/metaCache';
+import { keyAt, keyId } from './stream/quadtree';
+import { TileStreamer } from './stream/TileStreamer';
+import { tilesetFromIndex } from './stream/tileset';
+import type { TileNode, Tileset } from './stream/tileset';
+import type { TraversalResult } from './stream/traversal';
 import { TopologyOverlay } from './topology';
 import type { GraphPick } from './topology';
 import type {
@@ -39,7 +51,9 @@ import type {
   LocalBounds,
   Manifest,
   RoadGraph,
+  TileEntry,
   TileIndex,
+  TileMeta,
   TurnRestriction,
 } from './types';
 import {
@@ -59,6 +73,7 @@ import { hasWorldParam, studioInfo, worldPicker, worldSwitcher } from './studio'
 import { ValidationOverlay, hasLocation, renderIssueList } from './validation';
 import type { IssueFilter } from './validation';
 import { WorldModel } from './world';
+import type { LoadedTile } from './world';
 
 const SKY = '#b9d3ea';
 const PREFS = { render: 'worldgen.viewer.render', graphics: 'worldgen.viewer.graphics', tod: 'worldgen.viewer.timeOfDay', ground: 'worldgen.viewer.ground' };
@@ -80,6 +95,14 @@ function writePref(key: string, value: string): void {
   }
 }
 const DEFAULT_BOUNDS: LocalBounds = { xmin: -500, ymin: -500, xmax: 500, ymax: 500, zmin: 0, zmax: 50 };
+/** Standard rendering: fixed sun from the south-west, high (three.js axes). */
+const STANDARD_SUN_DIR = new Vector3(-0.5, 1.1, 0.6).normalize();
+/** Standard rendering: largest half-size (m) of the camera-fitted shadow frustum. */
+const STANDARD_SHADOW_HALF = 1500;
+/** meta.json is prefetched for tiles this close to the camera (m). */
+const META_RADIUS = 300;
+/** At most this many meta.json documents are kept. */
+const META_CAPACITY = 64;
 
 interface RouteEndpoint {
   x: number;
@@ -131,6 +154,21 @@ class App {
   private readonly restrictionsByEdge = new Map<string, TurnRestriction[]>();
   private readonly restrictionsByNode = new Map<string, TurnRestriction[]>();
   private readonly loadMessages: string[] = [];
+  private tileset: Tileset | null = null;
+  private streamer: TileStreamer | null = null;
+  private metaCache: MetaCache | null = null;
+  private readonly standardShadow = new ShadowFitter();
+  private bench: FlyBench | null = null;
+  private tileErrorCount = 0;
+  private tileErrorToastAt = 0;
+  private metaFailureShown = false;
+  private layerListDirty = false;
+  private layerListAt = 0;
+  private validationDirtyAt = 0;
+  private highlightDirty = false;
+  private metaNearAt = 0;
+  private streamStatusAt = 0;
+  private streamProgressShown = false;
 
   // state
   private selectedEntity: string | null = null;
@@ -196,6 +234,7 @@ class App {
 
     this.rig = new CameraRig(this.camera, this.renderer.domElement);
     this.rig.probe = (origin, dir) => this.probeRay(origin, dir);
+    this.rig.groundLevel = (x, y) => this.approxGroundZ(x, y);
     this.rig.onModeChange = (mode) => this.onCameraMode(mode);
     this.picker = new Picker(this.camera, this.renderer.domElement);
 
@@ -262,17 +301,14 @@ class App {
       if (index) this.toasts.show('The tile index lists no tiles.', 'warn');
       return;
     }
-    await this.loadTiles(index);
+    this.startStreaming(index);
   }
 
   private setupFraming(): void {
     const b = this.bounds;
     this.rig.setBounds(b);
     this.rig.frame(b);
-    const extent = Math.max(100, b.xmax - b.xmin, b.ymax - b.ymin);
     this.configureStandardSun();
-    this.fog.near = extent * 1.2;
-    this.fog.far = extent * 6;
     this.photoreal.setBounds(b);
   }
 
@@ -300,31 +336,36 @@ class App {
     this.rig.map.update();
   }
 
-  /** Fixed sun and whole-world shadow frustum of the standard rendering. */
+  /**
+   * Fixed sun of the standard rendering. Its shadow frustum follows what the
+   * camera looks at (fitStandardShadow), whatever the size of the world.
+   */
   private configureStandardSun(): void {
-    const b = this.bounds;
-    const extent = Math.max(100, b.xmax - b.xmin, b.ymax - b.ymin);
-    const center = enuToThree((b.xmin + b.xmax) / 2, (b.ymin + b.ymax) / 2, b.zmin ?? 0);
-    this.sun.position.copy(center).add(new Vector3(-0.5 * extent, 1.1 * extent, 0.6 * extent));
-    this.sun.target.position.copy(center);
+    const focus = this.rig.focus;
+    this.sun.target.position.copy(focus);
     this.sun.target.updateMatrixWorld();
-    const cam = this.sun.shadow.camera;
-    cam.left = cam.bottom = -extent * 0.75;
-    cam.right = cam.top = extent * 0.75;
-    cam.near = 1;
-    cam.far = extent * 4;
-    cam.updateProjectionMatrix();
+    this.sun.position.copy(focus).addScaledVector(STANDARD_SUN_DIR, 2000);
+    this.sun.updateMatrixWorld();
     if (this.sun.shadow.mapSize.x !== 4096) {
       this.sun.shadow.mapSize.set(4096, 4096);
       this.sun.shadow.map?.dispose();
       this.sun.shadow.map = null;
     }
-    this.sun.shadow.bias = -0.0005;
-    this.sun.shadow.normalBias = 0;
     this.sun.shadow.radius = 1;
+    this.standardShadow.invalidate();
   }
 
-  private async loadTiles(index: TileIndex): Promise<void> {
+  private fitStandardShadow(): void {
+    const zSpan = (this.bounds.zmax ?? 0) - (this.bounds.zmin ?? 0);
+    this.standardShadow.fit(this.sun, STANDARD_SUN_DIR, this.rig.focus, this.rig.viewDistance(), {
+      maxHalf: STANDARD_SHADOW_HALF,
+      mapSize: this.sun.shadow.mapSize.x,
+      zSpan,
+    });
+  }
+
+  /** Starts streaming the world's tiles for the camera (see stream/TileStreamer). */
+  private startStreaming(index: TileIndex): void {
     this.photoreal.setOrthoSource(this.base, index.ortho);
     if (!index.ortho) {
       // Worlds built without imagery: landcover colours only.
@@ -334,52 +375,278 @@ class App {
       this.groundNote.hidden = false;
       this.photoreal.setGround('procedural');
     }
-    const loader = new TileLoader(this.base, 4);
     const b = this.bounds;
-    const focus = { x: (b.xmin + b.xmax) / 2, y: (b.ymin + b.ymax) / 2 };
-    let loadedTiles = 0;
-    let metaFailures = 0;
-    const tileErrors: string[] = [];
-    await loader.loadAll(index.tiles, focus, {
-      onTile: (entry, scene) => {
-        const tile = this.world.addTile(entry, scene);
-        if (this.shadows && !this.photoreal.enabled) applyShadows(scene, true);
-        this.photoreal.onTileAdded(tile);
-        if (this.colors.mode !== 'materials') this.colors.refreshTile(entry.id, this.world);
-        if (++loadedTiles % 4 === 1) this.renderLayerList();
-      },
-      onMeta: (entry, meta, error) => {
-        this.world.setMeta(entry, meta, error);
-        if (meta) this.photoreal.onMetaLoaded(entry.id);
-        if (error) {
-          metaFailures++;
-          this.addLoadMessage(`meta ${entry.id}: ${error}`);
-        }
-        if (meta && this.colors.mode !== 'materials') this.colors.refreshTile(entry.id, this.world);
-        if (meta && this.selectedEntity && meta.entities[this.selectedEntity]) this.refreshSelectedEntity();
-      },
-      onProgress: (p) => {
-        const doneCount = p.loaded + p.failed;
-        const failed = p.failed ? ` · ${p.failed} failed` : '';
-        this.progress.set(p.total ? doneCount / p.total : 1, `Loading tiles ${doneCount}/${p.total}${failed}`);
-      },
-      onError: (_entry, message) => {
-        tileErrors.push(message);
-        this.addLoadMessage(message);
+    const tileset = tilesetFromIndex(index, [b.zmin ?? 0, b.zmax ?? 50]);
+    this.tileset = tileset;
+    if (tileset.skipped) this.addLoadMessage(`${tileset.skipped} tile index entries were skipped (duplicate or invalid).`);
+    const params = new URLSearchParams(window.location.search);
+    const rawBudget = params.get('gpuBudget');
+    const budget = parseBudgetMb(rawBudget) ?? DEFAULT_GPU_BUDGET;
+    if (rawBudget && parseBudgetMb(rawBudget) === null) this.toasts.show(`Ignoring ?gpuBudget=${rawBudget}: expected megabytes, e.g. 768 or 1.5GB.`, 'warn');
+
+    this.metaCache = new MetaCache({
+      capacity: META_CAPACITY,
+      load: (entry, signal) => this.fetchMeta(entry, signal),
+      onLoaded: (id, meta, error) => this.onMetaLoaded(id, meta, error),
+      onEvicted: (id) => this.onMetaEvicted(id),
+    });
+    this.streamer = new TileStreamer({
+      base: this.base,
+      tileset,
+      camera: this.camera,
+      viewportHeight: () => this.renderer.domElement.clientHeight,
+      budgetBytes: budget,
+      addContent: (node, scene) => this.addTile(node, scene),
+      removeContent: (_node, content) => this.removeTile(content as LoadedTile),
+      onError: (_node, message) => this.onTileError(message),
+      onTraversal: (res) => this.afterTraversal(res),
+    });
+    this.photoreal.onTileBytes = (id, bytes) => this.streamer?.addBytes(id, bytes);
+    this.progress.set(0, `Streaming ${tileset.contentNodes.length} tiles…`);
+    this.streamProgressShown = true;
+    void this.startBenchIfRequested(params);
+  }
+
+  /** A parsed tile GLB joins the scene. */
+  private addTile(node: TileNode, scene: Group): LoadedTile {
+    const entry = node.content!.entry;
+    const tile = this.world.addTile(entry, scene);
+    if (this.shadows && !this.photoreal.enabled) applyShadows(scene, true);
+    this.photoreal.onTileAdded(tile);
+    if (this.colors.mode !== 'materials') this.colors.refreshTile(entry.id, this.world);
+    this.layerListDirty = true;
+    if (this.validation && !this.validationDirtyAt && this.validation.needsGroundIn(entry.bounds)) {
+      // Markers there can sit on the real terrain now.
+      this.validationDirtyAt = performance.now() + 400;
+    }
+    if (this.selectedEntity && tile.entityIds.has(this.selectedEntity)) this.highlightDirty = true;
+    return tile;
+  }
+
+  /** An evicted tile leaves the scene and frees its GPU memory. */
+  private removeTile(tile: LoadedTile): void {
+    const selectedHere = !!this.selectedEntity && tile.entityIds.has(this.selectedEntity);
+    // Highlight overlays of instanced features share the tile's geometry.
+    if (selectedHere) this.highlighter.clear();
+    this.colors.forgetTile(tile);
+    this.photoreal.onTileRemoved(tile);
+    this.world.removeTile(tile.entry.id);
+    tile.dispose();
+    this.layerListDirty = true;
+    if (selectedHere) this.highlightDirty = true;
+  }
+
+  private onTileError(message: string): void {
+    this.tileErrorCount++;
+    this.addLoadMessage(message);
+    const now = performance.now();
+    if (now - this.tileErrorToastAt > 5000) {
+      this.tileErrorToastAt = now;
+      this.toasts.show(`${this.tileErrorCount} tile(s) failed to load (see World → Messages).`, 'warn');
+    }
+  }
+
+  private async fetchMeta(entry: TileEntry, signal: AbortSignal): Promise<TileMeta | null> {
+    const path = entry.meta!;
+    const meta = await fetchOptionalJson<TileMeta>(worldUrl(this.base, path), signal);
+    if (!meta) return null;
+    checkSchema(meta, 'worldgen.tile_meta', path);
+    if (!meta.entities || typeof meta.entities !== 'object') meta.entities = {};
+    return meta;
+  }
+
+  private onMetaLoaded(tileId: string, meta: TileMeta | null, error: string | null): void {
+    this.world.setMeta(tileId, meta, error);
+    if (error) {
+      this.addLoadMessage(`meta ${tileId}: ${error}`);
+      if (!this.metaFailureShown) {
+        this.metaFailureShown = true;
+        this.toasts.show('Some tile meta.json files are missing or invalid; inspection is limited there (see World → Messages).', 'warn');
+      }
+    }
+    if (!meta) return;
+    if (this.world.tiles.has(tileId)) {
+      this.photoreal.onMetaLoaded(tileId);
+      if (this.colors.mode !== 'materials') this.colors.refreshTile(tileId, this.world);
+    }
+    if (this.selectedEntity && meta.entities[this.selectedEntity]) this.refreshSelectedEntity();
+  }
+
+  private onMetaEvicted(tileId: string): void {
+    this.world.dropMeta(tileId);
+    if (this.colors.mode !== 'materials' && this.world.tiles.has(tileId)) this.colors.refreshTile(tileId, this.world);
+  }
+
+  /** Loads the meta.json of these tiles (if not loaded yet); resolves when all are there. */
+  private ensureMeta(tileIds: readonly string[]): Promise<void> {
+    const cache = this.metaCache;
+    const ts = this.tileset;
+    if (!cache || !ts) return Promise.resolve();
+    const pending: Promise<unknown>[] = [];
+    for (const id of new Set(tileIds)) {
+      const entry = ts.byContentId.get(id)?.content?.entry;
+      if (entry && !this.world.hasMeta(id)) pending.push(cache.require(entry));
+    }
+    return Promise.all(pending).then(() => undefined);
+  }
+
+  /** After each tile selection: meta.json for the tiles near the camera (or every drawn tile in colour modes). */
+  private afterTraversal(res: TraversalResult): void {
+    const now = performance.now();
+    if (!this.metaCache || now - this.metaNearAt < 250) return;
+    this.metaNearAt = now;
+    const colourMode = this.colors.mode !== 'materials';
+    const near: NearTile[] = [];
+    for (const w of res.wanted) {
+      const c = w.node.content;
+      if (!c) continue;
+      if (w.distance <= META_RADIUS || (colourMode && w.ready && w.tier <= 1)) near.push({ entry: c.entry, distance: w.distance });
+    }
+    near.sort((a, b) => a.distance - b.distance);
+    this.metaCache.setNear(near.slice(0, Math.max(8, this.metaCache.capacity - 8)));
+  }
+
+  /** Index tiles with the same key as local (x, y) and its neighbours (for entity lookups). */
+  private tileIdsAround(x: number, y: number, ring = 0): string[] {
+    const ts = this.tileset;
+    if (!ts) return [];
+    const k = keyAt(x, y, ts.tileSize);
+    const out: string[] = [];
+    for (let di = -ring; di <= ring; di++) {
+      for (let dj = -ring; dj <= ring; dj++) {
+        const id = ts.nodes.get(keyId({ level: 0, i: k.i + di, j: k.j + dj }))?.content?.id;
+        if (id) out.push(id);
+      }
+    }
+    return out;
+  }
+
+  /** Tiles around the given tiles (3 × 3 each). */
+  private neighbourTiles(tileIds: readonly string[]): string[] {
+    const ts = this.tileset;
+    if (!ts) return [...tileIds];
+    const out = new Set<string>();
+    for (const id of tileIds) {
+      const b = ts.byContentId.get(id)?.bounds;
+      if (!b) continue;
+      for (const t of this.tileIdsAround((b[0] + b[2]) / 2, (b[1] + b[3]) / 2, 1)) out.add(t);
+    }
+    return [...out];
+  }
+
+  private async startBenchIfRequested(params: URLSearchParams): Promise<void> {
+    const raw = params.get('bench');
+    const streamer = this.streamer;
+    const ts = this.tileset;
+    if (!raw || !streamer || !ts) return;
+    let path: BenchPath;
+    try {
+      if (raw === 'auto' || raw === '1') {
+        const b = this.bounds;
+        const duration = Number(params.get('benchDuration'));
+        path = autoPath(
+          {
+            bounds: [b.xmin, b.ymin, b.xmax, b.ymax],
+            topAt: (x, y) => this.zRangeNear(x, y, 300)[1],
+            groundAt: (x, y) => this.zRangeNear(x, y, 0)[0],
+          },
+          Number.isFinite(duration) && duration > 0 ? duration : undefined,
+        );
+      } else {
+        path = validatePath(await fetchJson<unknown>(new URL(raw, window.location.href).href));
+      }
+    } catch (e) {
+      this.toasts.show(`Benchmark path unavailable: ${errorText(e)}`, 'error');
+      return;
+    }
+    this.toasts.show(`Benchmark "${path.name ?? raw}" running: results on window.worldgenBench.`, 'info', 4000);
+    this.bench = new FlyBench(path, {
+      camera: this.camera,
+      rig: this.rig,
+      renderer: this.renderer,
+      streamer,
+      gpu: this.photoreal.gpu,
+      resources: () => ({
+        streamerLoaded: streamer.stats().loaded,
+        worldTiles: this.world.tiles.size,
+        worldPickables: this.world.pickables.length,
+        metaDocs: this.metaCache?.size ?? 0,
+        ...this.photoreal.resourceCounts(),
+      }),
+      onDone: (r) => {
+        const s = r.flight?.frameMs;
+        this.toasts.show(`Benchmark done${s ? `: p95 frame ${s.p95} ms` : ''} · peak GPU ${formatMb(r.peak.gpuBytes)} (window.worldgenBench).`, 'info', 8000);
       },
     });
-    this.progress.set(1, `Loaded ${loadedTiles}/${index.tiles.length} tiles`);
-    this.progress.hide(1500);
-    this.renderLayerList();
-    if (tileErrors.length) {
-      this.toasts.show(
-        `${tileErrors.length} of ${index.tiles.length} tiles failed to load (see World → Messages).`,
-        tileErrors.length === index.tiles.length ? 'error' : 'warn',
-      );
+  }
+
+  /** z range [min, max] of the index tiles within `radius` m of local (x, y). */
+  private zRangeNear(x: number, y: number, radius: number): [number, number] {
+    const ts = this.tileset;
+    let lo = Infinity;
+    let hi = -Infinity;
+    if (ts) {
+      const ring = Math.ceil(radius / ts.tileSize);
+      for (const id of this.tileIdsAround(x, y, ring)) {
+        const n = ts.byContentId.get(id)!;
+        lo = Math.min(lo, n.zmin);
+        hi = Math.max(hi, n.zmax);
+      }
     }
-    if (metaFailures) this.toasts.show(`${metaFailures} tile meta.json files are missing or invalid; inspection is limited there.`, 'warn');
-    // Markers without z can now sit on the terrain.
-    if (this.validation) this.applyIssueFilter();
+    if (!Number.isFinite(lo)) return [this.bounds.zmin ?? 0, this.bounds.zmax ?? 50];
+    return [lo, hi];
+  }
+
+  /** Ground elevation from the tile index (lowest point of the tile at x, y), null outside the world. */
+  private approxGroundZ(x: number, y: number): number | null {
+    const ts = this.tileset;
+    if (!ts) return null;
+    const n = ts.nodes.get(keyId(keyAt(x, y, ts.tileSize)));
+    return n?.content ? n.zmin : null;
+  }
+
+  /** Deferred work after tiles came or went (at most a few times per second). */
+  private flushDeferred(now: number): void {
+    if (this.layerListDirty && now - this.layerListAt > 500) {
+      this.layerListDirty = false;
+      this.layerListAt = now;
+      this.renderLayerList();
+    }
+    if (this.validationDirtyAt && now >= this.validationDirtyAt) {
+      this.validationDirtyAt = 0;
+      this.validation?.applyFilter(this.issueFilter);
+    }
+    if (this.highlightDirty) {
+      this.highlightDirty = false;
+      this.refreshHighlight();
+    }
+  }
+
+  private updateStreamStatus(now: number): void {
+    const streamer = this.streamer;
+    if (!streamer || now - this.streamStatusAt < 250) return;
+    this.streamStatusAt = now;
+    const st = streamer.stats();
+    const busy = !st.settled;
+    const el = this.status.tiles;
+    el.textContent = `${st.rendered} tiles · ${formatMb(st.gpuBytes)}`;
+    el.classList.toggle('over-budget', st.gpuBytes > st.budgetBytes);
+    el.title = [
+      `Tiles drawn: ${st.rendered} (${st.loaded} loaded of ${st.total})`,
+      `Loading: ${st.loading} · queued: ${st.queued} · uploading: ${st.uploading}${st.failed ? ` · failed: ${st.failed}` : ''}`,
+      `GPU memory: ${formatMb(st.gpuBytes)} of ${formatMb(st.budgetBytes)} budget (?gpuBudget=<MB>)`,
+      `Holes: ${st.holes} · evicted: ${st.evicted} · aborted: ${st.aborted}`,
+      `meta.json documents: ${this.metaCache?.size ?? 0} of ${this.metaCache?.capacity ?? 0}`,
+    ].join('\n');
+    if (busy) {
+      const want = Math.max(1, st.selected);
+      this.progress.set(Math.min(1, st.rendered / want), `Streaming tiles · ${st.rendered}/${st.selected} in view · ${st.loading + st.queued} loading · ${formatMb(st.gpuBytes)}`);
+      this.streamProgressShown = true;
+    } else if (this.streamProgressShown) {
+      this.streamProgressShown = false;
+      this.progress.set(1, `${st.rendered} tiles in view · ${formatMb(st.gpuBytes)} of ${formatMb(st.budgetBytes)}`);
+      this.progress.hide(1200);
+    }
   }
 
   private async loadGraph(): Promise<void> {
@@ -453,7 +720,11 @@ class App {
         return;
       }
       for (const w of checkSchema(diag, 'worldgen.diagnostics', path)) this.toasts.show(w, 'warn');
-      this.validation = new ValidationOverlay(diag, (x, y) => this.groundZAt(x, y));
+      this.validation = new ValidationOverlay(
+        diag,
+        (x, y) => this.groundZAt(x, y),
+        (x, y) => this.approxGroundZ(x, y),
+      );
       this.validation.visible = this.validationCheck.checked;
       this.scene.add(this.validation.group);
       this.validationCheck.disabled = false;
@@ -749,7 +1020,7 @@ class App {
     clear(list);
     const names = this.world.layerNames(this.manifest?.layers ?? []);
     for (const name of names) {
-      const count = this.world.layerNodes.get(name)?.length ?? 0;
+      const count = this.world.layerNodes.get(name)?.size ?? 0;
       const label = checkbox(name, this.world.isLayerVisible(name), (v) => this.world.setLayerVisible(name, v), h('span', { class: 'count' }, count ? `${count} tiles` : '—'));
       if (!count) label.classList.add('empty');
       list.append(label);
@@ -760,7 +1031,11 @@ class App {
     renderLegend(this.colorLegend, this.colors.legend());
     if (this.colors.mode !== 'materials') {
       this.colorLegend.append(
-        h('div', { class: 'muted small' }, 'Colours come from tile meta.json (no metadata = grey). Terrain is drawn muted.'),
+        h(
+          'div',
+          { class: 'muted small' },
+          `Colours come from tile meta.json (no metadata = grey), loaded for the ${META_CAPACITY - 8} nearest tiles in view. Terrain is drawn muted.`,
+        ),
       );
     }
   }
@@ -873,20 +1148,35 @@ class App {
     const now = performance.now();
     const dt = Math.min(0.1, (now - this.lastFrame) / 1000);
     this.lastFrame = now;
+    this.bench?.beforeFrame(now);
     this.rig.update(dt);
+    const range = this.rig.viewRange();
+    this.streamer?.update(now);
+    this.flushDeferred(now);
     this.routeView.updateMarkerScale(this.rig.viewDistance());
     if (this.photoreal.enabled) {
-      this.photoreal.render(this.rig.focus, this.rig.viewDistance());
+      this.photoreal.render(this.rig.focus, this.rig.viewDistance(), range);
     } else {
+      if (this.fogOn) {
+        this.fog.near = range * 0.35;
+        this.fog.far = range * 0.95;
+      }
+      if (this.shadows) this.fitStandardShadow();
+      const gpu = this.photoreal.gpu;
+      gpu.begin();
       this.renderer.render(this.scene, this.camera);
+      gpu.end();
+      gpu.poll();
       if (dt > 0) this.fpsEma += (1 / dt - this.fpsEma) * 0.05;
       if (now - this.fpsShownAt > 500) {
         this.fpsShownAt = now;
         this.status.fps.textContent = `${Math.round(this.fpsEma)} fps`;
         this.status.fps.className = 'sb-item sb-fps';
-        this.status.fps.title = 'Frame rate (standard rendering)';
+        this.status.fps.title = `Frame rate (standard rendering)${gpu.lastMs !== null ? ` · GPU ${gpu.lastMs.toFixed(1)} ms per frame` : ''}`;
       }
     }
+    this.bench?.afterFrame(now, performance.now() - now);
+    this.updateStreamStatus(now);
   }
 
   // ------------------------------------------------------------ render mode
@@ -959,12 +1249,19 @@ class App {
     return hit ? hit.point.clone() : null;
   }
 
-  /** Terrain (or any surface) elevation at local x, y; null when nothing is there. */
+  /**
+   * Terrain (or any surface) elevation at local x, y from the loaded tiles
+   * there; null when no tile is loaded at that point.
+   */
   private groundZAt(x: number, y: number): number | null {
+    const tiles = this.world.tilesAt(x, y);
+    if (!tiles.length) return null;
     const top = (this.bounds.zmax ?? 1000) + 1000;
     const origin = enuToThree(x, y, top);
-    let objects: Object3D[] = this.world.pickables.filter((p) => p.layer === 'terrain' && p.object instanceof Mesh).map((p) => p.object);
-    if (!objects.length) objects = this.meshPickables(['trees', 'vegetation_regions']);
+    const pick = (accept: (layer: string) => boolean): Object3D[] =>
+      tiles.flatMap((t) => t.pickables.filter((p) => accept(p.layer) && p.object instanceof Mesh).map((p) => p.object));
+    let objects = pick((l) => l === 'terrain');
+    if (!objects.length) objects = pick((l) => l !== 'trees' && l !== 'vegetation_regions');
     this.picker.raycaster.set(origin, new Vector3(0, -1, 0));
     const hit = this.picker.intersect(objects)[0];
     return hit ? hit.point.y : null;
@@ -1048,7 +1345,8 @@ class App {
     this.selectedEntity = id;
     const centroid = record?.centroid;
     const latlon = centroid ? this.geo.toLatLon(centroid[0], centroid[1]) : hit ? this.latLonOfThree(hit.point) : null;
-    const tiles = entry?.tiles ?? (hit?.tileId ? [hit.tileId] : []);
+    const drawnIn = [...new Set(occurrences.map((o) => o.pickable.tileId))];
+    const tiles = entry?.tiles ?? (hit?.tileId ? [hit.tileId] : drawnIn);
     this.info.showEntity({
       id,
       record,
@@ -1056,9 +1354,13 @@ class App {
       layer: hit ? this.world.pickableFor(hit.object)?.layer : occurrences[0]?.pickable.layer,
       latlon,
       instanceIndex: hit?.instanceIndex,
-      onEntityLink: (other) => this.selectById(other),
+      onEntityLink: (other) => this.selectById(other, this.neighbourTiles(tiles)),
     });
     if (opts.fly && box) this.flyToBox(box);
+    // meta.json is loaded lazily: fetch it for the tiles that draw this feature.
+    const metaTiles = [...new Set([...(hit?.tileId ? [hit.tileId] : []), ...drawnIn, ...tiles])];
+    this.metaCache?.setPinned(metaTiles);
+    if (!record && metaTiles.some((t) => !this.world.hasMeta(t))) void this.ensureMeta(metaTiles);
   }
 
   private refreshSelectedEntity(): void {
@@ -1066,8 +1368,18 @@ class App {
     if (id) this.selectEntity(id);
   }
 
-  /** Selects anything by id: tile entity, graph edge or node. */
-  private selectById(id: string): void {
+  /** Re-draws the selection highlight after tiles drawing it came or went. */
+  private refreshHighlight(): void {
+    const id = this.selectedEntity;
+    if (!id) return;
+    this.highlighter.show(this.world.occurrencesOf(id), this.world.recordFor(id)?.centroid ?? null);
+  }
+
+  /**
+   * Selects anything by id: tile entity, graph edge or node. `hintTiles` are
+   * tiles whose meta.json may describe the entity when it is not loaded yet.
+   */
+  private selectById(id: string, hintTiles: readonly string[] = []): void {
     if (this.world.getEntity(id) || this.world.occurrencesOf(id).length) {
       this.selectEntity(id, { fly: true });
       return;
@@ -1095,6 +1407,11 @@ class App {
       );
       return;
     }
+    const unloaded = hintTiles.filter((t) => this.tileset?.byContentId.has(t) && !this.world.hasMeta(t));
+    if (unloaded.length) {
+      void this.ensureMeta(unloaded).then(() => this.selectById(id));
+      return;
+    }
     this.toasts.show(`"${id}" is not in any loaded tile or in the road graph.`, 'warn');
   }
 
@@ -1102,9 +1419,9 @@ class App {
     if (!this.topology) return;
     this.highlighter.clear();
     this.selectedEntity = null;
-    const onLink = (id: string): void => this.selectById(id);
     if (pick.type === 'edge') {
       const e = pick.edge;
+      const onLink = (id: string): void => this.selectById(id, e.tiles ?? []);
       this.topology.highlightEdges([e]);
       this.info.showEdge(e, this.restrictionsByEdge.get(e.id) ?? [], onLink);
       if (fly) {
@@ -1115,6 +1432,7 @@ class App {
       }
     } else {
       const n = pick.node;
+      const onLink = (id: string): void => this.selectById(id, this.tileIdsAround(n.x, n.y, 1));
       this.topology.highlightNode(n);
       this.info.showNode(n, this.incident.get(n.id) ?? [], this.restrictionsByNode.get(n.id) ?? [], this.geo.toLatLon(n.x, n.y), onLink);
       if (fly) this.rig.flyTo(enuToThree(n.x, n.y, n.z ?? 0), 120);
@@ -1135,7 +1453,8 @@ class App {
     }
     const latlon = loc ? (typeof loc.lat === 'number' && typeof loc.lon === 'number' ? { lat: loc.lat, lon: loc.lon } : this.geo.toLatLon(loc.x, loc.y)) : null;
     const flyFn = target ? () => this.rig.flyTo(target!, 120) : null;
-    this.info.showIssue(issue, latlon, (id) => this.selectById(id), flyFn);
+    const hints = [...(issue.tile ? [issue.tile] : []), ...(loc ? this.tileIdsAround(loc.x, loc.y, 1) : [])];
+    this.info.showIssue(issue, latlon, (id) => this.selectById(id, hints), flyFn);
     if (fly && flyFn) flyFn();
     if (fly && !loc) this.toasts.show('This issue has no location.', 'info', 3000);
   }
@@ -1188,7 +1507,7 @@ class App {
     if (p.x < b.xmin || p.x > b.xmax || p.y < b.ymin || p.y > b.ymax) {
       this.toasts.show(`${formatLatLon(ll)} is outside the compiled area.`, 'warn');
     }
-    const z = this.groundZAt(p.x, p.y) ?? b.zmin ?? 0;
+    const z = this.groundZAt(p.x, p.y) ?? this.approxGroundZ(p.x, p.y) ?? b.zmin ?? 0;
     this.rig.flyTo(enuToThree(p.x, p.y, z), 250);
   }
 
@@ -1328,6 +1647,11 @@ class App {
       this.updateToolHint();
     }
   }
+}
+
+function formatMb(bytes: number): string {
+  const mb = bytes / (1024 * 1024);
+  return mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${Math.round(mb)} MB`;
 }
 
 function formatHour(h: number): string {

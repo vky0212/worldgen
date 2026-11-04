@@ -1,10 +1,17 @@
 /**
  * In-memory model of the loaded world: tile scenes, layer nodes, pickable
  * meshes and the entity registry built from the tile meta.json files.
+ *
+ * Tiles come and go as the camera moves (see stream/TileStreamer): addTile
+ * registers a tile's scene, removeTile unregisters it again (layer nodes,
+ * pickables, entity occurrences) so it can be disposed. meta.json documents
+ * are loaded lazily and independently of the GLBs (setMeta / dropMeta).
  */
 import { Group, InstancedMesh, Line, Mesh, Points } from 'three';
 import type { BufferGeometry, Object3D } from 'three';
 import { FEATURE_ATTR, featureIdsOf, instanceIdsOf } from './picking';
+import { disposeTree, estimateGpuBytes } from './stream/content';
+import type { TileContent } from './stream/content';
 import { LAYER_NAMES } from './types';
 import type { EntityRecord, TileEntry, TileMeta } from './types';
 
@@ -19,13 +26,12 @@ export interface Pickable {
   instanceIds: string[] | null;
 }
 
-export interface LoadedTile {
+export interface LoadedTile extends TileContent {
   entry: TileEntry;
-  scene: Group;
-  meta: TileMeta | null;
-  metaError: string | null;
   layers: Map<string, Object3D[]>;
   pickables: Pickable[];
+  /** Entity ids drawn in this tile (keys into the occurrence index). */
+  entityIds: Set<string>;
 }
 
 export interface EntityEntry {
@@ -41,50 +47,68 @@ export interface EntityOccurrence {
   instanceIndex?: number;
 }
 
+interface MetaState {
+  meta: TileMeta | null;
+  error: string | null;
+}
+
 export class WorldModel {
   readonly root = new Group();
   readonly tiles = new Map<string, LoadedTile>();
-  readonly layerNodes = new Map<string, Object3D[]>();
-  readonly pickables: Pickable[] = [];
+  /** Layer nodes of the loaded tiles, per layer. */
+  readonly layerNodes = new Map<string, Set<Object3D>>();
   private readonly layerVisible = new Map<string, boolean>();
+  private readonly metas = new Map<string, MetaState>();
   private readonly entities = new Map<string, EntityEntry>();
   private readonly occurrences = new Map<string, EntityOccurrence[]>();
   private readonly tileOfRoot = new WeakMap<Object3D, string>();
   private readonly pickableOf = new WeakMap<Object3D, Pickable>();
+  private pickableCache: Pickable[] | null = null;
 
   constructor() {
     this.root.name = 'worldgen_tiles';
   }
 
+  /** Every pickable of every loaded tile. */
+  get pickables(): Pickable[] {
+    if (!this.pickableCache) {
+      const all: Pickable[] = [];
+      for (const t of this.tiles.values()) for (const p of t.pickables) all.push(p);
+      this.pickableCache = all;
+    }
+    return this.pickableCache;
+  }
+
   /** Registers a freshly loaded tile scene and returns the tile record. */
   addTile(entry: TileEntry, scene: Group): LoadedTile {
+    if (this.tiles.has(entry.id)) this.removeTile(entry.id)?.dispose();
     const tile: LoadedTile = {
       entry,
-      scene,
-      meta: null,
-      metaError: null,
+      root: scene,
       layers: new Map(),
       pickables: [],
+      entityIds: new Set(),
+      gpuBytes: 0,
+      dispose: () => disposeTree(scene),
     };
     this.tileOfRoot.set(scene, entry.id);
     collectLayerNodes(scene, tile.layers);
 
     for (const [layer, nodes] of tile.layers) {
-      let list = this.layerNodes.get(layer);
-      if (!list) {
-        list = [];
-        this.layerNodes.set(layer, list);
+      let set = this.layerNodes.get(layer);
+      if (!set) {
+        set = new Set();
+        this.layerNodes.set(layer, set);
       }
       for (const node of nodes) {
-        list.push(node);
+        set.add(node);
         node.visible = this.isLayerVisible(layer);
         node.traverse((obj) => {
           const p = makePickable(obj, entry.id, layer);
           if (!p) return;
           tile.pickables.push(p);
-          this.pickables.push(p);
           this.pickableOf.set(obj, p);
-          this.indexOccurrences(p);
+          this.indexOccurrences(p, tile.entityIds);
         });
       }
     }
@@ -94,38 +118,80 @@ export class WorldModel {
     scene.traverse((o) => {
       o.matrixAutoUpdate = false;
     });
+    tile.gpuBytes = estimateGpuBytes(scene);
 
-    // Merge pending meta that may have arrived before the GLB.
-    const existing = this.tiles.get(entry.id);
-    if (existing) {
-      tile.meta = existing.meta;
-      tile.metaError = existing.metaError;
-    }
     this.tiles.set(entry.id, tile);
+    this.pickableCache = null;
     this.root.add(scene);
     return tile;
   }
 
-  /** Attaches a tile's meta.json (may arrive before or after the GLB). */
-  setMeta(entry: TileEntry, meta: TileMeta | null, error: string | null): void {
-    let tile = this.tiles.get(entry.id);
-    if (!tile) {
-      // GLB not loaded (yet or at all): keep a placeholder so entities resolve.
-      tile = { entry, scene: new Group(), meta: null, metaError: null, layers: new Map(), pickables: [] };
-      this.tiles.set(entry.id, tile);
+  /**
+   * Unregisters a tile (scene detached, layer nodes, pickables and entity
+   * occurrences removed) and returns it; the caller disposes it.
+   */
+  removeTile(id: string): LoadedTile | undefined {
+    const tile = this.tiles.get(id);
+    if (!tile) return undefined;
+    this.tiles.delete(id);
+    this.pickableCache = null;
+    this.root.remove(tile.root);
+    for (const [layer, nodes] of tile.layers) {
+      const set = this.layerNodes.get(layer);
+      if (!set) continue;
+      for (const n of nodes) set.delete(n);
     }
-    tile.meta = meta;
-    tile.metaError = error;
+    for (const eid of tile.entityIds) {
+      const list = this.occurrences.get(eid);
+      if (!list) continue;
+      const kept = list.filter((o) => o.pickable.tileId !== id);
+      if (kept.length) this.occurrences.set(eid, kept);
+      else this.occurrences.delete(eid);
+    }
+    return tile;
+  }
+
+  /** Attaches a tile's meta.json (independent of whether its GLB is loaded). */
+  setMeta(tileId: string, meta: TileMeta | null, error: string | null): void {
+    if (this.metas.has(tileId)) this.dropMeta(tileId);
+    this.metas.set(tileId, { meta, error });
     if (!meta) return;
     for (const [id, record] of Object.entries(meta.entities)) {
       if (!record || typeof record !== 'object') continue;
       const e = this.entities.get(id);
       if (e) {
-        if (!e.tiles.includes(entry.id)) e.tiles.push(entry.id);
+        if (!e.tiles.includes(tileId)) e.tiles.push(tileId);
       } else {
-        this.entities.set(id, { id, record, tiles: [entry.id] });
+        this.entities.set(id, { id, record, tiles: [tileId] });
       }
     }
+  }
+
+  /** Forgets a tile's meta.json (evicted from the meta cache). */
+  dropMeta(tileId: string): void {
+    const st = this.metas.get(tileId);
+    if (!st) return;
+    this.metas.delete(tileId);
+    if (!st.meta) return;
+    for (const id of Object.keys(st.meta.entities)) {
+      const e = this.entities.get(id);
+      if (!e) continue;
+      e.tiles = e.tiles.filter((t) => t !== tileId);
+      if (!e.tiles.length) {
+        this.entities.delete(id);
+      } else if (e.record === st.meta.entities[id]) {
+        const other = this.metas.get(e.tiles[0])?.meta?.entities[id];
+        if (other) e.record = other;
+      }
+    }
+  }
+
+  hasMeta(tileId: string): boolean {
+    return this.metas.has(tileId);
+  }
+
+  metaOf(tileId: string): TileMeta | null {
+    return this.metas.get(tileId)?.meta ?? null;
   }
 
   get entityCount(): number {
@@ -139,7 +205,7 @@ export class WorldModel {
   /** Record for an entity, preferring the given tile's own meta. */
   recordFor(id: string, tileId?: string): EntityRecord | undefined {
     if (tileId) {
-      const r = this.tiles.get(tileId)?.meta?.entities[id];
+      const r = this.metas.get(tileId)?.meta?.entities[id];
       if (r) return r;
     }
     return this.entities.get(id)?.record;
@@ -160,6 +226,16 @@ export class WorldModel {
       if (id !== undefined) return id;
     }
     return null;
+  }
+
+  /** Loaded tiles whose bounds contain local (x, y). */
+  tilesAt(x: number, y: number): LoadedTile[] {
+    const out: LoadedTile[] = [];
+    for (const t of this.tiles.values()) {
+      const b = t.entry.bounds;
+      if (b && x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3]) out.push(t);
+    }
+    return out;
   }
 
   /** All layer names: known contract layers first, then any extra ones found. */
@@ -183,17 +259,18 @@ export class WorldModel {
     return this.pickables.filter((p) => !exclude.includes(p.layer) && isShown(p.object));
   }
 
-  private indexOccurrences(p: Pickable): void {
+  private indexOccurrences(p: Pickable, ids: Set<string>): void {
     if (p.featureIds) {
-      p.featureIds.forEach((id, featureIndex) => this.pushOccurrence(id, { pickable: p, featureIndex }));
+      p.featureIds.forEach((id, featureIndex) => this.pushOccurrence(id, { pickable: p, featureIndex }, ids));
     }
     if (p.instanceIds) {
-      p.instanceIds.forEach((id, instanceIndex) => this.pushOccurrence(id, { pickable: p, instanceIndex }));
+      p.instanceIds.forEach((id, instanceIndex) => this.pushOccurrence(id, { pickable: p, instanceIndex }, ids));
     }
   }
 
-  private pushOccurrence(id: string, occ: EntityOccurrence): void {
+  private pushOccurrence(id: string, occ: EntityOccurrence, ids: Set<string>): void {
     if (typeof id !== 'string') return;
+    ids.add(id);
     const list = this.occurrences.get(id);
     if (list) list.push(occ);
     else this.occurrences.set(id, [occ]);

@@ -59,7 +59,8 @@ hides its API features (static hosting keeps working).
 npm run build      # tsc --noEmit (app + node configs) && vite build -> dist/
 npm run typecheck  # type-check only
 npm test           # unit tests (node --test): routing, job-progress reducer, region helpers,
-                   # building styles, graphics levels + frame-rate governor, solar position
+                   # building styles, graphics levels + frame-rate governor, solar position,
+                   # tile streaming (quadtree, traversal, request queue, caches), bench paths
 ```
 
 `dist/` contains both pages (`index.html`, `generate.html`) and is built with `base: './'`,
@@ -79,6 +80,9 @@ Viewer (`index.html`):
 | `tod` | Local solar time in hours for the sun, 4.5 … 20.5 (default 10.5) |
 | `ground` | Photo-realistic ground colour: `satellite` (default when the world has `tiles/<tile>.ortho.jpg` imagery) or `procedural` (landcover colours). Overrides the **Ground** choice |
 | `cam` | Initial view `x,y,z[,distance,yaw,pitch]`: look at local ENU `(x, y, z)` from `distance` m (default 150), heading `yaw`° (0 = from the south, 90 = from the east), `pitch`° above the horizon (default 35). For reproducible screenshots and bug reports |
+| `gpuBudget` | GPU memory budget for streamed tile content, in MB (`768`) or with a unit (`1.5GB`). Default 1024 MB. Tiles beyond it are evicted least recently used first; what is on screen never is |
+| `bench` | Fly-through benchmark: `auto` (a loop over the world at 120 m above the highest surface, then a climb to an overview) or the URL of a path file (see [Fly-through benchmark](#fly-through-benchmark)). Results go to `window.worldgenBench` and the console |
+| `benchDuration` | Flight time in seconds for `bench=auto` (default 90) |
 
 Generate page (`generate.html`):
 
@@ -199,8 +203,12 @@ remembered in `localStorage`.
 
 ## Features
 
-- **Loading.** Tiles load nearest-first with 4 parallel requests, and a progress bar
-  shows how far it has got. Each tile's `meta.json` loads alongside its GLB.
+- **Streaming.** Tiles stream in for the camera instead of loading all at once (see
+  [Tile streaming](#tile-streaming)): the tiles in view load nearest first, up to 6 at a
+  time, and tiles that are no longer needed are freed when the GPU budget is reached. The
+  status bar shows the tiles drawn and their GPU memory (hover it for details) and the
+  progress bar shows loading in progress. A tile's `meta.json` loads when it is near the
+  camera (within ~300 m) or when you click one of its features; at most 64 are kept.
   `road_graph.json` and `diagnostics.json` are optional. Missing or broken files show a
   message (a toast, plus a line in **Messages**) and never stop the app. A document whose
   `schema_version` major version is not `1` is rejected.
@@ -227,7 +235,8 @@ remembered in `localStorage`.
   - *Source*: one colour per `source`.
 
   Features without metadata are grey. Terrain is drawn muted so that features on top of
-  it stay readable.
+  it stay readable. In these modes `meta.json` loads for the nearest tiles in view (up to
+  56), so distant tiles on large worlds stay grey.
 - **Topology overlay.** Graph edges are drawn as screen-space lines:
   - blue: two-way road
   - cyan: one-way, with a chevron showing the direction
@@ -260,21 +269,84 @@ remembered in `localStorage`.
   `lat, lon`. The **World** panel lists the region, CRS, sources and licences.
   Attribution is always shown at the bottom right of the status bar.
 
+## Tile streaming
+
+The viewer never holds a whole large world: `src/stream/` selects, loads and frees tiles
+for the current camera.
+
+- **Tileset** (`tileset.ts`): the flat schema 1.x `tiles/index.json` becomes the finest
+  level (0) of a quadtree; content-less ancestors group it into a few roots so whole
+  blocks are culled at once. Coarser levels with content (LOD) plug in here later.
+- **Selection** (`traversal.ts`): frustum culling plus screen-space error refinement
+  (refine above τ = 16 px, collapse below τ / 1.5). A refined tile stays drawn until all
+  its visible children are loaded, and a tile that is not loaded yet is replaced by its
+  loaded children or its nearest loaded ancestor, so there are no holes or overlaps.
+  Tiles just outside the frustum (within ~384 m) are prefetched at low priority. A 1.x
+  world has no coarser level, so every visible tile within the view range is drawn.
+- **Requests** (`requestQueue.ts`): at most 6 GLB fetches, nearest first; fetches for
+  tiles that left the selection are aborted.
+- **Upload**: parsed tiles join the scene within ~4 ms of main-thread time per frame.
+- **Cache** (`cache.ts`): loaded tiles stay (hidden) until the GPU budget (`?gpuBudget=`,
+  default 1 GB) is needed; then the least recently used ones that are not drawn, not
+  ancestors of drawn tiles and not waiting for siblings are evicted and disposed
+  (geometry, materials, textures, instance buffers, colour-mode buffers, building style
+  textures, orthophotos, tree LOD state).
+- **View range**: the far plane, the fog and therefore the streamed area follow the
+  camera's altitude above the ground (6 km at street level up to 60 km), not the world's
+  size. Shadows in both renderings are fitted to what the camera looks at.
+
+Selection runs every frame while the camera moves and at 10 Hz otherwise.
+
+### Fly-through benchmark
+
+`?bench=auto` (or `?bench=<url of a path file>`) waits for the first view to load, flies a
+deterministic Catmull-Rom spline (driven by wall time), then holds still until loading
+has finished. It records, per frame: frame interval, main-thread time, GPU time
+(`EXT_disjoint_timer_query_webgl2`, Chromium), draw calls and triangles, tiles drawn /
+loaded / loading, GPU bytes, JS heap (Chromium) and holes (visible selected tiles with
+nothing drawn); and at the end the time to settle and the per-tile resources still
+alive. The summary is on `window.worldgenBench` (its `status` goes `warmup` → `flying` →
+`settling` → `done`) and is logged to the console. Path file:
+
+```json
+{
+  "name": "river flight",
+  "duration_s": 60,
+  "points": [[-2000, -1500, 250], [0, 0, 220], [1800, 900, 400]],
+  "targets": [[-1600, -1200, 60], [400, 300, 80], [2000, 1200, 90]],
+  "warmup_s": 30,
+  "settle_timeout_s": 30
+}
+```
+
+`points` are camera positions in local ENU metres; `targets` (optional, one per point)
+are look-at points, otherwise the camera looks ahead along the path. Run it with the
+browser window visible: hidden tabs are throttled.
+
 ## Source layout
 
 | File | Purpose |
 |---|---|
 | `src/main.ts` | App wiring: scene, lights, sidebar, events, selection, routing UI |
 | `src/types.ts` | Types that mirror `docs/output-format.md` |
-| `src/loader.ts` | `?world=` resolution, JSON fetching with 404 handling, schema checks, progressive tile loader |
-| `src/world.ts` | Loaded tiles, layer nodes, pickable objects, entity registry and occurrences |
+| `src/loader.ts` | `?world=` resolution, JSON fetching with 404 handling, schema checks |
+| `src/world.ts` | Loaded tiles (add / remove), layer nodes, pickable objects, entity registry from lazily loaded meta.json, occurrences |
+| `src/stream/quadtree.ts` | Tile keys, parent / children by floor shifts, bounds. Pure; unit-tested |
+| `src/stream/tileset.ts` | Tile index → quadtree adapter (1.x: one level under virtual roots). Pure; unit-tested |
+| `src/stream/traversal.ts` | Frustum + screen-space-error selection with hysteresis, no holes or overlaps, prefetch. Pure; unit-tested |
+| `src/stream/requestQueue.ts` | Prioritised fetch queue with a concurrency limit and aborts. Pure; unit-tested |
+| `src/stream/cache.ts` | LRU cache with a cost budget and pinning; `?gpuBudget=` parsing. Pure; unit-tested |
+| `src/stream/metaCache.ts` | Lazily loaded meta.json documents (near the camera, on click), LRU of 64. Unit-tested |
+| `src/stream/TileStreamer.ts` | Glue: traversal → requests → parse → time-sliced upload → eviction |
+| `src/stream/content.ts` | GPU byte estimate and disposal of a tile's content |
+| `src/bench.ts`, `src/benchPath.ts` | Fly-through benchmark (`?bench=`); spline paths and statistics (pure; unit-tested) |
 | `src/picking.ts` | Feature-id and instance-id resolution, raycasting helper, selection highlight |
 | `src/colorModes.ts` | Vertex-colour and instance-colour recolouring per mode; restores original materials |
 | `src/topology.ts` | Road-graph overlay (fat lines, chevrons, node points) and graph picking |
 | `src/routing.ts` | Pure Dijkstra router with one-way handling and turn restrictions. No three.js; unit-tested |
 | `src/routeView.ts` | Route line and start/end markers |
 | `src/validation.ts` | Validation pins and the filterable issue list |
-| `src/controls.ts` | Orbit (MapControls) and fly camera, framing, fly-to, dynamic near/far |
+| `src/controls.ts` | Orbit (MapControls) and fly camera, framing, fly-to, near plane and altitude-based view range |
 | `src/geo.ts` | proj4 WGS84 ↔ local ENU; ENU ↔ three axes `(x, z, -y)` |
 | `src/render/photoreal.ts` | Photo-realistic mode: sky + IBL, sun, fitted shadows, fog, post chain, governor wiring, satellite ground |
 | `src/render/quality.ts` | Graphics levels and the frame-rate governor. Pure; unit-tested |
@@ -285,6 +357,7 @@ remembered in `localStorage`.
 | `src/render/treeLod.ts` | Per-tile tree LOD with impostors sharing the instance matrices |
 | `src/render/sun.ts` | Solar position. Pure; unit-tested |
 | `src/render/gpuTimer.ts` | GPU frame time via `EXT_disjoint_timer_query_webgl2` |
+| `src/render/shadowFit.ts` | Camera-fitted, texel-snapped sun shadow frustum (both renderings) |
 | `src/ui.ts` | DOM helpers, info panel, status bar, toasts, progress bar |
 | `src/dom.ts` | Shared DOM helpers (`h`, sections, checkboxes) without three.js |
 | `src/api.ts`, `src/apiTypes.ts` | `worldgen serve` API client and types (docs/studio-api.md) |
@@ -303,6 +376,12 @@ remembered in `localStorage`.
 | `test/buildingStyle.test.ts` | Region profiles, class/material/levels mapping, colour parsing, determinism, packing |
 | `test/quality.test.ts` | Level monotonicity, feature shedding, governor scale-down/shed/recover/hysteresis |
 | `test/sun.test.ts` | Solar position: equinox, solstice, morning/afternoon, night |
+| `test/quadtree.test.ts` | Keys with negative indices, parent/children, 1.x tileset adapter |
+| `test/traversal.test.ts` | Selection, hysteresis, culling and prefetch, no holes / overlaps for any loaded set and scripted load orders |
+| `test/requestQueue.test.ts` | Priority order, concurrency, aborts of unwanted requests, start gate |
+| `test/cache.test.ts` | LRU order, budget trimming, pinning, `?gpuBudget=` parsing |
+| `test/metaCache.test.ts` | meta.json proximity loading, capacity, required + pinned documents |
+| `test/benchPath.test.ts` | Spline paths, path validation, percentiles, auto path |
 | `vite.config.ts` | Vite config: both pages, the `/world/*` middleware and the `/api` + `/worlds` proxy |
 
 ## How three.js' GLTFLoader exposes the contract
