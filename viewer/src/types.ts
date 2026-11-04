@@ -112,6 +112,9 @@ export interface TilesetDoc extends SchemaDoc {
   ortho?: OrthoIndexInfo | null;
   bounds?: [number, number, number, number] | null;
   subtrees: { si: number; sj: number; bounds?: [number, number, number, number]; zrange?: [number, number] | null; tiles?: number }[];
+  /** Unit tree archetype meshes instanced by every tile (TRE sections). */
+  archetypes?: string;
+  trees?: { seed: number; cell_size: number; archetypes: string[]; categories: string[] };
 }
 
 /** tiles/sub/<si>_<sj>.json: the subtree's tiles per level, columnar. */

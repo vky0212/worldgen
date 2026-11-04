@@ -101,6 +101,42 @@ def test_draped_roads_sit_on_the_runtime_terrain(data_world):
     assert checked > 100
 
 
+def test_tree_records_replace_instances_and_meta(data_world):
+    from worldgen.export.instances import decode_trees, instances_from_records, tree_ids
+    from worldgen.vegetation.regions import instance_transforms
+
+    out, res = data_world
+    world = res.world
+    T = world.config.tiling.tile_size
+    cs = world.config.vegetation.cell_size
+    tr = world.trees
+    pos = {t: k for k, t in enumerate(tr.ids)}
+    assert len(read_glb_json((out / "tiles" / "archetypes.glb").read_bytes())["scenes"][0]["nodes"]) == 5
+    total = 0
+    for content, meta_path in _tiles(out):
+        c = read_container(content.read_bytes())
+        doc = read_glb_json(c.sections["GLB"])
+        assert all(n.get("name") != "trees" for n in doc["nodes"])
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        assert not any(v["kind"] == "tree" for v in meta["entities"].values())
+        rec = decode_trees(c.sections["TRE"])
+        tob = json.loads(c.sections["TOB"]) if "TOB" in c.sections else []
+        x0, y0 = c.i * T, c.j * T
+        ids = tree_ids(rec, tob, (x0, y0, x0 + T, y0 + T), cs)
+        k = np.array([pos[t] for t in ids], dtype=np.int64)
+        inside = (tr.x >= x0) & (tr.x < x0 + T) & (tr.y >= y0) & (tr.y < y0 + T) & tr.rendered_mask()
+        assert sorted(k.tolist()) == np.nonzero(inside)[0].tolist()        # exactly the tile's rendered trees
+        if not len(k):
+            continue
+        ref = instance_transforms(tr, k, (x0, y0))
+        got = instances_from_records(rec, decode_heights(c.sections["HGT"]), x0, y0, T)
+        assert np.abs(got["TRANSLATION"] - ref["TRANSLATION"]).max() < 0.06    # 4 mm position, 5 mm trunk
+        assert np.abs(got["SCALE"] - ref["SCALE"]).max() < 0.06               # 0.1 m crown, 1 cm height
+        assert np.abs(np.abs(got["ROTATION"]) - np.abs(ref["ROTATION"])).max() < 0.02
+        total += len(k)
+    assert total > 1000
+
+
 def test_incremental_and_mode_switch(tmp_path):
     out = tmp_path / "w"
     first = _build(out)
@@ -108,8 +144,9 @@ def test_incremental_and_mode_switch(tmp_path):
     baked = _build(out, mode="baked")
     assert len(baked.tiles_written) == len(first.tiles_written)
     assert (out / "tiles" / "index.json").is_file() and not (out / "tiles" / "tileset.json").exists()
-    assert not (out / "tiles" / "0").exists()
+    assert not (out / "tiles" / "0").exists() and not (out / "tiles" / "archetypes.glb").exists()
     again = _build(out)
     assert len(again.tiles_written) == len(first.tiles_written)
-    assert not (out / "tiles" / "index.json").exists() and not list((out / "tiles").glob("*.glb"))
+    assert not (out / "tiles" / "index.json").exists()
+    assert not [p for p in (out / "tiles").glob("*_*.glb")]                  # no baked tile files left
     assert validate_outputs(out)["errors"] == 0

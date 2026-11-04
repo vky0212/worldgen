@@ -10,6 +10,7 @@
 import { Group, InstancedMesh, Line, Mesh, Points } from 'three';
 import type { BufferGeometry, Object3D } from 'three';
 import { FEATURE_ATTR, featureIdsOf, instanceIdsOf } from './picking';
+import { RECORD_PROVIDER } from './content/wgtScene';
 import { disposeTree, estimateGpuBytes } from './stream/content';
 import type { TileContent } from './stream/content';
 import { LAYER_NAMES } from './types';
@@ -32,6 +33,8 @@ export interface LoadedTile extends TileContent {
   pickables: Pickable[];
   /** Entity ids drawn in this tile (keys into the occurrence index). */
   entityIds: Set<string>;
+  /** Records the tile synthesises itself (data-first trees), by entity id. */
+  records?: (id: string) => EntityRecord | undefined;
 }
 
 export interface EntityEntry {
@@ -92,6 +95,8 @@ export class WorldModel {
       dispose: () => disposeTree(scene),
     };
     this.tileOfRoot.set(scene, entry.id);
+    const provider = (scene.userData as Record<string, unknown>)[RECORD_PROVIDER];
+    if (typeof provider === 'function') tile.records = provider as (id: string) => EntityRecord | undefined;
     collectLayerNodes(scene, tile.layers);
 
     for (const [layer, nodes] of tile.layers) {
@@ -208,7 +213,18 @@ export class WorldModel {
       const r = this.metas.get(tileId)?.meta?.entities[id];
       if (r) return r;
     }
-    return this.entities.get(id)?.record;
+    const known = this.entities.get(id)?.record;
+    if (known) return known;
+    // Data-first tiles synthesise some records (trees) from their own data.
+    if (tileId) {
+      const r = this.tiles.get(tileId)?.records?.(id);
+      if (r) return r;
+    }
+    for (const o of this.occurrences.get(id) ?? []) {
+      const r = this.tiles.get(o.pickable.tileId)?.records?.(id);
+      if (r) return r;
+    }
+    return undefined;
   }
 
   occurrencesOf(id: string): EntityOccurrence[] {

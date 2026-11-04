@@ -88,8 +88,68 @@ def terrain_vectors() -> dict[str, Any]:
             "tiles": tiles}
 
 
+TREE_SEED = 1337
+TREE_CELL = 16.0
+
+
+def tree_vectors() -> dict[str, Any]:
+    """A tile with generated trees, ground cover and one mapped tree: its container (HGT + TRE +
+    TOB) and what a runtime derives from it — ids, instance transforms, per-tree seeds."""
+    from worldgen.export.container import decode_heights, read_container
+    from worldgen.export.instances import FLAG_GROUND, FLAG_TOB, decode_trees, instances_from_records, tree_ids, tree_sections
+    from worldgen.world.model import TreeTable
+
+    hf, rgba, codes = _synthetic()
+    i, j = 1, 1
+    x0, y0 = i * TILE, j * TILE
+    rng = np.random.default_rng(5)
+    n = 9
+    xs = x0 + rng.uniform(0.0, TILE, n)
+    ys = y0 + rng.uniform(0.0, TILE, n)
+    ci, cj = np.floor(xs / TREE_CELL).astype(int), np.floor(ys / TREE_CELL).astype(int)
+    ids = [f"tree:gen:{a}_{b}_{k}" for k, (a, b) in enumerate(zip(ci, cj))]
+    ids[3] = f"tree:gen:{ci[3]}_{cj[3]}_g7"
+    ids[5] = "tree:osm:node/42"
+    arch = ["broadleaf", "conifer", "palm", "grass", "broadleaf", "broadleaf", "shrub", "conifer", "broadleaf"]
+    trees = TreeTable(
+        ids=ids, x=xs, y=ys, ground_z=hf.sample(xs, ys), height=rng.uniform(0.4, 25.0, n),
+        crown_radius=rng.uniform(0.2, 6.0, n), trunk_radius=np.where(np.isin(arch, ["grass", "shrub"]), 0.0,
+                                                                     rng.uniform(0.05, 0.6, n)),
+        yaw=rng.uniform(0.0, 2 * np.pi, n), archetype=arch, species=[None] * 5 + ["Ficus"] + [None] * 3,
+        category=["dense_forest"] * 3 + ["grassland"] + ["urban_trees"] * 2 + ["shrubland"] + ["dense_forest"] * 2,
+        confidence=rng.uniform(0.05, 0.9, n), observed=np.array([k == 5 for k in range(n)]),
+        seed=np.arange(n, dtype=np.uint64), source=["procedural"] * 5 + ["osm"] + ["procedural"] * 3,
+        source_id=[f"seed:{TREE_SEED}"] * 5 + ["node/42"] + [f"seed:{TREE_SEED}"] * 3,
+        inferred=[["height", "crown_radius", "trunk_radius"]] * 5 + [["crown_radius"]] + [["height"]] * 3)
+    idx = np.array([k for a in ("broadleaf", "conifer", "palm", "shrub", "grass") for k in range(n) if arch[k] == a])
+    bounds = (x0, y0, x0 + TILE, y0 + TILE)
+    sections = terrain_sections(hf, bounds, QUANTUM, rgba, codes) + tree_sections(trees, idx, bounds, TREE_CELL)
+    wgt = write_container(0, i, j, sections)
+    c = read_container(wgt)
+    rec = decode_trees(c.sections["TRE"])
+    import json as _json
+    tob = _json.loads(c.sections["TOB"])
+    inst = instances_from_records(rec, decode_heights(c.sections["HGT"]), x0, y0, TILE)
+    seeds = []
+    for r in rec:
+        if r["flags"] & FLAG_TOB:
+            seeds.append(None)
+            continue
+        salt = 6 if r["flags"] & FLAG_GROUND else 3
+        cell_i, cell_j = int(np.floor(x0 / TREE_CELL)) + int(r["dx"]), int(np.floor(y0 / TREE_CELL)) + int(r["dy"])
+        seeds.append(str(int(hash_u64(TREE_SEED, salt, cell_i, cell_j, int(r["k"]))[0]) & 0x7FFFFFFFFFFFFFFF))
+    return {"schema": "worldgen.conformance.tree_tiles", "tile_size": TILE, "cell_size": TREE_CELL,
+            "seed": TREE_SEED, "i": i, "j": j, "wgt_base64": base64.b64encode(wgt).decode("ascii"),
+            "expected": {"ids": tree_ids(rec, tob, bounds, TREE_CELL),
+                         "archetype_codes": [int(v) & 15 for v in rec["arch_cat"]],
+                         "translation": inst["TRANSLATION"].ravel().tolist(),
+                         "rotation": inst["ROTATION"].ravel().tolist(),
+                         "scale": inst["SCALE"].ravel().tolist(), "seeds": seeds},
+            "note": "translation: compare within 1e-4 (float32 of a float64 height lookup)"}
+
+
 def vectors() -> dict[str, dict[str, Any]]:
-    return {"hash64.json": hash_vectors(), "terrain_tiles.json": terrain_vectors()}
+    return {"hash64.json": hash_vectors(), "terrain_tiles.json": terrain_vectors(), "tree_tiles.json": tree_vectors()}
 
 
 def write(out_dir: Path) -> list[Path]:

@@ -20,6 +20,7 @@ from worldgen.config import WorldConfig
 from worldgen.errors import ValidationFailed
 from worldgen.export.container import write_container
 from worldgen.export.heightmap import tile_terrain_sections
+from worldgen.export.instances import archetypes_glb, tree_sections
 from worldgen.export.merge import merge_glbs
 from worldgen.export.ortho import ortho_baker
 from worldgen.export.tiles import (
@@ -51,6 +52,7 @@ from worldgen.spatial.region import Region
 from worldgen.tiling.grid import TileGrid, parse_tile_id
 from worldgen.validation.checks import Report, validate_world
 from worldgen.vegetation.classify import CATEGORIES
+from worldgen.vegetation.placement import ARCHETYPES
 from worldgen.vegetation.regions import environmental_fields
 from worldgen.world.world import CanonicalWorld
 
@@ -191,13 +193,15 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
             progress.tile(t, "building")
             assets = build_tile_assets(world, t, pieces.pop(t, []), None, rgba, arche,
                                        trees_in_tile=tindex.get(t, NO_TREES), entity_index=eindex,
-                                       terrain_mesh=not data)
+                                       terrain_mesh=not data, trees_as_data=data)
             content = out / paths[t]["content"]
             content.parent.mkdir(parents=True, exist_ok=True)
             if data:
                 i, j = parse_tile_id(t)
-                content.write_bytes(write_container(0, i, j, tile_terrain_sections(world, t, rgba)
-                                                    + [("GLB", assets["glb"], False)]))
+                sections = tile_terrain_sections(world, t, rgba)
+                sections += tree_sections(world.trees, assets["tree_idx"], grid.bounds(t), cfg.vegetation.cell_size)
+                sections.append(("GLB", assets["glb"], False))
+                content.write_bytes(write_container(0, i, j, sections))
             else:
                 content.write_bytes(assets["glb"])
             col = out / paths[t]["collision"]
@@ -229,6 +233,11 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
         tileset, subtrees = data_index(tiles, tile_state, cfg.tiling.tile_size, world.terrain.resolution,
                                        cfg.height_quantum(), LAYER_ORDER, ortho_info,
                                        {str(k): v for k, v in LANDCOVER_CODES.items()})
+        tileset["archetypes"] = "tiles/archetypes.glb"
+        tileset["trees"] = {"sections": ["TRE", "TOB"], "seed": cfg.vegetation.seed,
+                            "cell_size": cfg.vegetation.cell_size, "archetypes": ARCHETYPES,
+                            "categories": CATEGORIES, "seed_salts": {"tree": 3, "ground": 6}}
+        (out / "tiles" / "archetypes.glb").write_bytes(archetypes_glb(cfg.vegetation.quality))
         for rel, doc in subtrees.items():
             _write_json(out / rel, doc, indent=None)
         _write_json(out / "tiles" / "tileset.json", tileset, indent=1)
@@ -285,7 +294,9 @@ def _remove_other_layout(out: Path, mode: str) -> None:
         for p in tiles.iterdir():
             if p.is_dir() and (p.name == "sub" or p.name.isdigit()):
                 shutil.rmtree(p)
-        (tiles / "tileset.json").unlink()
+        for name in ("tileset.json", "archetypes.glb"):
+            if (tiles / name).exists():
+                (tiles / name).unlink()
 
 
 def _combined_glb_wanted(cfg: WorldConfig, n_tiles: int) -> bool:
