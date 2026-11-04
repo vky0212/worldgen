@@ -121,6 +121,23 @@ def build_options(body: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def spawn_build(cmd: list[str], env: dict[str, str]) -> subprocess.Popen:
+    """Starts a build subprocess with text pipes for stdout/stderr.
+
+    On POSIX it is started with posix_spawn rather than fork(). Plan previews load PROJ into
+    this long-running, multi-threaded server, and PROJ registers an at-fork handler that
+    closes its proj.db SQLite handles in a forked child. On macOS that handler crashes the
+    child with SIGSEGV before the build starts ("build exited with code -11"). posix_spawn
+    runs no at-fork handlers. Python only takes that path with ``close_fds=False`` (and no
+    cwd, preexec_fn or new session). That is safe: Python creates file descriptors
+    non-inheritable (PEP 446), so the child still gets only its three standard streams.
+    """
+    windows = sys.platform == "win32"
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, env=env,
+                            text=True, encoding="utf-8", errors="replace", bufsize=1, close_fds=windows,
+                            creationflags=subprocess.CREATE_NO_WINDOW if windows else 0)
+
+
 def option_overrides(req: dict[str, Any]) -> list[str]:
     """``--set`` overrides for the build command."""
     sets: list[str] = []
@@ -325,10 +342,7 @@ class JobManager:
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
         src = str(Path(__file__).resolve().parents[1])
         env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
-        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        job.proc = subprocess.Popen(self.command(job), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    stdin=subprocess.DEVNULL, env=env, text=True, encoding="utf-8",
-                                    errors="replace", bufsize=1, creationflags=flags)
+        job.proc = spawn_build(self.command(job), env)
         if job.cancel_requested:   # cancelled between the state change and the process start
             job.proc.terminate()
         stderr_tail: deque[str] = deque(maxlen=20)
