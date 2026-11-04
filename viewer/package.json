@@ -9,7 +9,7 @@
     "build": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json",
-    "test": "node --test test/routing.test.ts test/progress.test.ts test/region.test.ts test/buildingStyle.test.ts test/quality.test.ts test/sun.test.ts test/quadtree.test.ts test/traversal.test.ts test/requestQueue.test.ts test/cache.test.ts test/metaCache.test.ts test/benchPath.test.ts"
+    "test": "node --test test/routing.test.ts test/progress.test.ts test/region.test.ts test/buildingStyle.test.ts test/quality.test.ts test/sun.test.ts test/quadtree.test.ts test/traversal.test.ts test/requestQueue.test.ts test/cache.test.ts test/metaCache.test.ts test/benchPath.test.ts test/wgt.test.ts"
   },
   "dependencies": {
     "leaflet": "1.9.4",

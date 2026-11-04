@@ -65,7 +65,8 @@ export interface Manifest extends SchemaDoc {
   origin?: { lat: number; lon: number; height?: number };
   gltf?: { up?: string; mapping?: string };
   local_bounds?: LocalBounds;
-  tiling?: { tile_size?: number; tile_count?: number; index?: string };
+  /** 1.x: `index` (flat tiles/index.json); 2.x data-first: `mode: "data"` and `tileset`. */
+  tiling?: { tile_size?: number; tile_count?: number; index?: string; tileset?: string; mode?: string };
   layers?: string[];
   config?: Record<string, unknown>;
   config_hash?: string;
@@ -96,6 +97,38 @@ export interface TileEntry {
   ortho?: string | null;
   hash?: string;
   counts?: Record<string, number>;
+  /** Content format: a baked GLB (default) or a data-first `.wgt` container (format 2.x). */
+  format?: 'glb' | 'wgt';
+}
+
+/** tiles/tileset.json of a data-first world (format 2.x). */
+export interface TilesetDoc extends SchemaDoc {
+  tile_size: number;
+  subtree_tiles?: number;
+  levels?: { level: number; size: number; spacing?: number; geometric_error?: number }[];
+  uri: { content: string; meta?: string; collision?: string; ortho?: string; subtree: string };
+  terrain?: { sections?: string[]; quantum?: number; apron?: number; triangulation?: string };
+  layers?: string[];
+  ortho?: OrthoIndexInfo | null;
+  bounds?: [number, number, number, number] | null;
+  subtrees: { si: number; sj: number; bounds?: [number, number, number, number]; zrange?: [number, number] | null; tiles?: number }[];
+}
+
+/** tiles/sub/<si>_<sj>.json: the subtree's tiles per level, columnar. */
+export interface SubtreeDoc extends SchemaDoc {
+  si: number;
+  sj: number;
+  levels: {
+    level: number;
+    i: number[];
+    j: number[];
+    zmin: (number | null)[];
+    zmax: (number | null)[];
+    hash?: string[];
+    /** bit 0: meta.json, bit 1: ortho.jpg, bit 2: collision.glb */
+    flags?: number[];
+    counts?: Record<string, number[]>;
+  }[];
 }
 
 /** tiles/index.json → ortho: settings of the baked satellite orthophotos. */

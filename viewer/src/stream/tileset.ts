@@ -12,7 +12,7 @@
  *
  * Pure module: no three.js, no DOM (unit-tested with node --test).
  */
-import type { TileEntry, TileIndex } from '../types';
+import type { SubtreeDoc, TileEntry, TileIndex, TilesetDoc } from '../types';
 import { keyBounds, keyId, parentKey } from './quadtree.ts';
 import type { Bounds2, TileKey } from './quadtree.ts';
 
@@ -150,6 +150,51 @@ export function tilesetFromIndex(index: TileIndex, defaultZ: [number, number] = 
   }
 
   return { tileSize, roots: level, nodes, byContentId, contentNodes, skipped };
+}
+
+/** Fills a tileset URI template ("tiles/{level}/{si}_{sj}/{i}_{j}.wgt"). */
+export function fillUri(template: string, keys: Record<string, number>): string {
+  return template.replace(/\{(\w+)\}/g, (m, k: string) => (k in keys ? String(keys[k]) : m));
+}
+
+/**
+ * The level-0 tiles of a data-first world (format 2.x: tiles/tileset.json and its
+ * subtree files) as index entries whose content is a `.wgt` container, so the
+ * quadtree and streamer treat them like 1.x tiles.
+ */
+export function indexFromTileset(ts: TilesetDoc, subtrees: readonly SubtreeDoc[]): TileIndex {
+  const size = Number(ts.tile_size) > 0 ? Number(ts.tile_size) : DEFAULT_TILE_SIZE;
+  const tiles: TileEntry[] = [];
+  for (const sub of subtrees) {
+    for (const lvl of sub.levels ?? []) {
+      if (lvl.level !== 0) continue; // coarser levels arrive with the LOD pyramid
+      for (let k = 0; k < lvl.i.length; k++) {
+        const i = lvl.i[k];
+        const j = lvl.j[k];
+        const keys = { level: 0, si: sub.si, sj: sub.sj, i, j };
+        const flags = lvl.flags?.[k] ?? 1;
+        const zmin = lvl.zmin?.[k];
+        const zmax = lvl.zmax?.[k];
+        const counts: Record<string, number> = {};
+        for (const [name, arr] of Object.entries(lvl.counts ?? {})) counts[name] = arr[k] ?? 0;
+        tiles.push({
+          id: `${i}_${j}`,
+          i,
+          j,
+          bounds: [i * size, j * size, (i + 1) * size, (j + 1) * size],
+          zrange: zmin != null && zmax != null ? [zmin, zmax] : undefined,
+          glb: fillUri(ts.uri.content, keys),
+          meta: flags & 1 && ts.uri.meta ? fillUri(ts.uri.meta, keys) : null,
+          ortho: flags & 2 && ts.uri.ortho ? fillUri(ts.uri.ortho, keys) : null,
+          collision: flags & 4 && ts.uri.collision ? fillUri(ts.uri.collision, keys) : null,
+          hash: lvl.hash?.[k],
+          counts,
+          format: 'wgt',
+        });
+      }
+    }
+  }
+  return { schema: 'worldgen.tile_index', schema_version: ts.schema_version, tile_size: size, ortho: ts.ortho ?? null, tiles };
 }
 
 function unionBounds(a: Bounds2, b: Bounds2): Bounds2 {

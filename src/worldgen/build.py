@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import platform
+import shutil
 import time
 from dataclasses import dataclass
 from importlib import metadata
@@ -17,6 +18,8 @@ from rasterio.transform import Affine
 from worldgen import SCHEMA_VERSION, __version__
 from worldgen.config import WorldConfig
 from worldgen.errors import ValidationFailed
+from worldgen.export.container import write_container
+from worldgen.export.heightmap import tile_terrain_sections
 from worldgen.export.merge import merge_glbs
 from worldgen.export.ortho import ortho_baker
 from worldgen.export.tiles import (
@@ -34,6 +37,7 @@ from worldgen.export.tiles import (
     trees_by_tile,
     world_tiles,
 )
+from worldgen.export.tileset import DATA_SCHEMA_VERSION, data_index, tile_paths
 from worldgen.export.vectors import write_geoparquet
 from worldgen.hashing import sha256_file
 from worldgen.landcover.landcover import LANDCOVER_CODES
@@ -44,7 +48,7 @@ from worldgen.sources.base import SourceRecord, write_geotiff
 from worldgen.sources.synthetic import load_fixture
 from worldgen.spatial.raster import GeoRaster
 from worldgen.spatial.region import Region
-from worldgen.tiling.grid import TileGrid
+from worldgen.tiling.grid import TileGrid, parse_tile_id
 from worldgen.validation.checks import Report, validate_world
 from worldgen.vegetation.classify import CATEGORIES
 from worldgen.vegetation.regions import environmental_fields
@@ -129,9 +133,12 @@ def _write_json(path: Path, data: Any, indent: int | None = None) -> None:
 def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> tuple[list[str], list[str]]:
     cfg = world.config
     out = opts.output
+    mode = cfg.export.mode
     (out / "tiles").mkdir(parents=True, exist_ok=True)
+    _remove_other_layout(out, mode)
     grid = TileGrid(cfg.tiling.tile_size)
     tiles = world_tiles(world)
+    paths = {t: tile_paths(mode, t) for t in tiles}
 
     state_path = out / "build_state.json"
     prev: dict[str, Any] = {}
@@ -151,9 +158,9 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
     baker = ortho_baker(world)
     dirty = []
     for t in tiles:
-        files_ok = (out / "tiles" / f"{t}.glb").is_file() and (out / "tiles" / f"{t}.meta.json").is_file()
+        files_ok = (out / paths[t]["content"]).is_file() and (out / paths[t]["meta"]).is_file()
         if baker is not None:
-            files_ok = files_ok and (out / "tiles" / f"{t}.ortho.jpg").is_file()
+            files_ok = files_ok and (out / paths[t]["ortho"]).is_file()
         if opts.force or not files_ok or prev_tiles.get(t, {}).get("hash") != hashes[t]:
             dirty.append(t)
     if opts.only_tiles is not None:
@@ -177,20 +184,29 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
     arche = archetypes_for(world)
     eindex = world.entity_index()
     built: dict[str, dict[str, Any]] = {}
+    data = mode == "data"
     for block in tile_blocks(dirty, EXPORT_BLOCK_TILES):
         pieces = generate_pieces(world, set(block), selector)
         for t in block:
             progress.tile(t, "building")
             assets = build_tile_assets(world, t, pieces.pop(t, []), None, rgba, arche,
-                                       trees_in_tile=tindex.get(t, NO_TREES), entity_index=eindex)
-            (out / "tiles" / f"{t}.glb").write_bytes(assets["glb"])
-            col = out / "tiles" / f"{t}.collision.glb"
+                                       trees_in_tile=tindex.get(t, NO_TREES), entity_index=eindex,
+                                       terrain_mesh=not data)
+            content = out / paths[t]["content"]
+            content.parent.mkdir(parents=True, exist_ok=True)
+            if data:
+                i, j = parse_tile_id(t)
+                content.write_bytes(write_container(0, i, j, tile_terrain_sections(world, t, rgba)
+                                                    + [("GLB", assets["glb"], False)]))
+            else:
+                content.write_bytes(assets["glb"])
+            col = out / paths[t]["collision"]
             if assets["collision"] is not None:
                 col.write_bytes(assets["collision"])
             elif col.exists():
                 col.unlink()
-            _write_json(out / "tiles" / f"{t}.meta.json", assets["meta"])
-            ortho = out / "tiles" / f"{t}.ortho.jpg"
+            _write_json(out / paths[t]["meta"], assets["meta"])
+            ortho = out / paths[t]["ortho"]
             if baker is not None:
                 ortho.write_bytes(baker.bake(grid.bounds(t)))
             elif ortho.exists():
@@ -209,28 +225,38 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
     ortho_info = baker.describe() if baker is not None else None
     if ortho_info is not None:
         world.stats["ortho"] = ortho_info
-    index = {"schema": "worldgen.tile_index", "schema_version": SCHEMA_VERSION, "tile_size": cfg.tiling.tile_size,
-             "layers": LAYER_ORDER, "ortho": ortho_info, "tiles": []}
-    for t in tiles:
-        st = tile_state.get(t, {})
-        index["tiles"].append({
-            "id": t, "i": int(t.split("_")[0]), "j": int(t.split("_")[1]), "bounds": list(grid.bounds(t)),
-            "zrange": st.get("zrange"), "glb": f"tiles/{t}.glb",
-            "collision": f"tiles/{t}.collision.glb" if st.get("collision") else None,
-            "meta": f"tiles/{t}.meta.json",
-            "ortho": f"tiles/{t}.ortho.jpg" if st.get("ortho") else None,
-            "hash": hashes[t], "counts": st.get("counts", {}),
-        })
-    _write_json(out / "tiles" / "index.json", index, indent=1)
+    if data:
+        tileset, subtrees = data_index(tiles, tile_state, cfg.tiling.tile_size, world.terrain.resolution,
+                                       cfg.height_quantum(), LAYER_ORDER, ortho_info,
+                                       {str(k): v for k, v in LANDCOVER_CODES.items()})
+        for rel, doc in subtrees.items():
+            _write_json(out / rel, doc, indent=None)
+        _write_json(out / "tiles" / "tileset.json", tileset, indent=1)
+    else:
+        index = {"schema": "worldgen.tile_index", "schema_version": SCHEMA_VERSION,
+                 "tile_size": cfg.tiling.tile_size, "layers": LAYER_ORDER, "ortho": ortho_info, "tiles": []}
+        for t in tiles:
+            st = tile_state.get(t, {})
+            index["tiles"].append({
+                "id": t, "i": int(t.split("_")[0]), "j": int(t.split("_")[1]), "bounds": list(grid.bounds(t)),
+                "zrange": st.get("zrange"), "glb": f"tiles/{t}.glb",
+                "collision": f"tiles/{t}.collision.glb" if st.get("collision") else None,
+                "meta": f"tiles/{t}.meta.json",
+                "ortho": f"tiles/{t}.ortho.jpg" if st.get("ortho") else None,
+                "hash": hashes[t], "counts": st.get("counts", {}),
+            })
+        _write_json(out / "tiles" / "index.json", index, indent=1)
     _write_json(state_path, {"world_key": _world_key(world), "tiles": tile_state}, indent=1)
 
     combined = out / "world.glb"
-    if _combined_glb_wanted(cfg, len(tiles)):
+    if not data and _combined_glb_wanted(cfg, len(tiles)):
         files = [(out / "tiles" / f"{t}.glb").read_bytes() for t in tiles if (out / "tiles" / f"{t}.glb").is_file()]
         if files:
             combined.write_bytes(merge_glbs(files, "world", {"origin": _origin(world)}))
     else:
-        if cfg.export.combined_glb:
+        if cfg.export.combined_glb and data:
+            log.info("world.glb not written: data-first tiles carry no terrain mesh to combine")
+        elif cfg.export.combined_glb:
             log.info("world.glb not written: %d tiles exceed export.combined_glb_max_tiles=%d",
                      len(tiles), cfg.export.combined_glb_max_tiles)
         if combined.exists():
@@ -246,6 +272,20 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
     _write_json(out / "diagnostics.json", report.to_dict(world), indent=1)
     (out / "ATTRIBUTION.txt").write_text(attribution_text(world), encoding="utf-8")
     return dirty, skipped
+
+
+def _remove_other_layout(out: Path, mode: str) -> None:
+    """Delete tile files of the other export mode left by an earlier build into ``out``."""
+    tiles = out / "tiles"
+    if mode == "data" and (tiles / "index.json").exists():
+        for p in tiles.iterdir():
+            if p.is_file():
+                p.unlink()
+    elif mode == "baked" and (tiles / "tileset.json").exists():
+        for p in tiles.iterdir():
+            if p.is_dir() and (p.name == "sub" or p.name.isdigit()):
+                shutil.rmtree(p)
+        (tiles / "tileset.json").unlink()
 
 
 def _combined_glb_wanted(cfg: WorldConfig, n_tiles: int) -> bool:
@@ -365,8 +405,14 @@ def write_manifest(world: CanonicalWorld, report: Report, opts: BuildOptions, du
             libs[lib] = metadata.version(lib)
         except metadata.PackageNotFoundError:
             pass
+    data = cfg.export.mode == "data"
+    tiling: dict[str, Any] = {"tile_size": cfg.tiling.tile_size, "tile_count": len(world_tiles(world))}
+    if data:
+        tiling.update(mode="data", tileset="tiles/tileset.json")
+    else:
+        tiling["index"] = "tiles/index.json"
     manifest = {
-        "schema": "worldgen.manifest", "schema_version": SCHEMA_VERSION,
+        "schema": "worldgen.manifest", "schema_version": DATA_SCHEMA_VERSION if data else SCHEMA_VERSION,
         "compiler": {"name": "worldgen", "version": __version__, "python": platform.python_version(),
                      "libraries": libs},
         "build": {"created_utc": _dt.datetime.now(_dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
@@ -380,8 +426,7 @@ def write_manifest(world: CanonicalWorld, report: Report, opts: BuildOptions, du
         "gltf": {"up": "+Y", "mapping": "gltf = (x, z, -y)", "tile_root_translation": "tile minimum corner"},
         "local_bounds": {"xmin": xmin, "ymin": ymin, "xmax": xmax, "ymax": ymax,
                          "zmin": round(zr[0], 3), "zmax": round(zr[1], 3)},
-        "tiling": {"tile_size": cfg.tiling.tile_size, "tile_count": len(world_tiles(world)),
-                   "index": "tiles/index.json"},
+        "tiling": tiling,
         "layers": LAYER_ORDER,
         "config": cfg.to_dict(), "config_hash": cfg.hash(),
         "sources": [s.to_dict() for s in world.sources],

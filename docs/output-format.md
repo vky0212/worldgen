@@ -14,6 +14,15 @@ Version history (minor versions keep the layout; consumers of 1.0 read 1.x):
   `export.combined_glb_max_tiles` tiles.
 * **1.0.0** — initial format.
 
+Major version 2 is the **data-first** layout (`export.mode: data`, see
+[Data-first tiles](#data-first-tiles-format-2x)): terrain ships as heightmaps that
+consumers mesh themselves. `export.mode: baked` (the default) keeps writing 1.x.
+
+* **2.0.0** — `tiles/tileset.json`, subtree files and one `.wgt` container per tile
+  (heightmap, colours, land cover, and the other layers as an embedded GLB). The
+  manifest, tileset and subtree documents carry 2.0.0; the other documents keep their
+  1.x layout and version.
+
 ## Directory layout
 
 ```text
@@ -224,6 +233,79 @@ service, licence, attribution, resolution) is the `imagery` entry of
 
 Observed and inferred values are always kept in separate maps; a key that
 appears only in `inferred` is an estimate, a key in `missing` is unknown.
+
+## Data-first tiles (format 2.x)
+
+With `export.mode: data` the tiles carry **data** where a consumer can generate geometry
+cheaply: the terrain is a heightmap (about 2.3× smaller than the mesh in practice) that
+viewers and engines mesh — and later level — themselves; Unreal Landscape, Unity
+Terrain and Godot heightmap terrains take it natively. Every other layer is still a
+mesh, in an embedded GLB with the same nodes, extras and feature ids as a baked tile.
+`manifest.tiling` is `{"mode": "data", "tileset": "tiles/tileset.json", …}`.
+
+```text
+tiles/
+├── tileset.json                        # levels, URI templates, codes, subtree list
+├── sub/<si>_<sj>.json                  # per 4096 m square: its tiles, columnar
+└── <level>/<si>_<sj>/<i>_<j>.wgt       # tile container (level 0 = 256 m tiles)
+    0/<si>_<sj>/<i>_<j>.meta.json|.collision.glb|.ortho.jpg   # as in 1.x, level 0 only
+```
+
+`(si, sj) = (floor(i / 16), floor(j / 16))`; tile `(i, j)` covers the same square as in 1.x.
+
+### tiles/tileset.json
+
+```jsonc
+{
+  "schema": "worldgen.tileset", "schema_version": "2.0.0",
+  "tile_size": 256, "subtree_tiles": 16,
+  "levels": [{"level": 0, "size": 256, "spacing": 4.0, "geometric_error": 0.0}],
+  "uri": {"content": "tiles/{level}/{si}_{sj}/{i}_{j}.wgt", "meta": "…", "collision": "…",
+          "ortho": "…", "subtree": "tiles/sub/{si}_{sj}.json"},
+  "terrain": {"sections": ["HGT", "RGB", "LCC"], "quantum": 0.01, "apron": 1,
+              "triangulation": "quad (i,j)-(i+1,j+1) diagonal"},
+  "layers": [...], "landcover_codes": {"1": "forest", ...}, "ortho": {...} | null,
+  "bounds": [xmin, ymin, xmax, ymax],
+  "subtrees": [{"si": 0, "sj": 0, "bounds": [0, 0, 4096, 4096], "zrange": [2.2, 39.9], "tiles": 8}]
+}
+```
+
+### tiles/sub/<si>_<sj>.json
+
+One entry per level, columnar arrays over the subtree's tiles:
+`i`, `j`, `zmin`, `zmax` (terrain and everything on it), `hash` (first 16 hex digits of the
+tile input hash, for cache busting), `flags` (bit 0: `meta.json`, bit 1: `ortho.jpg`,
+bit 2: `collision.glb`) and `counts` (per layer, like the 1.x index).
+
+### .wgt container
+
+Little-endian. A 24-byte header `char[4] "WGT1"`, `u16 version (1)`, `u16 section count`,
+`u8 level`, 3 bytes padding, `i32 i`, `i32 j`, `u32 reserved`; then one 16-byte entry per
+section: `char[4] tag` (space padded), `u32 offset`, `u32 stored length`, `u16 flags`
+(bit 0: stored as raw DEFLATE, RFC 1951), `u16` padding. Section data start 8-byte aligned.
+Readers ignore unknown tags. Sections:
+
+| tag | content |
+|---|---|
+| `HGT ` | 48-byte header `u16 nx, u16 ny, u8 dtype (1 = u16, 2 = u32), u8 apron (1), u16 reserved, f64 spacing, f64 quantum, i64 offset, f64 x0, f64 y0`, then `nx·ny` heights, row 0 south, west to east. Height = `(offset + value) × quantum` (float64). The grid is the tile's nodes (shared edges included, 65 × 65 for 256 m tiles at 4 m) plus a one-node **apron** on every side; `(x0, y0)` is the apron's south-west node. Beyond the edge of the world the apron is linearly extrapolated. |
+| `RGB ` | `u16 nx, u16 ny`, then `u8 r, g, b` per tile node (no apron): the blended terrain colour (the `COLOR_0` of a baked tile). |
+| `LCC ` | `u16 nx, u16 ny`, then the `u8` land-cover code per tile node (`landcover_codes`). |
+| `GLB ` | The tile's other layers as a GLB, exactly like a baked tile minus its `terrain` layer node. |
+
+The shaped terrain is rounded to `quantum` (1 cm) **before** roads are draped, trees placed
+and buildings founded, so decoding a heightmap gives bit for bit the surface everything was
+fitted to.
+
+**Meshing a tile** (what a baked tile's terrain contains; `export/heightmap.py` is the
+reference): one vertex per tile node; two triangles per cell, `(c,r)-(c+1,r)-(c+1,r+1)` and
+`(c,r)-(c+1,r+1)-(c,r+1)`; normals from central differences over the apron,
+`n ∝ (−∂z/∂x, −∂z/∂y, 1)`; texture coordinates `u = (x − xmin)/T`, `v = (y − ymin)/T`
+(glTF `v' = 1 − v`); colours from `RGB `. The terrain's feature id is `terrain:<i>_<j>`
+and its record is in the tile's `meta.json`.
+
+**Conformance:** `tests/conformance/` (written by `python -m worldgen.conformance`)
+holds `hash64.json` and `terrain_tiles.json` — containers with the exact vertex arrays of
+their baked terrain — that every implementation can test against.
 
 ## graph/road_graph.json
 
