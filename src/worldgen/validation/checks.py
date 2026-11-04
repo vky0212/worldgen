@@ -444,14 +444,17 @@ def check_terrain_seams(world: CanonicalWorld) -> list[Issue]:
     hf = world.terrain
     grid = TileGrid(world.config.tiling.tile_size)
     tiles = {parse_tile_id(t) for t in [tile_id(i, j) for i, j in world.region.tiles()]}
+    # Whole-grid normals once: tile_mesh would otherwise recompute them on every call, which
+    # makes this check quadratic in the region size. Only positions are compared below.
+    normals = hf.vertex_normals()
     out = []
     for i, j in sorted(tiles):
         for di, dj in ((1, 0), (0, 1)):
             q = (i + di, j + dj)
             if q not in tiles:
                 continue
-            a = hf.tile_mesh(*grid.bounds(tile_id(i, j)))
-            b = hf.tile_mesh(*grid.bounds(tile_id(*q)))
+            a = hf.tile_mesh(*grid.bounds(tile_id(i, j)), normals=normals)
+            b = hf.tile_mesh(*grid.bounds(tile_id(*q)), normals=normals)
             if di:
                 edge = grid.bounds(tile_id(*q))[0]
                 ea = a.positions[np.isclose(a.positions[:, 0], edge)]
@@ -576,7 +579,9 @@ def check_tree_tile_independence(world: CanonicalWorld) -> list[Issue]:
     gen_mask = np.array([s == "procedural" and a in ("broadleaf", "conifer", "palm")
                          for s, a in zip(tr.source, tr.archetype)])
     tile_of = grid.tiles_of(tr.x, tr.y)
-    counts = {t: int(np.sum(gen_mask & (tile_of == t))) for t in tiles}
+    names, n = np.unique(tile_of[gen_mask], return_counts=True)
+    per_tile = dict(zip(names.tolist(), n.tolist()))
+    counts = {t: per_tile.get(t, 0) for t in tiles}
     sample = sorted(tiles, key=lambda t: (-counts[t], t))[:2]
     excl = vegetation_exclusions(world, world.config.vegetation.exclusion_buffer)
     out = []

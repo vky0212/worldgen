@@ -21,12 +21,14 @@ from worldgen.export.merge import merge_glbs
 from worldgen.export.ortho import ortho_baker
 from worldgen.export.tiles import (
     LAYER_ORDER,
+    NO_TREES,
     archetypes_for,
     build_tile_assets,
     entity_strtree,
     generate_pieces,
     terrain_render_inputs,
     tile_input_hash,
+    trees_by_tile,
     world_tiles,
 )
 from worldgen.export.vectors import write_geoparquet
@@ -135,8 +137,10 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
     if prev.get("world_key") != _world_key(world):
         prev = {}
     prev_tiles = prev.get("tiles", {})
+    # World-level indexes, built once: per-tile lookups must not scan every tree or entity.
     etree = entity_strtree(world)
-    hashes = {t: tile_input_hash(world, t, etree) for t in tiles}
+    tindex = trees_by_tile(world)
+    hashes = {t: tile_input_hash(world, t, etree, tindex) for t in tiles}
     baker = ortho_baker(world)
     dirty = []
     for t in tiles:
@@ -161,10 +165,12 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
     pieces = generate_pieces(world, set(dirty)) if dirty else {}
     normals, rgba = terrain_render_inputs(world)
     arche = archetypes_for(world)
+    eindex = world.entity_index()
     tile_state = dict(prev_tiles)
     for k, t in enumerate(dirty):
         progress.tile(t, "building")
-        assets = build_tile_assets(world, t, pieces.get(t, []), normals, rgba, arche)
+        assets = build_tile_assets(world, t, pieces.get(t, []), normals, rgba, arche,
+                                   trees_in_tile=tindex.get(t, NO_TREES), entity_index=eindex)
         (out / "tiles" / f"{t}.glb").write_bytes(assets["glb"])
         col = out / "tiles" / f"{t}.collision.glb"
         if assets["collision"] is not None:

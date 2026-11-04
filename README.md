@@ -191,6 +191,22 @@ uv run pytest
 
 The viewer has its own tests: `cd viewer && npm test`.
 
+## Benchmarks
+
+`benchmarks/scale_bench.py` measures how a build scales with area: it compiles,
+validates and exports centred sub-regions of one region (each in its own
+process, sources read offline from the cache) and reports seconds per stage and
+per validation check, peak memory and output size, normalised per km².
+
+```bash
+uv run python benchmarks/scale_bench.py --world generated/taipei --fractions 0.25,0.5,1 --json before.json
+```
+
+`--set key=value` compares levels of detail (e.g. `terrain.resolution=16`),
+`--baseline before.json` reports the speed-up of a later run (another branch,
+a native kernel) against saved results, and `--fixture NAME` runs offline on a
+synthetic scenario.
+
 ## Repository layout
 
 ```text

@@ -29,13 +29,49 @@ from worldgen.world.world import CanonicalWorld
 
 LAYER_ORDER = ["terrain", "roads", "bridges", "tunnels", "buildings", "water", "vegetation_regions", "trees"]
 
+NO_TREES = np.zeros(0, dtype=np.int64)
+
 
 def world_tiles(world: CanonicalWorld) -> list[str]:
     return [tile_id(i, j) for i, j in world.region.tiles()]
 
 
-def tile_input_hash(world: CanonicalWorld, tid: str, entity_tree: tuple[STRtree, list[Any]] | None = None) -> str:
-    """Hash of everything that can influence a tile's assets."""
+def _owner_cell(v: np.ndarray, size: float) -> np.ndarray:
+    """Tile index k with k*size <= v < (k+1)*size, exactly as the tile bounds test decides it."""
+    k = np.floor(v / size).astype(np.int64)
+    # v / size can round across a tile line; settle it with the same products TileGrid.bounds uses.
+    k -= (v < k * size).astype(np.int64)
+    k += (v >= (k + 1) * size).astype(np.int64)
+    return k
+
+
+def trees_by_tile(world: CanonicalWorld) -> dict[str, np.ndarray]:
+    """Indices (ascending) of the rendered trees owned by each tile.
+
+    Built once per export: testing every tree against every tile's bounds is
+    O(tiles x trees). Ownership equals ``x0 <= x < x1 and y0 <= y < y1`` on the tile bounds.
+    """
+    tr = world.trees
+    if not len(tr):
+        return {}
+    size = float(world.config.tiling.tile_size)
+    idx = np.nonzero(tr.rendered_mask())[0]
+    i = _owner_cell(tr.x[idx], size)
+    j = _owner_cell(tr.y[idx], size)
+    order = np.lexsort((idx, j, i))
+    idx, i, j = idx[order], i[order], j[order]
+    starts = np.flatnonzero(np.r_[True, (i[1:] != i[:-1]) | (j[1:] != j[:-1])])
+    ends = np.r_[starts[1:], len(idx)]
+    return {tile_id(int(i[a]), int(j[a])): idx[a:b] for a, b in zip(starts, ends)}
+
+
+def tile_input_hash(world: CanonicalWorld, tid: str, entity_tree: tuple[STRtree, list[Any]] | None = None,
+                    tree_index: dict[str, np.ndarray] | None = None) -> str:
+    """Hash of everything that can influence a tile's assets.
+
+    ``entity_tree`` (``entity_strtree``) and ``tree_index`` (``trees_by_tile``) are world-level
+    indexes; pass them when hashing many tiles.
+    """
     cfg = world.config
     grid = TileGrid(cfg.tiling.tile_size)
     x0, y0, x1, y1 = grid.bounds(tid)
@@ -76,8 +112,10 @@ def tile_input_hash(world: CanonicalWorld, tid: str, entity_tree: tuple[STRtree,
     parts["entities"] = sha256_json(round_floats(ent_parts, 3))
     tr = world.trees
     if len(tr):
-        m = (tr.x >= x0) & (tr.x < x1) & (tr.y >= y0) & (tr.y < y1) & tr.rendered_mask()
-        idx = np.nonzero(m)[0]
+        if tree_index is not None:
+            idx = tree_index.get(tid, NO_TREES)
+        else:
+            idx = np.nonzero((tr.x >= x0) & (tr.x < x1) & (tr.y >= y0) & (tr.y < y1) & tr.rendered_mask())[0]
         parts["trees"] = sha256_json([[tr.ids[i], round(float(tr.x[i]), 2), round(float(tr.y[i]), 2),
                                        round(float(tr.height[i]), 2), tr.archetype[i]] for i in idx])
     # Orthophoto: imagery content + bake settings. World-level, because the colour levels are.
@@ -115,8 +153,15 @@ def generate_pieces(world: CanonicalWorld, wanted: set[str]) -> dict[str, list[P
 
 
 def build_tile_assets(world: CanonicalWorld, tid: str, pieces: list[Piece], terrain_normals: np.ndarray,
-                      terrain_rgba: np.ndarray, arche: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    """Return {"glb": bytes, "collision": bytes|None, "meta": dict, "counts": dict, "zrange": [..]}."""
+                      terrain_rgba: np.ndarray, arche: dict[str, dict[str, Any]], *,
+                      trees_in_tile: np.ndarray | None = None,
+                      entity_index: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return {"glb": bytes, "collision": bytes|None, "meta": dict, "counts": dict, "zrange": [..]}.
+
+    ``trees_in_tile`` (this tile's entry of ``trees_by_tile``) and ``entity_index``
+    (``world.entity_index()``) are computed once per export by the caller; without them they are
+    derived here, which costs O(trees + entities) per tile.
+    """
     cfg = world.config
     grid = TileGrid(cfg.tiling.tile_size)
     x0, y0, x1, y1 = grid.bounds(tid)
@@ -152,17 +197,20 @@ def build_tile_assets(world: CanonicalWorld, tid: str, pieces: list[Piece], terr
             children.append(gb.add_node(name, mesh=mi, extras={"layer": name}))
     # Trees: instanced archetypes.
     tr = world.trees
-    tree_ids: list[str] = []
+    tree_idx: list[np.ndarray] = []
     n_trees = 0
     if len(tr):
-        inside = (tr.x >= x0) & (tr.x < x1) & (tr.y >= y0) & (tr.y < y1) & tr.rendered_mask()
+        if trees_in_tile is None:
+            trees_in_tile = np.nonzero((tr.x >= x0) & (tr.x < x1) & (tr.y >= y0) & (tr.y < y1)
+                                       & tr.rendered_mask())[0]
+        tile_arch = np.array([tr.archetype[k] for k in trees_in_tile], dtype=object)
         tree_children = []
         for arch in ARCHETYPE_ORDER:
-            idx = np.nonzero(inside & (np.array(tr.archetype, dtype=object) == arch))[0]
+            idx = trees_in_tile[tile_arch == arch]
             if len(idx) == 0:
                 continue
             ids = [tr.ids[i] for i in idx]
-            tree_ids += ids
+            tree_idx.append(idx)
             n_trees += len(idx)
             mi = gb.add_mesh(f"tree_{arch}", arche[arch], (0.0, 0.0, 0.0), extras={"archetype": arch})
             ext = gb.instancing(instance_transforms(tr, idx, (x0, y0)))
@@ -185,16 +233,17 @@ def build_tile_assets(world: CanonicalWorld, tid: str, pieces: list[Piece], terr
         cb.add_node(f"tile_{tid}_collision", children=[node], translation=(x0, 0.0, -y0), root=True)
         col_bytes = cb.to_glb()
 
-    meta = tile_metadata(world, tid, layers, tree_ids)
+    meta = tile_metadata(world, tid, layers, np.concatenate(tree_idx) if tree_idx else NO_TREES, entity_index)
     counts = {name: len(layers[name].features) for name in LAYER_ORDER if name != "trees"}
     counts["trees"] = n_trees
     return {"glb": glb, "collision": col_bytes, "meta": meta, "counts": counts,
             "zrange": [round(zmin, 3), round(zmax, 3)] if np.isfinite(zmin) else None}
 
 
-def tile_metadata(world: CanonicalWorld, tid: str, layers: dict[str, LayerBuilder], tree_ids: list[str]
-                  ) -> dict[str, Any]:
-    index = world.entity_index()
+def tile_metadata(world: CanonicalWorld, tid: str, layers: dict[str, LayerBuilder], tree_idx: np.ndarray,
+                  entity_index: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Semantic records of a tile's features; ``tree_idx`` are row indices into ``world.trees``."""
+    index = entity_index if entity_index is not None else world.entity_index()
     ents: dict[str, Any] = {}
     hf = world.terrain
     for name, lb in layers.items():
@@ -214,13 +263,10 @@ def tile_metadata(world: CanonicalWorld, tid: str, layers: dict[str, LayerBuilde
             rec["centroid"] = [round(c.x, 2), round(c.y, 2), round(z, 2)]
             ents[fid] = rec
     tr = world.trees
-    if tree_ids:
-        pos = {tid_: k for k, tid_ in enumerate(tr.ids)}
-        for t_id in tree_ids:
-            k = pos[t_id]
-            rec = tr.record(k)
-            rec["centroid"] = [round(float(tr.x[k]), 2), round(float(tr.y[k]), 2), round(float(tr.ground_z[k]), 2)]
-            ents[t_id] = rec
+    for k in tree_idx.tolist():
+        rec = tr.record(k)
+        rec["centroid"] = [round(float(tr.x[k]), 2), round(float(tr.y[k]), 2), round(float(tr.ground_z[k]), 2)]
+        ents[tr.ids[k]] = rec
     return {"schema": "worldgen.tile_meta", "schema_version": SCHEMA_VERSION, "tile": tid,
             "entities": dict(sorted(ents.items()))}
 
