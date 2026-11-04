@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import numpy as np
@@ -16,7 +17,7 @@ from worldgen.geometry.mesh import LayerBuilder
 from worldgen.hashing import round_floats, sha256_bytes, sha256_json
 from worldgen.landcover.landcover import terrain_colors
 from worldgen.landcover.water import build_water_pieces
-from worldgen.tiling.grid import Piece, TileGrid, group_pieces, tile_id
+from worldgen.tiling.grid import Piece, TileGrid, group_pieces, parse_tile_id, tile_id
 from worldgen.transportation.meshing import (
     build_bridge_pieces,
     build_collision_pieces,
@@ -65,12 +66,22 @@ def trees_by_tile(world: CanonicalWorld) -> dict[str, np.ndarray]:
     return {tile_id(int(i[a]), int(j[a])): idx[a:b] for a, b in zip(starts, ends)}
 
 
+# Configuration keys that never change a tile's files, kept out of the tile input hashes.
+NOT_TILE_INPUTS: dict[str, tuple[str, ...]] = {"export": ("combined_glb_max_tiles",)}
+
+
+def tile_config_hash(cfg: Any) -> str:
+    """Hash of the configuration sections that can change a tile's files."""
+    return cfg.section_hash("tiling", "terrain", "roads", "bridges", "tunnels", "buildings", "water",
+                            "vegetation", "smoothing", "export", exclude=NOT_TILE_INPUTS)
+
+
 def tile_input_hash(world: CanonicalWorld, tid: str, entity_tree: tuple[STRtree, list[Any]] | None = None,
-                    tree_index: dict[str, np.ndarray] | None = None) -> str:
+                    tree_index: dict[str, np.ndarray] | None = None, config_hash: str | None = None) -> str:
     """Hash of everything that can influence a tile's assets.
 
-    ``entity_tree`` (``entity_strtree``) and ``tree_index`` (``trees_by_tile``) are world-level
-    indexes; pass them when hashing many tiles.
+    ``entity_tree`` (``entity_strtree``), ``tree_index`` (``trees_by_tile``) and ``config_hash``
+    (``tile_config_hash``) are world-level; pass them when hashing many tiles.
     """
     cfg = world.config
     grid = TileGrid(cfg.tiling.tile_size)
@@ -78,8 +89,7 @@ def tile_input_hash(world: CanonicalWorld, tid: str, entity_tree: tuple[STRtree,
     hf = world.terrain
     parts: dict[str, Any] = {
         "compiler": __version__,
-        "config": cfg.section_hash("tiling", "terrain", "roads", "bridges", "tunnels", "buildings", "water",
-                                   "vegetation", "smoothing", "export"),
+        "config": config_hash if config_hash is not None else tile_config_hash(cfg),
         "tile": tid,
     }
     if hf is not None:
@@ -131,36 +141,146 @@ def entity_strtree(world: CanonicalWorld) -> tuple[STRtree, list[Any]]:
     return STRtree([e.geometry for e in ents]), ents
 
 
-def generate_pieces(world: CanonicalWorld, wanted: set[str]) -> dict[str, list[Piece]]:
+def generate_pieces(world: CanonicalWorld, wanted: set[str], selector: PieceSelector | None = None
+                    ) -> dict[str, list[Piece]]:
+    """Mesh pieces of the ``wanted`` tiles, grouped by tile.
+
+    With a ``selector`` the builders only see the entities that can own a piece in those tiles
+    (export calls this per block of tiles); every tile gets the same pieces, in the same order.
+    """
     cfg = world.config
     grid = TileGrid(cfg.tiling.tile_size)
-    graph = world.graph
+    graph: Any = world.graph
+    layout = world.junctions
+    bridges, tunnels, buildings = world.bridges, world.tunnels, world.buildings
+    water, regions = world.water, world.vegetation_regions
+    if selector is not None:
+        sel = selector.select(wanted)
+        graph = _GraphView(world.graph, sel["edges"])
+        layout = dataclasses.replace(world.junctions, junctions=sel["junctions"])
+        bridges, tunnels, buildings = sel["bridges"], sel["tunnels"], sel["buildings"]
+        water, regions = sel["water"], sel["regions"]
     pieces: list[Piece] = []
     drape = world.terrain if cfg.roads.surface_mode == "drape" else None
-    _, inter_pieces = build_intersections(graph, world.junctions, grid, drape, wanted)
+    _, inter_pieces = build_intersections(graph, layout, grid, drape, wanted)
     pieces += inter_pieces
     pieces += build_road_pieces(graph, world.profiles, world.junctions, cfg, grid, wanted, drape)
-    pieces += build_bridge_pieces(world.bridges, graph, world.profiles, world.terrain.sample, cfg, grid, wanted)
-    pieces += build_tunnel_pieces(world.tunnels, graph, world.profiles, cfg, grid, wanted)
-    pieces += build_building_pieces(world.buildings, cfg.buildings, grid, wanted)
-    pieces += build_water_pieces(world.water, world.water_levels, world.waterway_profiles, world.covered_waterways,
+    pieces += build_bridge_pieces(bridges, graph, world.profiles, world.terrain.sample, cfg, grid, wanted)
+    pieces += build_tunnel_pieces(tunnels, graph, world.profiles, cfg, grid, wanted)
+    pieces += build_building_pieces(buildings, cfg.buildings, grid, wanted)
+    pieces += build_water_pieces(water, world.water_levels, world.waterway_profiles, world.covered_waterways,
                                  cfg, grid, wanted)
-    pieces += region_outline_pieces(world.vegetation_regions, world.terrain, grid, wanted)
+    pieces += region_outline_pieces(regions, world.terrain, grid, wanted)
     if cfg.export.collision:
         pieces += build_collision_pieces(graph, world.profiles, cfg, grid, wanted)
-        pieces += build_building_collision(world.buildings, cfg.buildings, grid, wanted)
+        pieces += build_building_collision(buildings, cfg.buildings, grid, wanted)
     return group_pieces(pieces)
 
 
-def build_tile_assets(world: CanonicalWorld, tid: str, pieces: list[Piece], terrain_normals: np.ndarray,
+class _EdgeSubset(dict):
+    """The edges a builder iterates; looking up any other edge falls back to the whole graph."""
+
+    def __init__(self, items: Any, full: dict[str, Any]) -> None:
+        super().__init__(items)
+        self._full = full
+
+    def __missing__(self, key: str) -> Any:
+        return self._full[key]
+
+
+class _GraphView:
+    """A road graph whose ``edges`` iterate a subset (nodes and everything else: the whole graph)."""
+
+    def __init__(self, graph: Any, edge_ids: list[str]) -> None:
+        self._graph = graph
+        self.nodes = graph.nodes
+        self.edges = _EdgeSubset(((e, graph.edges[e]) for e in edge_ids), graph.edges)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._graph, name)
+
+
+class PieceSelector:
+    """The entities that can own pieces in a set of tiles, from bounds computed once per export.
+
+    Every piece builder assigns a piece to the tile of its anchor (a centreline segment, a
+    node, a footprint's representative point), which lies inside the entity's bounding box; so
+    an entity whose box misses the tiles has no piece there. Edges get a wider margin because
+    bridge piers test the ground roads within ``pier_width + 8`` m of each pier. Selections keep
+    the world's order, so each tile receives exactly the pieces, in the same order, as from one
+    call over the whole world, while the work per block follows the block, not the world.
+    """
+
+    MARGIN = 2.0
+
+    def __init__(self, world: CanonicalWorld) -> None:
+        cfg = world.config
+        self.grid = TileGrid(cfg.tiling.tile_size)
+        self.edge_margin = cfg.bridges.pier_width + 8.0 + self.MARGIN
+        g = world.graph
+        self.edge_ids = sorted(g.edges)
+        self.edge_box = _boxes([g.edges[e].line for e in self.edge_ids])
+        self.junctions = world.junctions.junctions
+        self.junction_tile = {nid: self.grid.tile_of(g.nodes[nid].x, g.nodes[nid].y) for nid in self.junctions}
+        self.bridges, self.tunnels = world.bridges, world.tunnels
+        self.bridge_box = _boxes([shapely.union_all([g.edges[e].line for e in b.edge_ids]) for b in self.bridges])
+        self.tunnel_box = _boxes([shapely.union_all([g.edges[e].line for e in t.edge_ids]) for t in self.tunnels])
+        self.buildings = world.buildings
+        self.building_tile = [self.grid.tile_of(p.x, p.y) for p in
+                              (b.geometry.representative_point() for b in self.buildings)]
+        self.water = world.water
+        self.water_box = _boxes([w.geometry for w in self.water])
+        self.regions = world.vegetation_regions
+        self.region_box = _boxes([r.geometry for r in self.regions])
+
+    def select(self, tiles: set[str]) -> dict[str, Any]:
+        bounds = np.array([self.grid.bounds(t) for t in tiles])
+        b = (bounds[:, 0].min(), bounds[:, 1].min(), bounds[:, 2].max(), bounds[:, 3].max())
+
+        def pick(items: list[Any], boxes: np.ndarray, margin: float = self.MARGIN) -> list[Any]:
+            return [items[k] for k in np.nonzero(_overlaps(boxes, b, margin))[0]]
+
+        return {
+            "edges": pick(self.edge_ids, self.edge_box, self.edge_margin),
+            "junctions": {nid: j for nid, j in self.junctions.items() if self.junction_tile[nid] in tiles},
+            "bridges": pick(self.bridges, self.bridge_box),
+            "tunnels": pick(self.tunnels, self.tunnel_box),
+            "buildings": [bd for bd, t in zip(self.buildings, self.building_tile) if t in tiles],
+            "water": pick(self.water, self.water_box),
+            "regions": pick(self.regions, self.region_box),
+        }
+
+
+def _boxes(geoms: list[Any]) -> np.ndarray:
+    if not geoms:
+        return np.zeros((0, 4))
+    return shapely.bounds(np.array(geoms, dtype=object))
+
+
+def _overlaps(boxes: np.ndarray, b: tuple[float, float, float, float], margin: float) -> np.ndarray:
+    return ((boxes[:, 0] <= b[2] + margin) & (boxes[:, 2] >= b[0] - margin)
+            & (boxes[:, 1] <= b[3] + margin) & (boxes[:, 3] >= b[1] - margin))
+
+
+def tile_blocks(tiles: list[str], block: int) -> list[list[str]]:
+    """``tiles`` grouped into square blocks of ``block`` x ``block`` tiles (order kept within a block)."""
+    groups: dict[tuple[int, int], list[str]] = {}
+    for t in tiles:
+        i, j = parse_tile_id(t)
+        groups.setdefault((i // block, j // block), []).append(t)
+    return [groups[k] for k in sorted(groups, key=lambda ij: (ij[1], ij[0]))]
+
+
+def build_tile_assets(world: CanonicalWorld, tid: str, pieces: list[Piece], terrain_normals: np.ndarray | None,
                       terrain_rgba: np.ndarray, arche: dict[str, dict[str, Any]], *,
                       trees_in_tile: np.ndarray | None = None,
                       entity_index: dict[str, Any] | None = None) -> dict[str, Any]:
     """Return {"glb": bytes, "collision": bytes|None, "meta": dict, "counts": dict, "zrange": [..]}.
 
-    ``trees_in_tile`` (this tile's entry of ``trees_by_tile``) and ``entity_index``
-    (``world.entity_index()``) are computed once per export by the caller; without them they are
-    derived here, which costs O(trees + entities) per tile.
+    ``terrain_normals`` may be None: the terrain meshes then compute normals for the tile's own
+    window (same values). ``trees_in_tile`` (this tile's entry of ``trees_by_tile``) and
+    ``entity_index`` (``world.entity_index()``) are computed once per export by the caller;
+    without them they are derived here, which costs O(trees + entities) per tile.
     """
     cfg = world.config
     grid = TileGrid(cfg.tiling.tile_size)
@@ -298,13 +418,17 @@ def terrain_record(world: CanonicalWorld, tid: str) -> dict[str, Any]:
     }
 
 
-def terrain_render_inputs(world: CanonicalWorld) -> tuple[np.ndarray, np.ndarray]:
-    hf = world.terrain
-    normals = hf.vertex_normals()
+def terrain_vertex_colors(world: CanonicalWorld) -> np.ndarray:
+    """RGBA per terrain node (smoothed colours, else the land-cover class colours).
+
+    Normals are not precomputed for the whole grid: each tile's terrain mesh derives them from
+    its own window (``Heightfield.normals_window``), which gives the same values.
+    """
     if world.terrain_rgba is not None:
-        return normals, world.terrain_rgba
+        return world.terrain_rgba
+    hf = world.terrain
     codes = world.terrain_codes if world.terrain_codes is not None else np.zeros(hf.z.shape, dtype=np.uint8)
-    return normals, terrain_colors(codes)
+    return terrain_colors(codes)
 
 
 def archetypes_for(world: CanonicalWorld) -> dict[str, dict[str, Any]]:

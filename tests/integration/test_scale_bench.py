@@ -27,6 +27,8 @@ def test_scale_bench_fixture(tmp_path):
         assert "terrain_tile_seams" in r["checks_s"] and "vegetation" in r["stages_s"]
         assert r["output_bytes"]["tiles_glb"] > 0
         assert r["peak_mb"] is None or r["peak_mb"] > 0
+        if r["stage_peak_mb"]:  # sampled where the platform reports the current working set
+            assert {"vegetation", "validate", "export"} <= set(r["stage_peak_mb"])
 
     # A run compared against a baseline reports the speed ratio.
     again = subprocess.run([sys.executable, str(SCRIPT), "--fixture", "demo_town", "--fractions", "0.5",

@@ -25,6 +25,7 @@ is removed afterwards unless ``--keep`` is given.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import platform
@@ -32,6 +33,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -43,34 +45,102 @@ RESULT_PREFIX = "SCALE_BENCH_RESULT "
 # peak memory of this process
 
 
+def _win_counters() -> Any:
+    import ctypes
+    import ctypes.wintypes as wt
+
+    class Counters(ctypes.Structure):
+        _fields_ = [("cb", wt.DWORD), ("PageFaultCount", wt.DWORD), ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t), ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t), ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t), ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t)]
+
+    k32 = ctypes.WinDLL("kernel32")
+    k32.GetCurrentProcess.restype = wt.HANDLE
+    psapi = ctypes.WinDLL("psapi")
+    psapi.GetProcessMemoryInfo.argtypes = [wt.HANDLE, ctypes.POINTER(Counters), wt.DWORD]
+    psapi.GetProcessMemoryInfo.restype = wt.BOOL
+    c = Counters()
+    c.cb = ctypes.sizeof(c)
+    return c if psapi.GetProcessMemoryInfo(k32.GetCurrentProcess(), ctypes.byref(c), c.cb) else None
+
+
 def peak_rss_mb() -> float | None:
     if sys.platform == "win32":
-        import ctypes
-        import ctypes.wintypes as wt
-
-        class Counters(ctypes.Structure):
-            _fields_ = [("cb", wt.DWORD), ("PageFaultCount", wt.DWORD), ("PeakWorkingSetSize", ctypes.c_size_t),
-                        ("WorkingSetSize", ctypes.c_size_t), ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                        ("QuotaPagedPoolUsage", ctypes.c_size_t), ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                        ("QuotaNonPagedPoolUsage", ctypes.c_size_t), ("PagefileUsage", ctypes.c_size_t),
-                        ("PeakPagefileUsage", ctypes.c_size_t)]
-
-        k32 = ctypes.WinDLL("kernel32")
-        k32.GetCurrentProcess.restype = wt.HANDLE
-        psapi = ctypes.WinDLL("psapi")
-        psapi.GetProcessMemoryInfo.argtypes = [wt.HANDLE, ctypes.POINTER(Counters), wt.DWORD]
-        psapi.GetProcessMemoryInfo.restype = wt.BOOL
-        c = Counters()
-        c.cb = ctypes.sizeof(c)
-        if not psapi.GetProcessMemoryInfo(k32.GetCurrentProcess(), ctypes.byref(c), c.cb):
-            return None
-        return c.PeakWorkingSetSize / 2**20
+        c = _win_counters()
+        return None if c is None else c.PeakWorkingSetSize / 2**20
     try:
         import resource
     except ImportError:
         return None
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return peak / 2**20 if sys.platform == "darwin" else peak / 2**10  # bytes on macOS, KiB on Linux
+
+
+def current_rss_mb() -> float | None:
+    if sys.platform == "win32":
+        c = _win_counters()
+        return None if c is None else c.WorkingSetSize / 2**20
+    try:
+        with open("/proc/self/statm", encoding="ascii") as fh:
+            return int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 2**20
+    except (OSError, ValueError, IndexError):
+        return None  # no cheap current-RSS reading on this platform
+
+
+class StagePeaks:
+    """Largest working set seen while each stage runs, sampled by a background thread.
+
+    Short spikes between samples can be missed; the process-wide ``peak_mb`` is exact.
+    """
+
+    def __init__(self, interval_s: float = 0.02) -> None:
+        self.stage = "setup"
+        self.peaks: dict[str, float] = {}
+        self._interval = interval_s
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            self.sample()
+
+    def sample(self) -> None:
+        m = current_rss_mb()
+        if m is not None and m > self.peaks.get(self.stage, 0.0):
+            self.peaks[self.stage] = m
+
+    def enter(self, name: str) -> None:
+        self.sample()
+        self.stage = name
+        self.sample()
+
+    def start(self) -> StagePeaks:
+        self._thread.start()
+        return self
+
+    def stop(self) -> dict[str, float]:
+        self._stop.set()
+        self._thread.join()
+        self.sample()
+        return {k: round(v, 1) for k, v in self.peaks.items()}
+
+    def track(self, stage_cm: Any) -> Any:
+        """Wrap a ``worldgen.log.stage``-style context manager so samples go to its stage."""
+        peaks = self
+
+        @contextlib.contextmanager
+        def tracked(name: str, timings: dict[str, float]) -> Any:
+            prev = peaks.stage
+            peaks.enter(name)
+            try:
+                with stage_cm(name, timings):
+                    yield
+            finally:
+                peaks.enter(prev)
+
+        return tracked
 
 
 # --------------------------------------------------------------------------------------
@@ -104,6 +174,7 @@ def _output_sizes(out: Path) -> dict[str, int]:
 
 
 def measure(args: argparse.Namespace) -> dict[str, Any]:
+    from worldgen import pipeline
     from worldgen.build import BuildOptions, export_world, fixture_region
     from worldgen.config import WorldConfig, deep_merge, from_dict, load_config, parse_override
     from worldgen.pipeline import acquire, bundle_from_fixture, compile_world
@@ -111,6 +182,8 @@ def measure(args: argparse.Namespace) -> dict[str, Any]:
     from worldgen.spatial.region import Region
     from worldgen.validation import checks
 
+    peaks = StagePeaks().start()
+    pipeline.stage = peaks.track(pipeline.stage)  # compile_world's stages report their memory
     t_start = time.perf_counter()
     if args.world:
         manifest = json.loads(Path(args.world, "manifest.json").read_text(encoding="utf-8"))
@@ -154,6 +227,7 @@ def measure(args: argparse.Namespace) -> dict[str, Any]:
         check_times[name] = round(time.perf_counter() - t0, 3)
 
     checks.Report.run = timed_run
+    peaks.enter("validate")
     try:
         t = time.perf_counter()
         report = checks.validate_world(world)
@@ -161,6 +235,7 @@ def measure(args: argparse.Namespace) -> dict[str, Any]:
     finally:
         checks.Report.run = run
 
+    peaks.enter("export")
     t_export = None
     sizes: dict[str, int] = {}
     if not args.no_export:
@@ -179,6 +254,7 @@ def measure(args: argparse.Namespace) -> dict[str, Any]:
             if not args.keep:
                 shutil.rmtree(out, ignore_errors=True)
 
+    stage_peaks = peaks.stop()
     tr = world.trees
     return {
         "fraction": args.fraction,
@@ -192,6 +268,8 @@ def measure(args: argparse.Namespace) -> dict[str, Any]:
         "stages_s": {k: round(v, 3) for k, v in world.timings.items()},
         "checks_s": check_times,
         "peak_mb": None if (p := peak_rss_mb()) is None else round(p, 1),
+        # Working set sampled during each stage ("setup" = loading sources and config).
+        "stage_peak_mb": stage_peaks,
         "output_bytes": sizes,
         "counts": {"trees": len(tr), "trees_rendered": int(tr.rendered_mask().sum()) if len(tr) else 0,
                    "buildings": len(world.buildings), "graph_edges": len(world.graph.edges),
@@ -229,6 +307,9 @@ def _row(r: dict[str, Any], base: dict[str, Any] | None) -> str:
             f"{r['validate_s']:>8.1f}", f"{r['export_s'] or 0:>7.1f}", f"{work:>7.1f}",
             f"{work / r['km2']:>6.2f}", f"{(r['peak_mb'] or 0):>7.0f}", f"{out_mb / r['km2']:>7.1f}"]
     line = "  ".join(cols) + "   " + ", ".join(f"{k} {v:.1f}" for k, v in top)
+    if r.get("stage_peak_mb"):
+        stage, mb = max(r["stage_peak_mb"].items(), key=lambda kv: kv[1])
+        line += f"   peak in {stage}"
     if base is not None:
         line += f"   [x{_work_s(base) / max(work, 1e-9):.2f} vs baseline]"
     return line

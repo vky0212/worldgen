@@ -102,8 +102,14 @@ compiler.
 11. **Validation** (`validation.checks`) on the in-memory world.
 12. **Export** (`build.export_world`): tile hashes → only dirty tiles are
     regenerated → tile GLB/collision/meta, tile index, combined `world.glb`
-    (binary merge of tile GLBs), graph JSON, GeoParquet, GeoTIFFs, fields,
-    diagnostics, attribution and finally the manifest with output hashes.
+    (binary merge of tile GLBs, only up to `export.combined_glb_max_tiles`),
+    graph JSON, GeoParquet, GeoTIFFs, fields, diagnostics, attribution and
+    finally the manifest with output hashes. Dirty tiles are generated and
+    written in blocks of 8 × 8 tiles: `export.tiles.PieceSelector` hands each
+    block only the entities whose bounding box can reach it (every piece is
+    anchored inside its entity's box), and terrain normals are computed per
+    tile window, so memory follows the block rather than the world while the
+    files stay identical to a whole-world pass.
 
 ## Progress and browser builds
 

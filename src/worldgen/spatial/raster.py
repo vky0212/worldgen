@@ -94,3 +94,44 @@ class GeoRaster:
 
     def coverage_fraction(self) -> float:
         return float(self.valid_mask().mean()) if self.data.size else 0.0
+
+
+# --------------------------------------------------------------------------------------
+# windowed rasterisation
+
+
+def raster_window(transform: Affine, shape: tuple[int, int], bounds: tuple[float, float, float, float],
+                  pad: int = 1) -> tuple[slice, slice] | None:
+    """(rows, cols) of an axis-aligned grid whose pixels can meet ``bounds`` (x0, y0, x1, y1), padded."""
+    cols = sorted(((bounds[0] - transform.c) / transform.a, (bounds[2] - transform.c) / transform.a))
+    rows = sorted(((bounds[1] - transform.f) / transform.e, (bounds[3] - transform.f) / transform.e))
+    c0 = max(int(np.floor(cols[0])) - pad, 0)
+    c1 = min(int(np.ceil(cols[1])) + pad, shape[1])
+    r0 = max(int(np.floor(rows[0])) - pad, 0)
+    r1 = min(int(np.ceil(rows[1])) + pad, shape[0])
+    if c1 <= c0 or r1 <= r0:
+        return None
+    return slice(r0, r1), slice(c0, c1)
+
+
+def rasterize_window(geom: Any, shape: tuple[int, int], transform: Affine
+                     ) -> tuple[tuple[slice, slice], np.ndarray] | None:
+    """Pixel-centre mask of one geometry, rasterised only over its bounding-box window.
+
+    Returns ``((rows, cols), mask)`` with ``mask`` covering ``grid[rows, cols]``, or None when the
+    geometry is empty or outside the grid. The window transform is the grid transform shifted by
+    whole pixels, so every pixel centre is the same point as in a full-grid rasterisation: one
+    polygon costs its own area instead of the whole grid.
+    """
+    from rasterio import features as rfeatures
+
+    if geom is None or geom.is_empty:
+        return None
+    win = raster_window(transform, shape, geom.bounds)
+    if win is None:
+        return None
+    rows, cols = win
+    mask = rfeatures.rasterize([(geom, 1)], out_shape=(rows.stop - rows.start, cols.stop - cols.start),
+                               transform=transform @ Affine.translation(cols.start, rows.start), fill=0,
+                               all_touched=False, dtype="uint8").astype(bool)
+    return win, mask

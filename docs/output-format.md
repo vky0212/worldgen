@@ -12,7 +12,8 @@ consumers must reject major versions they do not understand.
 ├── manifest.json                 # region, CRS, origin, config, sources, output hashes
 ├── diagnostics.json              # validation report (issues with locations)
 ├── build_state.json              # per-tile input hashes for incremental builds
-├── world.glb                     # optional: every tile combined in one file
+├── world.glb                     # optional: every tile combined in one file (export.combined_glb,
+│                                 #   only up to export.combined_glb_max_tiles tiles, default 400)
 ├── ATTRIBUTION.txt               # human-readable source attribution
 ├── graph/
 │   └── road_graph.json           # routable transportation topology

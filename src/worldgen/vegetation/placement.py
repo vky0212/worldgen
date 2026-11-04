@@ -202,29 +202,49 @@ def _lambda0(coverage: np.ndarray, height: np.ndarray, cat: np.ndarray, spacing:
     return np.nan_to_num(lam0, nan=0.0, posinf=0.0)
 
 
+# Side of the square blocks _matern_ii queries one at a time (metres).
+MATERN_BLOCK = 256.0
+
+
 def _matern_ii(x: np.ndarray, y: np.ndarray, mark: np.ndarray, delta: np.ndarray, obs: TreeTable) -> np.ndarray:
-    """Keep a candidate unless a lower-mark candidate or an observed tree is within the hard core."""
+    """Keep a candidate unless a lower-mark candidate or an observed tree is within the hard core.
+
+    Two candidates conflict when their distance is below the larger of their hard-core distances,
+    so every conflict is found from the endpoint with the larger one. Candidates are queried block
+    by block with that block's own largest hard core: memory follows the block, not one
+    world-wide radius around every candidate. A conflict's loser is the higher mark (on equal
+    marks, the higher index); the kept set does not depend on the query order.
+    """
     n = len(x)
     keep = np.ones(n, dtype=bool)
     if n == 0:
         return keep
     pts = np.column_stack([x, y])
     tree = cKDTree(pts)
-    rmax = float(delta.max())
-    pairs = tree.query_pairs(rmax, output_type="ndarray")
-    if len(pairs):
-        a, b = pairs[:, 0], pairs[:, 1]
+    bi = np.floor(x / MATERN_BLOCK).astype(np.int64)
+    bj = np.floor(y / MATERN_BLOCK).astype(np.int64)
+    order = np.lexsort((bj, bi))
+    starts = np.flatnonzero(np.r_[True, (bi[order][1:] != bi[order][:-1]) | (bj[order][1:] != bj[order][:-1])])
+    for s, e in zip(starts, np.r_[starts[1:], n]):
+        idx = order[s:e]
+        # Slightly beyond the largest hard core: pairs are confirmed below with the exact test.
+        r = float(delta[idx].max()) * (1.0 + 1e-9) + 1e-9
+        found = cKDTree(pts[idx]).sparse_distance_matrix(tree, r, output_type="ndarray")
+        p, q = idx[found["i"]], found["j"]
+        a, b = np.minimum(p, q), np.maximum(p, q)
+        other = a != b
+        a, b = a[other], b[other]
         d = np.hypot(x[a] - x[b], y[a] - y[b])
         close = d < np.maximum(delta[a], delta[b])
         a, b = a[close], b[close]
-        loser = np.where(mark[a] > mark[b], a, b)
-        keep[loser] = False
+        keep[np.where(mark[a] > mark[b], a, b)] = False
     if len(obs):
         otree = cKDTree(np.column_stack([obs.x, obs.y]))
         r = np.maximum(delta, 1.5)
-        for k in np.nonzero(keep)[0]:
-            if otree.query_ball_point(pts[k], r[k]):
-                keep[k] = False
+        idx = np.nonzero(keep)[0]
+        if len(idx):
+            near = otree.query_ball_point(pts[idx], r[idx], return_length=True)
+            keep[idx[near > 0]] = False
     return keep
 
 

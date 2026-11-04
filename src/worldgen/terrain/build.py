@@ -13,7 +13,7 @@ from shapely.geometry.base import BaseGeometry
 from worldgen.config import WorldConfig
 from worldgen.errors import SourceError
 from worldgen.log import get_logger
-from worldgen.spatial.raster import GeoRaster
+from worldgen.spatial.raster import GeoRaster, rasterize_window
 from worldgen.spatial.region import Region
 from worldgen.terrain.heightfield import Heightfield, dsm_to_dtm, fill_nodata
 
@@ -122,6 +122,16 @@ def rasterize_mask(hf: Heightfield, geoms: list[BaseGeometry]) -> np.ndarray:
         [(g, 1) for g in geoms], out_shape=hf.z.shape, transform=_grid_transform(hf), fill=0,
         all_touched=False, dtype="uint8",
     ).astype(bool)
+
+
+def node_mask_window(hf: Heightfield, geom: BaseGeometry | None
+                     ) -> tuple[tuple[slice, slice], np.ndarray] | None:
+    """Grid nodes inside one geometry, over its bounding-box window only (see rasterize_window).
+
+    Same nodes as ``rasterize_mask(hf, [geom])``; use it when rasterising many polygons one by
+    one, where a full-grid mask per polygon would cost polygons x grid nodes.
+    """
+    return rasterize_window(geom, hf.z.shape, _grid_transform(hf))
 
 
 @dataclass
@@ -252,13 +262,15 @@ def carve_polygons(hf: Heightfield, items: list[tuple[BaseGeometry, float]]) -> 
     """Lower terrain inside polygons to at most the given level. Returns nodes changed."""
     changed = 0
     for geom, level in items:
-        mask = rasterize_mask(hf, [geom])
-        if not mask.any():
+        hit = node_mask_window(hf, geom)
+        if hit is None or not hit[1].any():
             continue
-        before = hf.z[mask]
+        win, mask = hit
+        zw = hf.z[win]
+        before = zw[mask]
         after = np.minimum(before, level)
         changed += int((after < before).sum())
-        hf.z[mask] = after
+        zw[mask] = after
     return changed
 
 

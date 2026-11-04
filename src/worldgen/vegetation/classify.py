@@ -19,7 +19,7 @@ from scipy import ndimage
 
 from worldgen.config import VegetationConfig
 from worldgen.hashing import rng_for
-from worldgen.spatial.raster import GeoRaster
+from worldgen.spatial.raster import GeoRaster, rasterize_window
 from worldgen.spatial.region import Region
 from worldgen.world.model import LandcoverArea, Waterbody
 
@@ -140,24 +140,27 @@ def classify_vegetation(
         name = OSM_CATEGORY.get(cls)
         if name is None:
             continue
-        m = _rasterize(shape, transform, [lc.geometry])
-        if not m.any():
+        # Rasterised over the polygon's own window: a full-grid mask per polygon costs polygons x cells.
+        hit = rasterize_window(lc.geometry, shape, transform)
+        if hit is None or not hit[1].any():
             continue
+        win, m = hit
+        cat_w = osm_cat[win]
         if name == "park":
             # Parks: trees where WorldCover sees tree cover, lawn elsewhere.
-            treeish = (tree_frac >= 0.34) if has_wc else np.zeros(shape, dtype=bool)
-            osm_cat[m & treeish] = CAT["urban_trees"]
-            osm_cat[m & ~treeish] = CAT["grassland"]
+            treeish = (tree_frac[win] >= 0.34) if has_wc else np.zeros(m.shape, dtype=bool)
+            cat_w[m & treeish] = CAT["urban_trees"]
+            cat_w[m & ~treeish] = CAT["grassland"]
         elif name == "dense_forest" and has_wc:
-            frac = float(np.nanmean(tree_frac[m])) if m.any() else 1.0
-            osm_cat[m] = CAT["dense_forest"] if frac >= cfg.forest_conflict_threshold else CAT["sparse_woodland"]
+            frac = float(np.nanmean(tree_frac[win][m]))
+            cat_w[m] = CAT["dense_forest"] if frac >= cfg.forest_conflict_threshold else CAT["sparse_woodland"]
         elif name == "wetland" and lc.properties.get("wetland") == "mangrove":
-            osm_cat[m] = CAT["mangrove"]
+            cat_w[m] = CAT["mangrove"]
         else:
-            osm_cat[m] = CAT[name]
+            cat_w[m] = CAT[name]
         lt = str(lc.properties.get("leaf_type", ""))
         if lt:
-            leaf[m] = {"broadleaved": 1, "needleleaved": 2, "mixed": 3}.get(lt, 0)
+            leaf[win][m] = {"broadleaved": 1, "needleleaved": 2, "mixed": 3}.get(lt, 0)
 
     category = np.zeros(shape, dtype=np.uint8)
     source = np.zeros(shape, dtype=np.uint8)

@@ -444,17 +444,15 @@ def check_terrain_seams(world: CanonicalWorld) -> list[Issue]:
     hf = world.terrain
     grid = TileGrid(world.config.tiling.tile_size)
     tiles = {parse_tile_id(t) for t in [tile_id(i, j) for i, j in world.region.tiles()]}
-    # Whole-grid normals once: tile_mesh would otherwise recompute them on every call, which
-    # makes this check quadratic in the region size. Only positions are compared below.
-    normals = hf.vertex_normals()
     out = []
     for i, j in sorted(tiles):
         for di, dj in ((1, 0), (0, 1)):
             q = (i + di, j + dj)
             if q not in tiles:
                 continue
-            a = hf.tile_mesh(*grid.bounds(tile_id(i, j)), normals=normals)
-            b = hf.tile_mesh(*grid.bounds(tile_id(*q)), normals=normals)
+            # tile_mesh computes normals for its own window only; only positions are compared.
+            a = hf.tile_mesh(*grid.bounds(tile_id(i, j)))
+            b = hf.tile_mesh(*grid.bounds(tile_id(*q)))
             if di:
                 edge = grid.bounds(tile_id(*q))[0]
                 ea = a.positions[np.isclose(a.positions[:, 0], edge)]
