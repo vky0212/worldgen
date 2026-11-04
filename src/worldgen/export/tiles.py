@@ -43,7 +43,7 @@ def tile_input_hash(world: CanonicalWorld, tid: str, entity_tree: tuple[STRtree,
     parts: dict[str, Any] = {
         "compiler": __version__,
         "config": cfg.section_hash("tiling", "terrain", "roads", "bridges", "tunnels", "buildings", "water",
-                                   "vegetation", "export"),
+                                   "vegetation", "smoothing", "export"),
         "tile": tid,
     }
     if hf is not None:
@@ -56,6 +56,10 @@ def tile_input_hash(world: CanonicalWorld, tid: str, entity_tree: tuple[STRtree,
         parts["terrain"] = sha256_bytes(win.tobytes())
         if world.terrain_codes is not None:
             parts["landcover"] = sha256_bytes(world.terrain_codes[r0:r1 + 1, c0:c1 + 1].tobytes())
+        if world.terrain_rgba is not None:
+            # Blended colours also depend on classes just outside the window.
+            rgb = np.round(world.terrain_rgba[r0:r1 + 1, c0:c1 + 1] * 1000).astype(np.int32)
+            parts["terrain_colors"] = sha256_bytes(rgb.tobytes())
     tree, ents = entity_tree if entity_tree is not None else entity_strtree(world)
     hits = sorted(tree.query(shapely.box(x0 - 2, y0 - 2, x1 + 2, y1 + 2)).tolist())
     ent_parts = []
@@ -251,6 +255,8 @@ def terrain_record(world: CanonicalWorld, tid: str) -> dict[str, Any]:
 def terrain_render_inputs(world: CanonicalWorld) -> tuple[np.ndarray, np.ndarray]:
     hf = world.terrain
     normals = hf.vertex_normals()
+    if world.terrain_rgba is not None:
+        return normals, world.terrain_rgba
     codes = world.terrain_codes if world.terrain_codes is not None else np.zeros(hf.z.shape, dtype=np.uint8)
     return normals, terrain_colors(codes)
 

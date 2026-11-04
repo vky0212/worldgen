@@ -59,6 +59,7 @@ class CanonicalWorld:
     terrain: Heightfield | None = None
     terrain_base: Heightfield | None = None
     terrain_codes: np.ndarray | None = None
+    terrain_rgba: np.ndarray | None = None   # (rows, cols, 4) blended vertex colours (smoothing stage)
     graph: Any = None                    # RoadGraph
     bridges: list[Bridge] = field(default_factory=list)
     tunnels: list[Tunnel] = field(default_factory=list)

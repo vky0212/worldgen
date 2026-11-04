@@ -30,7 +30,7 @@ consumers must reject major versions they do not understand.
 │   ├── heightfield.tif           # GeoTIFF, local CRS, float32 metres
 │   ├── heightfield.f32           # raw little-endian float32, row 0 = south
 │   ├── heightfield.json          # grid description for the raw file
-│   └── landcover.tif             # uint8 landcover classes on the terrain grid
+│   └── landcover.tif             # uint8 landcover classes on the terrain grid (borders smoothed)
 └── fields/
     ├── vegetation_fields.tif     # multi-band environmental fields (see below)
     └── fields.json               # band descriptions, legends
@@ -177,7 +177,9 @@ service, licence, attribution, resolution) is the `imagery` entry of
   is the entity id; look it up in the tile's `meta.json`. Three.js' GLTFLoader
   exposes the attribute as `geometry.attributes._feature_id_0`, mesh extras as
   `mesh.userData`, primitive extras as `geometry.userData`.
-* `terrain` uses `COLOR_0` vertex colours derived from the landcover classes.
+* `terrain` uses `COLOR_0` vertex colours derived from the landcover classes,
+  blended across class borders by the smoothing stage (`smoothing.blend_width_m`);
+  submerged vertices carry the wet bank colour.
   Terrain feature id is the single entity `terrain:<tile>`.
 * `vegetation_regions` uses glTF `LINES` primitives (draped outlines).
 * `trees`: one child node per vegetation archetype (`broadleaf`, `conifer`,

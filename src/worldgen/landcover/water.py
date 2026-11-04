@@ -122,6 +122,20 @@ def carve_inputs(water: list[Waterbody], levels: dict[str, float], profiles: dic
     return polys, corridors
 
 
+def shore_inputs(water: list[Waterbody], levels: dict[str, float], cfg: WorldConfig
+                 ) -> list[tuple[Polygon, float, float]]:
+    """(area, surface elevation, bed elevation) of every water area with a level (shoreline shaping)."""
+    depth = cfg.terrain.water_carve_depth
+    off = cfg.water.surface_offset
+    return [(w.geometry, levels[w.id] + off, levels[w.id] - depth) for w in water if w.is_area and w.id in levels]
+
+
+def waterway_outlines(water: list[Waterbody], profiles: dict[str, WaterwayProfile]) -> list[Polygon]:
+    """Outlines of the rendered water lines (centreline buffered to the profile width)."""
+    return [w.geometry.buffer(profiles[w.id].width / 2.0, cap_style="flat")
+            for w in water if not w.is_area and w.id in profiles]
+
+
 def build_water_pieces(water: list[Waterbody], levels: dict[str, float], profiles: dict[str, WaterwayProfile],
                        covered: set[str], cfg: WorldConfig, grid: TileGrid, wanted: set[str] | None = None
                        ) -> list[Piece]:

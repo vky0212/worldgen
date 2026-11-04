@@ -26,7 +26,7 @@ Region ──► sources/ ──► normalization ──► CanonicalWorld ─�
 | `worldgen.terrain` | Heightfield, DSM→DTM, datum, terrain shaping | `heightfield.py`, `build.py` |
 | `worldgen.transportation` | Elevation profiles, bridge/tunnel alignment, junction geometry, road/bridge/tunnel meshes | `elevation.py`, `junctions.py`, `meshing.py` |
 | `worldgen.buildings` | Footprint repair, Overture conflation, heights, roofs, extrusion | `buildings.py` |
-| `worldgen.landcover` | Water levels/surfaces/coastlines, terrain land-cover classes | `water.py`, `landcover.py` |
+| `worldgen.landcover` | Water levels/surfaces/coastlines, terrain land-cover classes, border smoothing (post-processing) | `water.py`, `landcover.py`, `smoothing.py` |
 | `worldgen.vegetation` | Classification, canopy field, regions, tree placement, archetypes, fields | `classify.py`, `placement.py`, `regions.py` |
 | `worldgen.geometry` | Engine-independent meshes and generators | `mesh.py`, `shapes.py` |
 | `worldgen.tiling` | Tile grid and ownership | `grid.py` |
@@ -65,7 +65,13 @@ compiler.
    clearance and terrain. Uncertain results are flagged, never hidden.
 7. **Terrain shaping**. Water is carved, terrain is kept below bridge decks,
    and terrain is conformed under ground roads (one full cell past the edge,
-   blended over a shoulder).
+   blended over a shoulder). With `smoothing.shorelines`, water areas are
+   carved by `landcover.smoothing.shape_shorelines`: within ~1.5 cells of the
+   outline the terrain is set to `surface + g·d` (`d` = signed distance to the
+   outline, `g` = bank gradient estimated from the original terrain and smoothed
+   along the shore), so the terrain triangles cross the water surface on the
+   outline instead of zig-zagging along grid nodes; further out it blends back
+   to the original terrain. The region edge is never treated as a shore.
 8. **Junctions** (`transportation.junctions`): two ends of similar width that
    continue each other get a mitred joint (both ribbons end on the same mitre
    line). Three or more ends get a corner polygon: neighbouring road edge lines
@@ -79,8 +85,22 @@ compiler.
    quads are clipped in vectorized numpy, other shapes through shapely), and
    instance budgets (`budget.py`) decide which buildings and trees are
    rendered.
-10. **Validation** (`validation.checks`) on the in-memory world.
-11. **Export** (`build.export_world`): tile hashes → only dirty tiles are
+10. **Smoothing** (`landcover/smoothing.py`), a post-processing stage after
+    land-cover classification (which also classifies the vegetation grid) and
+    before tree placement.
+    Each class becomes a Gaussian membership field (`smoothing.border_radius_m`)
+    displaced by smooth world-space noise (`warp_amplitude_m`,
+    `warp_wavelength_m`); every node takes the class of the largest membership,
+    so source-pixel staircases become smooth, natural borders and specks vanish.
+    Mapped water is kept exactly; a WorldCover water patch outside it that
+    reaches within `water_snap_m` of mapped water takes the surrounding land
+    class (whole patch; unmapped ponds farther away are kept). Terrain
+    vertex colours are blended over `blend_width_m`; submerged nodes take the
+    wet bank colour. The vegetation grid is refined `vegetation_upsample` times
+    with the same smoothing and noise (trees and ground colours agree) and tree
+    coverage fades towards forest edges (`forest_edge_thinning`).
+11. **Validation** (`validation.checks`) on the in-memory world.
+12. **Export** (`build.export_world`): tile hashes → only dirty tiles are
     regenerated → tile GLB/collision/meta, tile index, combined `world.glb`
     (binary merge of tile GLBs), graph JSON, GeoParquet, GeoTIFFs, fields,
     diagnostics, attribution and finally the manifest with output hashes.

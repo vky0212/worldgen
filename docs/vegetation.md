@@ -20,6 +20,8 @@ manifest.
 ```text
 OSM + WorldCover + CHM ─► VegetationGrid (classify.py)
                             category, source, canopy height, coverage, confidence
+                        ─► refined grid, smooth borders, thinned forest edges
+                            (landcover/smoothing.py, smoothing stage)
                         ─► VegetationRegion polygons + statistics (regions.py)
                         ─► tree placement (placement.py) ─► terrain conformance
                         ─► TreeTable ─► GLB instancing + GeoParquet + fields GeoTIFF
@@ -42,6 +44,21 @@ Categories: `dense_forest`, `sparse_woodland`, `shrubland`, `grassland`,
 * Canopy height comes from the CHM where available (`canopy_observed`), else
   from the category default modulated by smooth deterministic noise and is
   then inferred. Measured canopy below 2 m in a tree category cuts coverage.
+
+### Smoothing (`landcover/smoothing.py`)
+
+The classified grid inherits the 10 m WorldCover pixels, so forest edges would
+be cell staircases. The smoothing stage (on unless `smoothing.enabled=false`)
+refines the grid by `smoothing.vegetation_upsample` (default 2: 8 m → 4 m),
+smooths the category borders (Gaussian class memberships, `border_radius_m`)
+and displaces them with the same world-space noise as the terrain colours, so
+trees and ground agree. Cells keep the canopy height, coverage, source and
+confidence of their source cell; a cell whose category changed takes them from
+the nearest cell of its new category. Coverage in tree categories fades
+towards the edge (`forest_edge_thinning`, the fraction removed right at the
+edge), giving open, irregular forest margins. Exported fields and region
+statistics are computed on the refined grid (`fields.json` has its resolution);
+regions keep the minimum area `2 × vegetation.resolution²`.
 
 ### Placement (`placement.py`)
 
