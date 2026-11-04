@@ -25,11 +25,11 @@
  },
  "edges": 29,
  "first_tree_ids": [
-  "tree:gen:-10_-10_g0",
-  "tree:gen:-10_-11_g1",
-  "tree:gen:-10_-12_g2",
-  "tree:gen:-10_-12_g3",
-  "tree:gen:-10_-13_g1"
+  "tree:gen:-10_-14_g0",
+  "tree:gen:-10_-15_g0",
+  "tree:gen:-10_-15_g3",
+  "tree:gen:-10_-15_g5",
+  "tree:gen:-10_-17_g0"
  ],
  "graph_node_kinds": {
   "connector": 8,
@@ -48,10 +48,10 @@
   "intersections": 10,
   "landcover_areas": 2,
   "roads": 15,
-  "trees": 13155,
+  "trees": 13189,
   "trees_budget_dropped": 0,
   "trees_observed": 5,
-  "trees_rendered": 13155,
+  "trees_rendered": 13189,
   "tunnels": 1,
   "turn_restrictions": 0,
   "turn_restrictions_enforced": 0,
@@ -60,7 +60,7 @@
   "water_bodies": 2
  },
  "terrain_mean": 26.43,
- "trees_total_height": 123706.0,
+ "trees_total_height": 123015.0,
  "tunnel_deck_min": {
   "tunnel:osm:way/113": 45.0
  }

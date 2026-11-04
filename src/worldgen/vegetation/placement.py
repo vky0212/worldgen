@@ -1,8 +1,11 @@
 """Deterministic, tile-independent tree placement.
 
-Candidates are drawn per *sampling cell* of a global lattice from a random
-stream seeded only by ``(seed, cell index)``; their attributes depend only on
-the global vegetation grid at the candidate position. A candidate survives if
+Candidates are drawn per *sampling cell* of a global lattice: the count and
+every uniform of a candidate are counter-based hashes of ``(seed, salt, cell
+index, candidate index, column)`` (``hashing.hash_unit``), so all cells are
+generated at once with array arithmetic and any window gives the same values;
+attributes depend only on the global vegetation grid at the candidate
+position. A candidate survives if
 
 1. it lies in a vegetated cell, outside every exclusion (buildings, road
    surfaces, water, bridges) and on terrain no steeper than the slope limit;
@@ -28,7 +31,7 @@ from scipy.spatial import cKDTree
 from shapely.geometry.base import BaseGeometry
 
 from worldgen.config import VegetationConfig
-from worldgen.hashing import rng_for, stable_u64
+from worldgen.hashing import hash_u64, hash_unit, stable_u64
 from worldgen.terrain.heightfield import Heightfield
 from worldgen.vegetation.classify import CAT, CATEGORIES, TREE_CATEGORIES, VegetationGrid
 from worldgen.world.model import ObservedTree, TreeTable
@@ -60,6 +63,63 @@ def trunk_radius(archetype: str, height: np.ndarray | float) -> np.ndarray:
     return np.clip(0.018 * h + 0.03, 0.05, 1.2)
 
 
+# The largest crown radius any archetype reaches (broadleaf clip): bounds every hard core.
+CROWN_RADIUS_MAX = 9.0
+
+
+def crown_radius_codes(arch: np.ndarray, height: np.ndarray) -> np.ndarray:
+    """``crown_radius`` for archetype codes (indices into ARCHETYPES), elementwise."""
+    a = np.asarray(arch)
+    h = np.maximum(np.asarray(height, dtype=float), 0.3)
+    return np.select(
+        [a == 1, a == 2, a == 3, a == 4],
+        [np.clip(0.18 * h ** 0.8, 0.6, 5.0), np.clip(0.9 + 0.12 * h, 1.2, 4.5),
+         np.clip(0.45 * h + 0.25, 0.4, 2.5), np.clip(0.6 * h + 0.2, 0.2, 0.8)],
+        np.clip(0.32 * h ** 0.85, 0.8, CROWN_RADIUS_MAX))
+
+
+def trunk_radius_codes(arch: np.ndarray, height: np.ndarray) -> np.ndarray:
+    """``trunk_radius`` for archetype codes, elementwise."""
+    a = np.asarray(arch)
+    h = np.asarray(height, dtype=float)
+    return np.select([a >= 3, a == 2], [np.zeros_like(h), np.clip(0.012 * h + 0.1, 0.1, 0.4)],
+                     np.clip(0.018 * h + 0.03, 0.05, 1.2))
+
+
+# Salts of the counter-based random streams (hashing.hash_unit; see docs/vegetation.md).
+SALT_TREE_COUNT = 1     # (seed, salt, i, j): candidates in sampling cell (i, j)
+SALT_TREE_U = 2         # (seed, salt, i, j, k, column): uniforms of candidate k
+SALT_TREE_SEED = 3      # (seed, salt, i, j, k): published per-tree seed
+SALT_GROUND_COUNT = 4
+SALT_GROUND_U = 5
+SALT_GROUND_SEED = 6
+
+# Sampling-cell rows generated together (bounds the candidate arrays held at once).
+CELL_ROWS_PER_BATCH = 64
+
+
+def poisson_icdf(u: np.ndarray, lam: np.ndarray | float) -> np.ndarray:
+    """Smallest n with P(N <= n) >= u for N ~ Poisson(lam), elementwise (lam up to a few hundred)."""
+    u = np.asarray(u, dtype=float)
+    uf = u.ravel()
+    lf = np.broadcast_to(np.asarray(lam, dtype=float), u.shape).ravel()
+    pf = np.exp(-lf)
+    cf = pf.copy()
+    nf = np.zeros(uf.shape, dtype=np.int64)
+    lmax = float(lf.max()) if lf.size else 0.0
+    # Far beyond any probability mass: stops rounding (cdf never quite reaching u) from looping.
+    k_max = int(np.ceil(lmax + 40.0 * np.sqrt(lmax) + 40.0))
+    active = np.flatnonzero(uf > cf)
+    k = 0
+    while active.size and k < k_max:
+        k += 1
+        pf[active] *= lf[active] / k
+        cf[active] += pf[active]
+        nf[active] = k
+        active = active[uf[active] > cf[active]]
+    return nf.reshape(u.shape)
+
+
 @dataclass
 class Exclusions:
     geometry: BaseGeometry | None
@@ -86,7 +146,8 @@ def _archetype_tables(cfg: VegetationConfig) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _leaf_adjusted(arch_u: np.ndarray, cat: np.ndarray, leaf: np.ndarray, cum: np.ndarray) -> np.ndarray:
-    idx = np.array([np.searchsorted(cum[c], u, side="right") for c, u in zip(cat, arch_u)], dtype=np.int64)
+    # Count of cumulative weights <= u, i.e. searchsorted(cum[cat], u, side="right") per row.
+    idx = (cum[np.asarray(cat, dtype=np.int64)] <= np.asarray(arch_u)[:, None]).sum(axis=1).astype(np.int64)
     idx = np.clip(idx, 0, len(ARCHETYPES) - 1)
     trees = np.isin(idx, [0, 1])
     idx = np.where(trees & (leaf == 1), 0, idx)
@@ -111,58 +172,20 @@ def place_trees(
     # Observed trees first: they are always kept and dominate generated candidates.
     obs = _observed_table(observed, grid, terrain, cfg)
 
-    # Interaction radius bound for the halo.
-    max_h = float(np.nanmax(grid.canopy_height)) if grid.canopy_height.size else 0.0
-    r_int = float(np.max(spacing)) * float(crown_radius("broadleaf", max(max_h * 1.5, 2.0)))
+    # Halo: the largest hard core any candidate can have, so trees inside ``bounds`` see every
+    # candidate that could suppress them (a constant, so it does not depend on the window).
+    r_int = float(np.max(spacing)) * CROWN_RADIUS_MAX
     hx0, hy0, hx1, hy1 = bx0 - r_int, by0 - r_int, bx1 + r_int, by1 + r_int
 
-    cand = {k: [] for k in ("x", "y", "mark", "cell", "k", "h", "arch", "yaw", "cat", "delta", "conf")}
     i0, i1 = math.floor(max(hx0, xmin) / cs), math.floor(min(hx1, xmax - 1e-9) / cs)
     j0, j1 = math.floor(max(hy0, ymin) / cs), math.floor(min(hy1, ymax - 1e-9) / cs)
-    res = grid.resolution
-    for j in range(j0, j1 + 1):
-        for i in range(i0, i1 + 1):
-            # Upper bound of the target intensity over grid cells touching this sampling cell.
-            r0, c0, _ = grid.cell_of(np.array([i * cs]), np.array([j * cs]))
-            r1, c1, _ = grid.cell_of(np.array([(i + 1) * cs - 1e-6]), np.array([(j + 1) * cs - 1e-6]))
-            sl = (slice(int(r0[0]), int(r1[0]) + 1), slice(int(c0[0]), int(c1[0]) + 1))
-            cats = grid.category[sl]
-            if not np.isin(cats, tree_codes).any():
-                continue
-            lam0_cap = _lambda0(grid.coverage[sl], grid.canopy_height[sl], cats, spacing, tree_codes).max()
-            if not np.isfinite(lam0_cap) or lam0_cap <= 0:
-                continue
-            rng = rng_for(cfg.seed, "trees", i, j)
-            n = int(rng.poisson(lam0_cap * cs * cs))
-            if n == 0:
-                continue
-            u = rng.random((n, 7))
-            x = (i + u[:, 0]) * cs
-            y = (j + u[:, 1]) * cs
-            rr, cc, inside = grid.cell_of(x, y)
-            cat = grid.category[rr, cc]
-            ok = inside & np.isin(cat, tree_codes)
-            lam0 = _lambda0(grid.coverage[rr, cc], grid.canopy_height[rr, cc], cat, spacing, tree_codes)
-            ok &= u[:, 2] < lam0 / lam0_cap
-            if not ok.any():
-                continue
-            h_local = np.maximum(grid.canopy_height[rr, cc], 3.0)
-            # Lognormal height jitter around the local canopy height (mean canopy -> individual trees).
-            h = h_local * np.exp(0.18 * _norm_ppf(u[:, 3]))
-            arch = _leaf_adjusted(u[:, 4], cat, grid.leaf_type[rr, cc], cum)
-            arch = np.where(np.isin(arch, [3, 4]), 0, arch)  # ground cover handled separately
-            delta = np.array([spacing[c] for c in cat]) * np.array(
-                [float(crown_radius(ARCHETYPES[a], hh)) for a, hh in zip(arch, h_local)])
-            sel = np.nonzero(ok)[0]
-            cand["x"].append(x[sel]); cand["y"].append(y[sel]); cand["mark"].append(u[sel, 5])
-            cand["cell"].append(np.full(len(sel), _cell_key(i, j), dtype=np.int64))
-            cand["k"].append(sel); cand["h"].append(h[sel]); cand["arch"].append(arch[sel])
-            cand["yaw"].append(u[sel, 6] * 2 * math.pi); cand["cat"].append(cat[sel])
-            cand["delta"].append(delta[sel]); cand["conf"].append(grid.confidence[rr, cc][sel])
-    if not cand["x"]:
+    parts = [_tree_candidates(grid, cfg, cum, spacing, tree_codes, i0, i1, jb, min(jb + CELL_ROWS_PER_BATCH - 1, j1))
+             for jb in range(j0, j1 + 1, CELL_ROWS_PER_BATCH)] if i1 >= i0 else []
+    parts = [p for p in parts if p is not None]
+    if not parts:
         gen = TreeTable()
     else:
-        C = {k: np.concatenate(v) for k, v in cand.items()}
+        C = {k: np.concatenate([p[k] for p in parts]) for k in parts[0]}
         # Exclusions and slope before the hard-core rule.
         keep = ~exclusions.contains(C["x"], C["y"])
         inside_t = terrain.contains(C["x"], C["y"])
@@ -181,7 +204,70 @@ def place_trees(
     return concat_tables([obs, gen])
 
 
-def _cell_key(i: int, j: int) -> int:
+def _range_max(a: np.ndarray, lo: np.ndarray, hi: np.ndarray, axis: int) -> np.ndarray:
+    """Maximum of ``a`` over the index ranges lo[k]..hi[k] (inclusive) along ``axis``."""
+    out = np.take(a, lo, axis=axis)
+    for d in range(1, int((hi - lo).max(initial=0)) + 1):
+        out = np.maximum(out, np.take(a, np.minimum(lo + d, hi), axis=axis))
+    return out
+
+
+def _tree_candidates(grid: VegetationGrid, cfg: VegetationConfig, cum: np.ndarray, spacing: np.ndarray,
+                     tree_codes: np.ndarray, i0: int, i1: int, j0: int, j1: int) -> dict[str, np.ndarray] | None:
+    """Candidates of sampling cells i0..i1 x j0..j1 that pass the intensity thinning.
+
+    Every sampling cell draws a Poisson number of candidates at the largest target intensity
+    of the grid cells it touches; each candidate's seven uniforms are hashed from
+    (seed, cell, candidate index, column), so a cell's candidates never depend on which other
+    cells are generated with it.
+    """
+    cs = cfg.cell_size
+    ii = np.arange(i0, i1 + 1, dtype=np.int64)
+    jj = np.arange(j0, j1 + 1, dtype=np.int64)
+    # Grid block of each sampling cell, resolved like cell_of does for the cell's corners.
+    _, c_lo, _ = grid.cell_of(ii * cs, np.full(len(ii), grid.ymin))
+    _, c_hi, _ = grid.cell_of((ii + 1) * cs - 1e-6, np.full(len(ii), grid.ymin))
+    r_lo, _, _ = grid.cell_of(np.full(len(jj), grid.xmin), jj * cs)
+    r_hi, _, _ = grid.cell_of(np.full(len(jj), grid.xmin), (jj + 1) * cs - 1e-6)
+    R0, R1, C0, C1 = int(r_lo.min()), int(r_hi.max()), int(c_lo.min()), int(c_hi.max())
+    win = (slice(R0, R1 + 1), slice(C0, C1 + 1))
+    lam = _lambda0(grid.coverage[win], grid.canopy_height[win], grid.category[win], spacing, tree_codes)
+    cap = _range_max(_range_max(lam, c_lo - C0, c_hi - C0, axis=1), r_lo - R0, r_hi - R0, axis=0)
+    jg, ig = np.meshgrid(jj, ii, indexing="ij")
+    act = cap > 0
+    ci, cj, cap = ig[act], jg[act], cap[act]
+    if len(ci) == 0:
+        return None
+    n = poisson_icdf(hash_unit(cfg.seed, SALT_TREE_COUNT, ci, cj), cap * cs * cs)
+    if n.sum() == 0:
+        return None
+    rep = np.repeat(np.arange(len(n)), n)
+    k = np.arange(int(n.sum()), dtype=np.int64) - np.repeat(np.cumsum(n) - n, n)
+    ci, cj, cap = ci[rep], cj[rep], cap[rep]
+    u = [hash_unit(cfg.seed, SALT_TREE_U, ci, cj, k, col) for col in range(7)]
+    x = (ci + u[0]) * cs
+    y = (cj + u[1]) * cs
+    rr, cc, inside = grid.cell_of(x, y)
+    cat = grid.category[rr, cc]
+    ok = inside & np.isin(cat, tree_codes)
+    lam0 = _lambda0(grid.coverage[rr, cc], grid.canopy_height[rr, cc], cat, spacing, tree_codes)
+    ok &= u[2] < lam0 / cap
+    sel = np.nonzero(ok)[0]
+    if len(sel) == 0:
+        return None
+    rr, cc, cat = rr[sel], cc[sel], cat[sel]
+    h_local = np.maximum(grid.canopy_height[rr, cc], 3.0)
+    # Lognormal height jitter around the local canopy height (mean canopy -> individual trees).
+    h = h_local * np.exp(0.18 * _norm_ppf(u[3][sel]))
+    arch = _leaf_adjusted(u[4][sel], cat, grid.leaf_type[rr, cc], cum)
+    arch = np.where(np.isin(arch, [3, 4]), 0, arch)  # ground cover handled separately
+    delta = spacing[cat] * crown_radius_codes(arch, h_local)
+    return {"x": x[sel], "y": y[sel], "mark": u[5][sel], "cell": _cell_key(ci[sel], cj[sel]), "k": k[sel],
+            "h": h, "arch": arch, "yaw": u[6][sel] * 2 * math.pi, "cat": cat, "delta": delta,
+            "conf": grid.confidence[rr, cc]}
+
+
+def _cell_key(i: int | np.ndarray, j: int | np.ndarray) -> int | np.ndarray:
     return (i + (1 << 20)) * (1 << 21) + (j + (1 << 20))
 
 
@@ -260,21 +346,19 @@ def _generated_table(C: dict[str, np.ndarray], terrain: Heightfield, cfg: Vegeta
     C = {k: v[order] for k, v in C.items()}
     arch = [ARCHETYPES[a] for a in C["arch"]]
     h = np.clip(C["h"], 2.5, 60.0)
-    crown = np.array([float(crown_radius(a, hh)) for a, hh in zip(arch, h)])
-    trunk = np.array([float(trunk_radius(a, hh)) for a, hh in zip(arch, h)])
+    crown = crown_radius_codes(C["arch"], h)
+    trunk = trunk_radius_codes(C["arch"], h)
     gz = terrain.sample(C["x"], C["y"])
-    ids = []
-    seeds = []
-    for cell, k in zip(C["cell"], C["k"]):
-        i, j = int(cell // (1 << 21)) - (1 << 20), int(cell % (1 << 21)) - (1 << 20)
-        ids.append(f"tree:gen:{i}_{j}_{int(k)}")
-        seeds.append(stable_u64(cfg.seed, "tree", i, j, int(k)) & 0x7FFFFFFFFFFFFFFF)
+    ci = C["cell"] // (1 << 21) - (1 << 20)
+    cj = C["cell"] % (1 << 21) - (1 << 20)
+    ids = [f"tree:gen:{i}_{j}_{k}" for i, j, k in zip(ci.tolist(), cj.tolist(), C["k"].tolist())]
+    seeds = hash_u64(cfg.seed, SALT_TREE_SEED, ci, cj, C["k"]) & np.uint64(0x7FFFFFFFFFFFFFFF)
     return TreeTable(
         ids=ids, x=C["x"], y=C["y"], ground_z=gz, height=h, crown_radius=crown, trunk_radius=trunk,
         yaw=C["yaw"], archetype=arch, species=[None] * n, category=[CATEGORIES[c] for c in C["cat"]],
         confidence=np.clip(C["conf"] * 0.5, 0.05, 0.5), observed=np.zeros(n, dtype=bool),
-        seed=np.array(seeds, dtype=np.uint64), source=["procedural"] * n,
-        source_id=[f"seed:{cfg.seed}" for _ in range(n)], inferred=[["height", "crown_radius", "trunk_radius"]] * n,
+        seed=seeds, source=["procedural"] * n,
+        source_id=[f"seed:{cfg.seed}"] * n, inferred=[["height", "crown_radius", "trunk_radius"]] * n,
     )
 
 
@@ -358,50 +442,51 @@ def place_ground_cover(grid: VegetationGrid, terrain: Heightfield, exclusions: E
     xmax = xmin + grid.shape[1] * grid.resolution
     ymax = ymin + grid.shape[0] * grid.resolution
     bx0, by0, bx1, by1 = bounds if bounds is not None else (xmin, ymin, xmax, ymax)
-    xs, ys, ks, cells, arch, h, yaw = [], [], [], [], [], [], []
-    for j in range(math.floor(by0 / cs), math.floor((by1 - 1e-9) / cs) + 1):
-        for i in range(math.floor(bx0 / cs), math.floor((bx1 - 1e-9) / cs) + 1):
-            rng = rng_for(cfg.seed, "ground", i, j)
-            lam = max(gc.shrub_density, gc.grass_density) * scale
-            n = int(rng.poisson(lam * cs * cs))
-            if n == 0:
-                continue
-            u = rng.random((n, 5))
-            x = (i + u[:, 0]) * cs
-            y = (j + u[:, 1]) * cs
-            rr, cc, inside = grid.cell_of(x, y)
-            cat = grid.category[rr, cc]
-            is_shrub = np.isin(cat, shrub_cats)
-            is_grass = np.isin(cat, grass_cats)
-            dens = np.where(is_shrub, gc.shrub_density, np.where(is_grass, gc.grass_density, 0.0)) * scale
-            ok = inside & (is_shrub | is_grass) & (u[:, 2] < dens / max(lam, 1e-12))
-            ok &= (x >= bx0) & (x < bx1) & (y >= by0) & (y < by1)
-            for k in np.nonzero(ok)[0]:
-                xs.append(x[k]); ys.append(y[k]); ks.append(int(k)); cells.append((i, j))
-                a = "shrub" if is_shrub[k] else "grass"
-                arch.append(a)
-                base = 1.6 if a == "shrub" else 0.5
-                h.append(base * (0.7 + 0.6 * u[k, 3]))
-                yaw.append(u[k, 4] * 2 * math.pi)
-    if not xs:
+    lam = max(gc.shrub_density, gc.grass_density) * scale
+    i0, i1 = math.floor(bx0 / cs), math.floor((bx1 - 1e-9) / cs)
+    j0, j1 = math.floor(by0 / cs), math.floor((by1 - 1e-9) / cs)
+    parts = []
+    for jb in range(j0, j1 + 1, CELL_ROWS_PER_BATCH):
+        # Cells in (j, i) order and candidates by index, the order of a cell-by-cell loop.
+        jg, ig = np.meshgrid(np.arange(jb, min(jb + CELL_ROWS_PER_BATCH - 1, j1) + 1, dtype=np.int64),
+                             np.arange(i0, i1 + 1, dtype=np.int64), indexing="ij")
+        ci, cj = ig.ravel(), jg.ravel()
+        n = poisson_icdf(hash_unit(cfg.seed, SALT_GROUND_COUNT, ci, cj), lam * cs * cs)
+        if n.sum() == 0:
+            continue
+        rep = np.repeat(np.arange(len(n)), n)
+        k = np.arange(int(n.sum()), dtype=np.int64) - np.repeat(np.cumsum(n) - n, n)
+        ci, cj = ci[rep], cj[rep]
+        u = [hash_unit(cfg.seed, SALT_GROUND_U, ci, cj, k, col) for col in range(5)]
+        x = (ci + u[0]) * cs
+        y = (cj + u[1]) * cs
+        rr, cc, inside = grid.cell_of(x, y)
+        cat = grid.category[rr, cc]
+        is_shrub = np.isin(cat, shrub_cats)
+        is_grass = np.isin(cat, grass_cats)
+        dens = np.where(is_shrub, gc.shrub_density, np.where(is_grass, gc.grass_density, 0.0)) * scale
+        ok = inside & (is_shrub | is_grass) & (u[2] < dens / max(lam, 1e-12))
+        ok &= (x >= bx0) & (x < bx1) & (y >= by0) & (y < by1)
+        s = np.nonzero(ok)[0]
+        if len(s):
+            arch = np.where(is_shrub[s], 3, 4)
+            parts.append({"x": x[s], "y": y[s], "k": k[s], "i": ci[s], "j": cj[s], "arch": arch, "cat": cat[s],
+                          "h": np.where(arch == 3, 1.6, 0.5) * (0.7 + 0.6 * u[3][s]), "yaw": u[4][s] * 2 * math.pi})
+    if not parts:
         return TreeTable()
-    X, Y = np.array(xs), np.array(ys)
-    keep = ~exclusions.contains(X, Y) & terrain.contains(X, Y)
-    keep &= terrain.slope_deg(X, Y) <= cfg.max_slope_deg
-    idx = np.nonzero(keep)[0]
-    n = len(idx)
-    H = np.array(h)[idx]
-    A = [arch[k] for k in idx]
+    G = {key: np.concatenate([p[key] for p in parts]) for key in parts[0]}
+    keep = ~exclusions.contains(G["x"], G["y"]) & terrain.contains(G["x"], G["y"])
+    keep &= terrain.slope_deg(G["x"], G["y"]) <= cfg.max_slope_deg
+    G = {key: v[keep] for key, v in G.items()}
+    n = len(G["x"])
+    seeds = hash_u64(cfg.seed, SALT_GROUND_SEED, G["i"], G["j"], G["k"]) & np.uint64(0x7FFFFFFFFFFFFFFF)
     return TreeTable(
-        ids=[f"tree:gen:{cells[k][0]}_{cells[k][1]}_g{ks[k]}" for k in idx], x=X[idx], y=Y[idx],
-        ground_z=terrain.sample(X[idx], Y[idx]), height=H,
-        crown_radius=np.array([float(crown_radius(a, hh)) for a, hh in zip(A, H)]),
-        trunk_radius=np.zeros(n), yaw=np.array(yaw)[idx], archetype=A, species=[None] * n,
-        category=[CATEGORIES[int(grid.category[r, c])] for r, c in zip(*grid.cell_of(X[idx], Y[idx])[:2])],
-        confidence=np.full(n, 0.2), observed=np.zeros(n, dtype=bool),
-        seed=np.array([stable_u64(cfg.seed, "ground", cells[k][0], cells[k][1], ks[k]) & 0x7FFFFFFFFFFFFFFF
-                       for k in idx], dtype=np.uint64),
-        source=["procedural"] * n, source_id=[f"seed:{cfg.seed}"] * n,
+        ids=[f"tree:gen:{i}_{j}_g{k}" for i, j, k in zip(G["i"].tolist(), G["j"].tolist(), G["k"].tolist())],
+        x=G["x"], y=G["y"], ground_z=terrain.sample(G["x"], G["y"]), height=G["h"],
+        crown_radius=crown_radius_codes(G["arch"], G["h"]), trunk_radius=np.zeros(n), yaw=G["yaw"],
+        archetype=[ARCHETYPES[a] for a in G["arch"]], species=[None] * n,
+        category=[CATEGORIES[c] for c in G["cat"]], confidence=np.full(n, 0.2), observed=np.zeros(n, dtype=bool),
+        seed=seeds, source=["procedural"] * n, source_id=[f"seed:{cfg.seed}"] * n,
         inferred=[["height", "crown_radius", "position"]] * n,
     )
 

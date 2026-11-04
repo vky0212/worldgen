@@ -8,7 +8,7 @@ import numpy as np
 import shapely
 from shapely.ops import unary_union
 
-from worldgen.budget import building_sizes, select_within_budget, tree_sizes
+from worldgen.budget import building_sizes, select_within_budget, tree_budget_uniforms, tree_sizes
 from worldgen.buildings.buildings import assign_base_elevations, prepare_buildings
 from worldgen.config import WorldConfig
 from worldgen.errors import SourceError
@@ -333,7 +333,8 @@ def _tree_budget(world: CanonicalWorld, cfg: WorldConfig) -> None:
     grid = TileGrid(cfg.tiling.tile_size)
     protected = tr.observed.copy() if vb.keep_observed else np.zeros(len(tr), dtype=bool)
     res = select_within_budget(tr.ids, grid.tiles_of(tr.x, tr.y), tree_sizes(tr.height, tr.crown_radius),
-                               protected, vb, cfg.vegetation.seed, "trees")
+                               protected, vb, cfg.vegetation.seed, "trees",
+                               u=tree_budget_uniforms(cfg.vegetation.seed, tr.seed))
     tr.rendered = res.keep
     world.stats["trees_budget_dropped"] = res.dropped
     if res.dropped:

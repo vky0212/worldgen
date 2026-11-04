@@ -18,7 +18,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from worldgen.config import BudgetConfig
-from worldgen.hashing import unit_hash
+from worldgen.hashing import hash_unit, unit_hash
 
 
 @dataclass
@@ -28,13 +28,25 @@ class BudgetResult:
     tiles_over_budget: list[str]
 
 
+# Salt of the tree budget's hash (hashing.hash_unit over the per-tree seed).
+TREE_BUDGET_SALT = 7
+
+
+def tree_budget_uniforms(seed: int, tree_seeds: np.ndarray) -> np.ndarray:
+    """The budget's uniform per tree, hashed from the tree's own (already unique) seed column."""
+    return hash_unit(seed, TREE_BUDGET_SALT, np.asarray(tree_seeds, dtype=np.uint64))
+
+
 def select_within_budget(ids: list[str], tiles: np.ndarray, sizes: np.ndarray, protected: np.ndarray,
-                         cfg: BudgetConfig, seed: int, salt: str) -> BudgetResult:
+                         cfg: BudgetConfig, seed: int, salt: str, u: np.ndarray | None = None) -> BudgetResult:
+    """``u``: one uniform per item; by default a hash of (seed, salt, id) per item (slow for many)."""
     n = len(ids)
     keep = np.ones(n, dtype=bool)
     if not cfg.enabled or n == 0:
         return BudgetResult(keep, 0, [])
-    u = np.array([max(unit_hash(seed, "budget", salt, i), 1e-12) for i in ids])
+    if u is None:
+        u = np.array([unit_hash(seed, "budget", salt, i) for i in ids])
+    u = np.maximum(np.asarray(u, dtype=float), 1e-12)
     key = np.log(u) / np.maximum(np.asarray(sizes, dtype=float), 1e-6)
     key = np.where(protected, np.inf, key)
     over: list[str] = []
