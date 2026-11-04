@@ -24,7 +24,7 @@ Region ──► sources/ ──► normalization ──► CanonicalWorld ─�
 | `worldgen.world` | Canonical, source-independent model | `model.py` (entities), `world.py` (container) |
 | `worldgen.topology` | Road graph, crossings, routing, graph schema | `graph.py`, `crossings.py` |
 | `worldgen.terrain` | Heightfield, DSM→DTM, datum, terrain shaping | `heightfield.py`, `build.py` |
-| `worldgen.transportation` | Elevation profiles, bridge/tunnel alignment, road/bridge/tunnel meshes | `elevation.py`, `meshing.py` |
+| `worldgen.transportation` | Elevation profiles, bridge/tunnel alignment, junction geometry, road/bridge/tunnel meshes | `elevation.py`, `junctions.py`, `meshing.py` |
 | `worldgen.buildings` | Footprint repair, Overture conflation, heights, roofs, extrusion | `buildings.py` |
 | `worldgen.landcover` | Water levels/surfaces/coastlines, terrain land-cover classes | `water.py`, `landcover.py` |
 | `worldgen.vegetation` | Classification, canopy field, regions, tree placement, archetypes, fields | `classify.py`, `placement.py`, `regions.py` |
@@ -32,7 +32,7 @@ Region ──► sources/ ──► normalization ──► CanonicalWorld ─�
 | `worldgen.tiling` | Tile grid and ownership | `grid.py` |
 | `worldgen.export` | GLB writer/merger, tile assets, GeoParquet | `gltf.py`, `merge.py`, `tiles.py`, `vectors.py` |
 | `worldgen.validation` | In-memory checks and file-level re-validation | `checks.py`, `assets.py` |
-| top level | Config, pipeline, build/export orchestration, CLI, static server | `config.py`, `pipeline.py`, `build.py`, `cli.py`, `serve.py` |
+| top level | Config, pipeline, build/export orchestration, progress events, CLI, server + build jobs | `config.py`, `pipeline.py`, `build.py`, `progress.py`, `cli.py`, `serve.py`, `studio.py` |
 
 The viewer (`viewer/`, TypeScript + Three.js + Vite) only consumes the files
 described in [output-format.md](output-format.md); it shares no code with the
@@ -66,12 +66,27 @@ compiler.
 7. **Terrain shaping**. Water is carved, terrain is kept below bridge decks,
    and terrain is conformed under ground roads (one full cell past the edge,
    blended over a shoulder).
-8. **Buildings, land cover, intersections, vegetation** on the shaped terrain.
-9. **Validation** (`validation.checks`) on the in-memory world.
-10. **Export** (`build.export_world`): tile hashes → only dirty tiles are
+8. **Junctions** (`transportation.junctions`): two ends of similar width that
+   continue each other get a mitred joint (both ribbons end on the same mitre
+   line). Three or more ends get a corner polygon: neighbouring road edge lines
+   are intersected (bevel when they diverge, chamfer when very acute), every
+   road is trimmed back to its furthest corner, and the polygon's cut vertices
+   are exactly the ribbon end vertices — no gaps, no overlapping surfaces.
+9. **Buildings, land cover, vegetation** on the shaped terrain.
+10. **Validation** (`validation.checks`) on the in-memory world.
+11. **Export** (`build.export_world`): tile hashes → only dirty tiles are
     regenerated → tile GLB/collision/meta, tile index, combined `world.glb`
     (binary merge of tile GLBs), graph JSON, GeoParquet, GeoTIFFs, fields,
     diagnostics, attribution and finally the manifest with output hashes.
+
+## Progress and browser builds
+
+Every stage boundary, source acquisition, validation check and exported tile
+is reported through `progress.current()` (a no-op by default).
+`worldgen build --progress jsonl` streams these events to stdout;
+`studio.JobManager` runs that command in a child process per job, re-sequences
+the events and fans them out over Server-Sent Events (`serve.py`). See
+[studio-api.md](studio-api.md).
 
 ## Determinism
 

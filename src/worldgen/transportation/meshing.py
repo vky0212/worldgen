@@ -1,8 +1,8 @@
 """Road, intersection, bridge and tunnel geometry generation.
 
 Produces tile-owned :class:`Piece` objects. Road surfaces are flat ribbons that
-follow the source centreline and the computed elevation profile; intersections
-are polygon patches at the node elevation; bridges add a deck box, railings
+follow the source centreline and the computed elevation profile; junctions
+(see ``junctions.py``) are corner polygons whose cut vertices are the ribbon ends; bridges add a deck box, railings
 and piers; tunnels add an inward-facing tube and portal frames.
 """
 
@@ -13,20 +13,15 @@ from collections.abc import Iterator
 
 import numpy as np
 from shapely.geometry import Point
-from shapely.ops import unary_union
 from shapely.strtree import STRtree
 
 from worldgen.config import WorldConfig
-from worldgen.geometry.shapes import box, flat_polygon_mesh, polygons_of, polyline_frames, ribbon, swept_box
+from worldgen.geometry.shapes import box, polyline_frames, ribbon, swept_box
 from worldgen.tiling.grid import Piece, TileGrid
 from worldgen.topology.graph import GraphEdge, RoadGraph
 from worldgen.transportation.elevation import EdgeProfile
+from worldgen.transportation.junctions import MAJOR, PATHS, JunctionLayout, surface_offset, trim_polyline
 from worldgen.world.model import Bridge, Intersection, Tunnel
-
-MAJOR = {"motorway", "trunk", "primary", "secondary", "motorway_link", "trunk_link", "primary_link",
-         "secondary_link"}
-PATHS = {"footway", "path", "cycleway", "steps", "pedestrian", "bridleway", "corridor", "track"}
-
 
 def road_material(cls: str) -> str:
     if cls in MAJOR:
@@ -45,71 +40,29 @@ def _runs(tiles: list[str]) -> Iterator[tuple[int, int, str]]:
             start = k
 
 
-def _trim(xy: np.ndarray, s: np.ndarray, z: np.ndarray, t0: float, t1: float
-          ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
-    """Cut a station polyline to the arc-length interval [t0, total - t1]."""
-    total = float(s[-1])
-    a, b = t0, total - t1
-    if b - a < 0.5:
-        return None
-    keep = (s > a) & (s < b)
-    za = np.interp(a, s, z)
-    zb = np.interp(b, s, z)
-    xa = np.array([np.interp(a, s, xy[:, 0]), np.interp(a, s, xy[:, 1])])
-    xb = np.array([np.interp(b, s, xy[:, 0]), np.interp(b, s, xy[:, 1])])
-    nxy = np.vstack([xa, xy[keep], xb])
-    ns = np.concatenate([[a], s[keep], [b]])
-    nz = np.concatenate([[za], z[keep], [zb]])
-    return nxy, ns, nz
-
-
-def intersection_radius(graph: RoadGraph, node_id: str) -> float:
-    widths = [graph.edges[e].width for e in graph.nodes[node_id].edges]
-    return max(widths) * 0.5 + 1.0
-
-
-def intersection_nodes(graph: RoadGraph, profiles: dict[str, EdgeProfile]) -> set[str]:
-    """Ground-level nodes where three or more road ends meet (patch generated)."""
-    out = set()
-    for n in graph.nodes.values():
-        if n.degree < 3:
-            continue
-        if all(profiles[e].kind == "ground" for e in n.edges):
-            out.add(n.id)
-    return out
-
-
-def build_intersections(graph: RoadGraph, nodes: set[str], cfg: WorldConfig, grid: TileGrid
+def build_intersections(graph: RoadGraph, layout: JunctionLayout, grid: TileGrid
                         ) -> tuple[list[Intersection], list[Piece]]:
+    """Intersection entities (3+ road ends) and the surfaces of every junction polygon."""
     ents: list[Intersection] = []
     pieces: list[Piece] = []
-    off = cfg.roads.surface_offset + 0.02
-    for nid in sorted(nodes):
+    for nid in sorted(layout.junctions):
+        j = layout.junctions[nid]
         n = graph.nodes[nid]
-        R = intersection_radius(graph, nid)
-        disc = Point(n.x, n.y).buffer(R, quad_segs=8)
-        parts = [Point(n.x, n.y).buffer(max(graph.edges[e].width for e in n.edges) / 2.0, quad_segs=8)]
-        for eid in n.edges:
-            e = graph.edges[eid]
-            seg = e.line.intersection(disc)
-            if not seg.is_empty:
-                parts.append(seg.buffer(e.width / 2.0, cap_style="flat", join_style="mitre"))
-        poly = unary_union(parts).intersection(disc.buffer(0.01))
-        names = sorted({graph.edges[e].name for e in n.edges if graph.edges[e].name})
-        classes = sorted({graph.edges[e].road_class for e in n.edges})
-        ent = Intersection(id=f"intersection:{nid.removeprefix('n:')}", geometry=poly,
-                           properties={"node_id": nid, "degree": n.degree, "road_classes": classes,
-                                       **({"streets": names} if names else {})},
-                           source="derived", source_id=nid, confidence=0.8, node_id=nid, elevation=n.z)
-        ents.append(ent)
-        mat = "road_major" if any(c in MAJOR for c in classes) else "road_minor"
-        for p in polygons_of(poly):
-            m = flat_polygon_mesh(p.simplify(0.05), n.z + off, uv_scale=8.0)
-            pieces.append(Piece(grid.tile_of(n.x, n.y), "roads", mat, ent.id, m))
+        if j.degree >= 3:
+            names = sorted({graph.edges[e].name for e in n.edges if graph.edges[e].name})
+            classes = sorted({graph.edges[e].road_class for e in n.edges})
+            ents.append(Intersection(
+                id=j.feature_id, geometry=j.polygon,
+                properties={"node_id": nid, "degree": n.degree, "road_classes": classes,
+                            **({"streets": names} if names else {})},
+                source="derived", source_id=nid, confidence=0.8, node_id=nid, elevation=n.z))
+        if not j.mesh.is_empty():
+            pieces.append(Piece(grid.tile_of(n.x, n.y), "roads", "road_major" if j.major else "road_minor",
+                                j.feature_id, j.mesh))
     return ents, pieces
 
 
-def build_road_pieces(graph: RoadGraph, profiles: dict[str, EdgeProfile], patches: set[str],
+def build_road_pieces(graph: RoadGraph, profiles: dict[str, EdgeProfile], layout: JunctionLayout,
                       cfg: WorldConfig, grid: TileGrid, wanted: set[str] | None = None) -> list[Piece]:
     pieces: list[Piece] = []
     exclude = set(cfg.roads.mesh_exclude_classes)
@@ -118,9 +71,8 @@ def build_road_pieces(graph: RoadGraph, profiles: dict[str, EdgeProfile], patche
         if e.road_class in exclude:
             continue
         p = profiles[eid]
-        t0 = intersection_radius(graph, e.u) if e.u in patches else 0.0
-        t1 = intersection_radius(graph, e.v) if e.v in patches else 0.0
-        cut = _trim(p.xy, p.s, p.z, t0, t1)
+        t0, t1 = layout.trim(eid)
+        cut = trim_polyline(p.xy, p.s, p.z, t0, t1)
         if cut is None:
             continue
         xy, s, z = cut
@@ -128,12 +80,17 @@ def build_road_pieces(graph: RoadGraph, profiles: dict[str, EdgeProfile], patche
         tiles = grid.segment_tiles(xy)
         if wanted is not None and not (set(tiles) & wanted):
             continue
-        off = cfg.roads.surface_offset if p.kind == "ground" else 0.08
+        off = surface_offset(cfg, p.kind, e.road_class)
         mat = road_material(e.road_class)
+        start_mitre = layout.mitres.get((eid, 0)) if t0 == 0 else None
+        end_mitre = layout.mitres.get((eid, 1)) if t1 == 0 else None
+        last = len(tiles)
         for a, b, tile in _runs(tiles):
             if wanted is not None and tile not in wanted:
                 continue
-            m = ribbon(xy[a:b + 1], z[a:b + 1] + off, e.width, s0=float(s[a]))
+            m = ribbon(xy[a:b + 1], z[a:b + 1] + off, e.width, s0=float(s[a]),
+                       start_offset=start_mitre if a == 0 else None,
+                       end_offset=end_mitre if b == last else None)
             pieces.append(Piece(tile, _layer_for(p.kind), mat, e.road_id, m))
     return pieces
 

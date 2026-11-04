@@ -59,6 +59,7 @@ class SourceCache:
     def __init__(self, root: str | Path, offline: bool = False) -> None:
         self.root = Path(root)
         self.offline = offline
+        self.last_hit = False   # whether the most recent request was served from the cache
         self.root.mkdir(parents=True, exist_ok=True)
 
     def key(self, *parts: Any) -> str:
@@ -86,7 +87,9 @@ class SourceCache:
         dp, mp = self._paths(namespace, key, suffix)
         if dp.is_file() and mp.is_file():
             meta = json.loads(mp.read_text(encoding="utf-8"))
+            self.last_hit = True
             return dp.read_bytes(), meta
+        self.last_hit = False
         if self.offline:
             raise OfflineCacheMiss(f"{namespace}: no cached data for request {key} (offline mode)")
         data, meta = fetch()
@@ -110,10 +113,12 @@ class SourceCache:
         dp, mp = self._paths(namespace, key, ".tif")
         if mp.is_file():
             meta = json.loads(mp.read_text(encoding="utf-8"))
+            self.last_hit = True
             if meta.get("empty"):
                 return None, meta
             if dp.is_file():
                 return read_geotiff(dp, name=namespace), meta
+        self.last_hit = False
         if self.offline:
             raise OfflineCacheMiss(f"{namespace}: no cached raster for request {key} (offline mode)")
         raster, meta = fetch()

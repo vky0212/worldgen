@@ -33,6 +33,7 @@ from worldgen.hashing import sha256_file
 from worldgen.landcover.landcover import LANDCOVER_CODES
 from worldgen.log import get_logger, stage
 from worldgen.pipeline import acquire, bundle_from_fixture, compile_world
+from worldgen.progress import current
 from worldgen.sources.base import write_geotiff
 from worldgen.sources.synthetic import load_fixture
 from worldgen.spatial.raster import GeoRaster
@@ -76,10 +77,15 @@ def build(cfg: WorldConfig, opts: BuildOptions) -> BuildResult:
     t0 = time.perf_counter()
     region = Region.from_config(cfg)
     timings: dict[str, float] = {}
+    progress = current()
+    if progress.enabled:
+        progress.plan(**plan_payload(region, cfg))
     with stage("acquire", timings):
         if opts.fixture:
             fx = load_fixture(opts.fixture, region.center, cfg.projection.method)
             bundle = bundle_from_fixture(fx)
+            for rec in bundle.records:
+                progress.source(rec.name, rec.status, "synthetic fixture")
         else:
             bundle = acquire(region, cfg, opts.cache_dir, offline=opts.offline)
     world = compile_world(region, cfg, bundle)
@@ -88,7 +94,8 @@ def build(cfg: WorldConfig, opts: BuildOptions) -> BuildResult:
         report = validate_world(world) if cfg.validation.enabled else Report()
     with stage("export", world.timings):
         written, skipped = export_world(world, report, opts)
-    manifest = write_manifest(world, report, opts, time.perf_counter() - t0)
+    with stage("manifest", world.timings):
+        manifest = write_manifest(world, report, opts, time.perf_counter() - t0)
     errors = manifest["validation"]["errors"]
     if cfg.validation.fail_on_error and errors:
         raise ValidationFailed(f"validation found {errors} error(s); see {opts.output / 'diagnostics.json'}")
@@ -136,12 +143,18 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
         dirty = [t for t in dirty if t in opts.only_tiles]
     skipped = [t for t in tiles if t not in dirty]
     log.info("tiles: %d total, %d to (re)build, %d unchanged", len(tiles), len(dirty), len(skipped))
+    progress = current()
+    for t in skipped:
+        progress.tile(t, "unchanged")
+    total_steps = len(dirty)
+    progress.step("export", 0, total_steps, "generating geometry")
 
     pieces = generate_pieces(world, set(dirty)) if dirty else {}
     normals, rgba = terrain_render_inputs(world)
     arche = archetypes_for(world)
     tile_state = dict(prev_tiles)
-    for t in dirty:
+    for k, t in enumerate(dirty):
+        progress.tile(t, "building")
         assets = build_tile_assets(world, t, pieces.get(t, []), normals, rgba, arche)
         (out / "tiles" / f"{t}.glb").write_bytes(assets["glb"])
         col = out / "tiles" / f"{t}.collision.glb"
@@ -152,6 +165,8 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
         _write_json(out / "tiles" / f"{t}.meta.json", assets["meta"])
         tile_state[t] = {"hash": hashes[t], "counts": assets["counts"], "zrange": assets["zrange"],
                          "collision": assets["collision"] is not None}
+        progress.tile(t, "built")
+        progress.step("export", k + 1, total_steps, f"tile {t}")
     for t in list(tile_state):
         if t not in tiles:
             tile_state.pop(t)
@@ -184,6 +199,27 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
     _write_json(out / "diagnostics.json", report.to_dict(world), indent=1)
     (out / "ATTRIBUTION.txt").write_text(attribution_text(world), encoding="utf-8")
     return dirty, skipped
+
+
+def plan_payload(region: Region, cfg: WorldConfig) -> dict[str, Any]:
+    """Region outline and tile rings in WGS84 (lat, lon) for progress displays and previews."""
+    grid = TileGrid(cfg.tiling.tile_size)
+    frame = region.frame
+
+    def ring(xs: list[float], ys: list[float]) -> list[list[float]]:
+        lon, lat = frame.to_wgs84(xs, ys)
+        return [[round(float(a), 7), round(float(b), 7)] for a, b in zip(lat, lon)]
+
+    tiles = []
+    for i, j in region.tiles():
+        tid = f"{i}_{j}"
+        x0, y0, x1, y1 = grid.bounds(tid)
+        tiles.append({"id": tid, "ring": ring([x0, x1, x1, x0], [y0, y0, y1, y1])})
+    fp = np.asarray(region.footprint.exterior.coords)
+    sources = [n for n in ("osm", "dem", "worldcover", "canopy_height", "overture")
+               if getattr(cfg.sources, n).enabled and (n != "canopy_height" or cfg.vegetation.enabled)]
+    return {"region": region.describe(), "tiles": tiles, "footprint": ring(list(fp[:, 0]), list(fp[:, 1])),
+            "tile_size": cfg.tiling.tile_size, "sources": sources}
 
 
 def _world_key(world: CanonicalWorld) -> dict[str, Any]:

@@ -5,7 +5,11 @@ contract in [`../docs/output-format.md`](../docs/output-format.md): `manifest.js
 `tiles/index.json`, the tile `.glb` + `.meta.json` files,
 `graph/road_graph.json` and `diagnostics.json`.
 
-Stack: TypeScript, Three.js, Vite, proj4. There is no UI framework, only plain DOM and CSS.
+It also contains the **generate page** (`generate.html`): pick a region on a map, start a
+WorldGen build through the `worldgen serve` API ([`../docs/studio-api.md`](../docs/studio-api.md))
+and watch its progress live, then open the result in the viewer.
+
+Stack: TypeScript, Three.js, Leaflet, Vite, proj4. There is no UI framework, only plain DOM and CSS.
 
 ## Requirements
 
@@ -28,25 +32,93 @@ $env:WORLDGEN_WORLD='..\generated\taipei'; npm run dev   # PowerShell
 ```
 
 Then open <http://localhost:5173/>. If `WORLDGEN_WORLD` is not set, `/world/*` returns 404
-with a hint, and the viewer shows a "could not load the world manifest" message.
+with a hint, and the viewer shows a "could not load the world manifest" message (or a world
+picker, when the API below is running and lists worlds).
 `npm run preview` (which serves the production build) uses the same middleware.
+
+### With the WorldGen API (generate page, world selector)
+
+Both `npm run dev` and `npm run preview` proxy `/api/*` and `/worlds/*` to `worldgen serve`,
+at `WORLDGEN_API` (default `http://127.0.0.1:8765`). Server-Sent Events stream through the
+proxy unbuffered. Start the backend, then the dev server:
+
+```sh
+worldgen serve --output-root ./generated              # repository root, port 8765
+npm run dev                                           # viewer/ -> http://localhost:5173/generate.html
+WORLDGEN_API=http://127.0.0.1:9000 npm run dev        # backend on another port
+```
+
+Without the dev server, `worldgen serve` serves the built pages itself at
+<http://127.0.0.1:8765/> and <http://127.0.0.1:8765/generate.html>. When the API cannot be
+reached, the generate page shows how to start it and retries every 5 s; the viewer simply
+hides its API features (static hosting keeps working).
 
 ## Build, typecheck, test
 
 ```sh
 npm run build      # tsc --noEmit (app + node configs) && vite build -> dist/
 npm run typecheck  # type-check only
-npm test           # routing unit tests (node --test)
+npm test           # unit tests (node --test): routing, job-progress reducer, region helpers
 ```
 
-`dist/` is built with `base: './'`, so it works from any path. The intended setup is the
-viewer at `/` with the compiled world at `/world/` (for example `worldgen serve`).
+`dist/` contains both pages (`index.html`, `generate.html`) and is built with `base: './'`,
+so it works from any path. The intended setup is the viewer at `/` with the compiled world at
+`/world/` and the API at `/api/` (for example `worldgen serve`). The pages call the API
+relative to themselves (`api/...`), so they must be served next to it.
 
 ## URL parameters
+
+Viewer (`index.html`):
 
 | Parameter | Meaning |
 |---|---|
 | `world` | Base URL of the compiled world directory. It can be absolute or relative to the page. Default: `world/` relative to the page, which is `/world/` when the viewer is served at `/`. A trailing `/` is added if missing. Example: `?world=https://example.org/worlds/taipei/` |
+
+Generate page (`generate.html`):
+
+| Parameter | Meaning |
+|---|---|
+| `tiles` | Leaflet tile URL template for the base map instead of OpenStreetMap's standard tiles (`https://tile.openstreetmap.org/{z}/{x}/{y}.png`, max zoom 19). Example: `?tiles=http://localhost:8080/{z}/{x}/{y}.png` |
+| `tiles_attribution` | Attribution text for a custom `tiles` layer (default: "© OpenStreetMap contributors") |
+
+## Generate page
+
+`generate.html` (linked as **＋ New world** from the viewer header):
+
+- **Region.** *Circle*: click the map to set the centre, drag the centre handle to move it and
+  the edge handle (or the slider / number field, 100 m ... `limits.max_radius_m`) to resize.
+  *Rectangle*: drag on the map to draw a bounding box (the draw tool is armed when you switch
+  to rectangle mode or press **Draw rectangle**; Esc cancels), then drag the corner handles to
+  resize or the centre handle to move it. Lat/lon (or south/west/north/east) fields are
+  synced both ways. Presets jump to a few well-known places; **Fit to selection** zooms to the
+  region. The last region is remembered in `localStorage`.
+- **Plan preview.** Every change asks `GET /api/plan` (debounced) and draws the footprint and
+  the tile grid, with the tile count, area and tile size. More than 200 tiles shows a warning;
+  a region the server rejects (HTTP 400) disables **Generate** with the server's reason.
+- **Build.** The name is suggested from the preset / world name or the centre
+  (`n25_033_e121_565`), editable, and validated against `[a-z0-9_-]{1,48}`; reusing a world
+  name rebuilds it incrementally. Profile (from `/api/profiles`), *offline* and *force*.
+- **Progress.** Overall bar with percentage, elapsed time, the current stage and an estimate
+  of the time left; a stage timeline (pending / running / done / failed / skipped) with
+  durations, source chips under *Download sources* (ok / partial / missing / failed /
+  disabled; the detail is the tooltip) and a tile bar under *Export tiles*. On the map, tiles
+  are coloured live: pending (grey outline), building (amber, pulsing), built (green),
+  unchanged (teal); click a tile for its id and state. The log console keeps the last 300
+  lines, highlights warnings and errors, can show warnings only and follows new lines unless
+  you scroll up. **Cancel build** asks the server to cancel. When the build succeeds, a summary
+  card shows roads, buildings, trees, bridges, tunnels, validation counts, tiles built /
+  unchanged and the duration, with **Open in 3D viewer** (`index.html?world=<world_url>`).
+- **Reconnects.** Events come from `EventSource(/api/jobs/<id>/events?after=<seq>)`. A dropped
+  stream is reopened after the last seen `seq` (with backoff; from the second failure on, the
+  job record is re-read first). The active job id is kept in `localStorage`, so a reload
+  re-attaches to it; closing the panel of a running build only detaches (it keeps running).
+- **Jobs and worlds.** Recent jobs (click one to follow it; failed or cancelled ones have
+  **Retry**) and existing worlds, which are also drawn on the map as dashed outlines with a
+  popup (**Open in viewer**, **Rebuild** fills the form with that world's region and name).
+
+In the viewer, when the API answers `/api/health`, a **World** selector lists the worlds of
+`/api/worlds` and switches with `?world=<url>`. If the viewer is opened without `?world=` and
+`world/` cannot be loaded, it offers those worlds (and **New world**) instead of only the error.
 
 ## Controls
 
@@ -138,8 +210,21 @@ viewer at `/` with the compiled world at `/world/` (for example `worldgen serve`
 | `src/controls.ts` | Orbit (MapControls) and fly camera, framing, fly-to, dynamic near/far |
 | `src/geo.ts` | proj4 WGS84 ↔ local ENU; ENU ↔ three axes `(x, z, -y)` |
 | `src/ui.ts` | DOM helpers, info panel, status bar, toasts, progress bar |
+| `src/dom.ts` | Shared DOM helpers (`h`, sections, checkboxes) without three.js |
+| `src/api.ts`, `src/apiTypes.ts` | `worldgen serve` API client and types (docs/studio-api.md) |
+| `src/studio.ts` | Viewer integration: API probe, world selector, world picker |
+| `src/generate/main.ts` | Generate page wiring: map, form, plan preview, jobs and worlds lists |
+| `src/generate/progress.ts` | Pure job-progress reducer (events -> UI state, idempotent by `seq`). No DOM; unit-tested |
+| `src/generate/session.ts` | Follows one job: replay, SSE, reconnect after the last `seq`, batching into the reducer |
+| `src/generate/progressView.ts` | Progress panel: overall bar, stage timeline, source chips, result card, log console |
+| `src/generate/regionEditor.ts` | Leaflet circle / rectangle editing with handles and rectangle drawing |
+| `src/generate/mapLayers.ts` | Base map (`?tiles=`), plan preview grid, live tile grid + legend, world outlines |
+| `src/generate/region.ts` | Pure region helpers: API query/body, name suggestion and validation, presets. Unit-tested |
+| `src/generate/generate.css` | Generate page styles (on top of `src/style.css`) |
 | `test/routing.test.ts` | Routing tests on a hand-made mini graph (one-way edges, `no_left_turn`, mandatory turns, modes, U-turns) |
-| `vite.config.ts` | Vite config and the `/world/*` dev/preview middleware |
+| `test/progress.test.ts` | Reducer tests: full build, failure, cancel, replay idempotency, log trimming |
+| `test/region.test.ts` | Region helper tests: plan/job parameters, names, conversions |
+| `vite.config.ts` | Vite config: both pages, the `/world/*` middleware and the `/api` + `/worlds` proxy |
 
 ## How three.js' GLTFLoader exposes the contract
 

@@ -1,8 +1,9 @@
 import { createReadStream, existsSync, statSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vite';
-import type { Connect, Plugin } from 'vite';
+import type { Connect, Plugin, ProxyOptions } from 'vite';
 
 /**
  * Serves `/world/*` from the directory named by the WORLDGEN_WORLD environment
@@ -86,6 +87,41 @@ function worldgenWorld(): Plugin {
   };
 }
 
+/**
+ * `/api/*` (JSON + Server-Sent Events) and `/worlds/*` (compiled worlds) are
+ * proxied to `worldgen serve`, at WORLDGEN_API (default http://127.0.0.1:8765),
+ * in both `vite` and `vite preview`.
+ */
+function worldgenApiProxy(): Record<string, ProxyOptions> {
+  const target = (process.env.WORLDGEN_API?.trim() || 'http://127.0.0.1:8765').replace(/\/+$/, '');
+  const configure: ProxyOptions['configure'] = (proxy) => {
+    proxy.on('proxyRes', (proxyRes, _req, res) => {
+      // Server-Sent Events must stream: no buffering, no compression, no caching.
+      if (String(proxyRes.headers['content-type'] ?? '').startsWith('text/event-stream')) {
+        proxyRes.headers['cache-control'] = 'no-cache, no-transform';
+        proxyRes.headers['x-accel-buffering'] = 'no';
+        // Send the headers right away (after the proxy has copied them) so
+        // EventSource opens before the first event arrives.
+        setImmediate(() => {
+          if (!res.writableEnded) res.flushHeaders();
+        });
+      }
+    });
+    proxy.on('error', (err, _req, res) => {
+      // Answer like the API does, so the pages show "API unreachable" instead of hanging.
+      const r = res as ServerResponse;
+      if (r && typeof r.writeHead === 'function' && !r.headersSent) {
+        r.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });
+        r.end(JSON.stringify({ error: `WorldGen API not reachable at ${target} (${err.message})` }));
+      }
+    });
+  };
+  const options: ProxyOptions = { target, changeOrigin: false, ws: false, configure };
+  return { '^/api/': options, '^/worlds/': options };
+}
+
+const page = (file: string): string => fileURLToPath(new URL(file, import.meta.url));
+
 export default defineConfig({
   base: './',
   plugins: [worldgenWorld()],
@@ -95,8 +131,18 @@ export default defineConfig({
     target: 'es2022',
     sourcemap: true,
     chunkSizeWarningLimit: 1200,
+    rolldownOptions: {
+      input: {
+        main: page('./index.html'),
+        generate: page('./generate.html'),
+      },
+    },
   },
   server: {
     port: 5173,
+    proxy: worldgenApiProxy(),
+  },
+  preview: {
+    proxy: worldgenApiProxy(),
   },
 });

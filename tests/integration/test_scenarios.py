@@ -248,3 +248,63 @@ def test_untagged_layers_and_conflicting_anchors():
     errors = [i for i in validate_world(w).issues if i.severity == "error"]
     assert not errors, [e.message for e in errors]
     assert tunnel.get("design_grade") >= w.config.tunnels.max_grade
+
+
+def _ribbon_ends(w, eid):  # noqa: ANN001, ANN202
+    from worldgen.geometry.shapes import ribbon
+    from worldgen.transportation.junctions import trim_polyline
+
+    e, p, lay = w.graph.edges[eid], w.profiles[eid], w.junctions
+    t0, t1 = lay.trim(eid)
+    xy, _, z = trim_polyline(p.xy, p.s, p.z, t0, t1)
+    m = ribbon(xy, z, e.width, start_offset=lay.mitres.get((eid, 0)) if t0 == 0 else None,
+               end_offset=lay.mitres.get((eid, 1)) if t1 == 0 else None)
+    return m.positions[:2, :2], m.positions[-2:, :2], m
+
+
+def test_junction_polygons_meet_ribbons_without_overlap(compiled):
+    from shapely.geometry import Polygon
+
+    w = compiled("simple_intersection")
+    centre = _node_at(w.graph, 0, 0)
+    j = w.junctions.junctions[centre.id]
+    assert j.degree == 4 and j.polygon.is_valid
+    outline = np.asarray(j.polygon.exterior.coords)[:, :2]
+    for eid in centre.edges:
+        start, end, m = _ribbon_ends(w, eid)
+        cut = start if w.graph.edges[eid].u == centre.id else end
+        for v in cut:   # both ribbon end vertices are junction vertices: no gap
+            assert np.min(np.hypot(*(outline - v).T)) < 1e-6
+        pos = m.positions[:, :2]
+        footprint = Polygon(np.vstack([pos[0::2], pos[1::2][::-1]]))
+        assert footprint.intersection(j.polygon).area < 1e-3     # and no overlap (no z-fighting)
+    # Corners lie where the road edges meet: a 7.5 m road (2 lanes) crossing a 6 m road.
+    xs, ys = outline[:, 0], outline[:, 1]
+    assert xs.max() == pytest.approx(3.0, abs=0.01) and ys.max() == pytest.approx(3.75, abs=0.01)
+
+
+def test_mitred_joint_shares_vertices():
+    from worldgen.build import fixture_region
+    from worldgen.config import load_config
+    from worldgen.pipeline import compile_world
+    from worldgen.sources.synthetic import ORIGIN, FixtureBuilder, _raster
+    from worldgen.spatial.frame import LocalFrame
+    from worldgen.spatial.region import Region
+    from worldgen.world.world import SourceBundle
+
+    frame = LocalFrame(ORIGIN)
+    b = FixtureBuilder(frame)
+    b.way([(-150, 0), (0, 0)], {"highway": "residential", "name": "A"})
+    b.way([(0, 0), (100, 60)], {"highway": "residential", "name": "B"})     # 31 degree bend at a way joint
+    cfg = load_config("basic", region={**fixture_region("simple_intersection"), "radius_m": 200.0})
+    w = compile_world(Region.from_config(cfg), cfg,
+                      SourceBundle(osm=b.osm, dem=_raster(frame, 300, 30, lambda x, y: np.full_like(x, 5.0))))
+    joint = _node_at(w.graph, 0, 0)
+    assert joint.degree == 2 and joint.id not in w.junctions.junctions
+    e1, e2 = sorted(joint.edges)
+    _, end1, _ = _ribbon_ends(w, e1)
+    start2, _, _ = _ribbon_ends(w, e2)
+    a = end1 if w.graph.edges[e1].v == joint.id else _ribbon_ends(w, e1)[0]
+    c = start2 if w.graph.edges[e2].u == joint.id else _ribbon_ends(w, e2)[1]
+    # Same two points (order may differ): the joint is closed on both sides.
+    assert sorted(map(tuple, np.round(a, 6))) == sorted(map(tuple, np.round(c, 6)))

@@ -63,6 +63,9 @@ body {
 .warn-text {
   color: var(--warn);
 }
+.error-text {
+  color: var(--error);
+}
 
 /* ---------------------------------------------------------------- sidebar */
 
@@ -93,6 +96,36 @@ body {
 }
 .subtitle {
   color: var(--muted);
+}
+.brand-action {
+  margin-left: auto;
+  align-self: center;
+  color: var(--accent-2);
+  text-decoration: none;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 9px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  white-space: nowrap;
+}
+.brand-action:hover {
+  border-color: var(--accent);
+  background: rgba(59, 130, 246, 0.12);
+}
+.world-switch {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.world-switch[hidden] {
+  display: none;
+}
+.world-switch > span {
+  color: var(--muted);
+  flex: none;
 }
 
 .section {
@@ -158,6 +191,39 @@ h4 {
   display: flex;
   gap: 6px;
   flex-wrap: wrap;
+}
+a.btn {
+  display: inline-block;
+  text-decoration: none;
+  text-align: center;
+}
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+.btn-primary:hover:not(:disabled) {
+  background: #2f6fd8;
+  border-color: var(--accent-2);
+}
+.btn-danger {
+  color: #fecaca;
+  border-color: rgba(239, 68, 68, 0.5);
+}
+.btn-danger:hover:not(:disabled) {
+  border-color: var(--error);
+  background: rgba(239, 68, 68, 0.15);
+}
+.btn-big {
+  display: block;
+  width: 100%;
+  padding: 9px 12px;
+  font-size: 14px;
+}
+.btn-small {
+  padding: 1px 8px;
+  font-size: 11.5px;
 }
 .icon-btn {
   background: none;
@@ -535,6 +601,30 @@ table.kv th {
 .overlay-message h2 {
   margin: 0 0 8px;
   font-size: 16px;
+}
+.picker-list {
+  list-style: none;
+  margin: 8px 0 12px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+.picker-list a {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  text-decoration: none;
+  background: var(--bg);
+}
+.picker-list a:hover {
+  border-color: var(--accent);
 }
 .overlay-message pre {
   background: var(--bg);

@@ -19,6 +19,8 @@ from worldgen.landcover.water import (
     waterways_covered_by_areas,
 )
 from worldgen.log import get_logger, stage
+from worldgen.progress import SOURCES as SOURCE_ORDER
+from worldgen.progress import current
 from worldgen.sources.base import SourceCache, SourceRecord
 from worldgen.sources.osm import OverpassClient
 from worldgen.sources.osm_normalize import normalize_osm
@@ -30,7 +32,8 @@ from worldgen.terrain.build import Corridor, apply_corridors, build_heightfield,
 from worldgen.topology.crossings import find_road_crossings, find_water_crossings
 from worldgen.topology.graph import RoadGraph
 from worldgen.transportation.elevation import compute_elevations
-from worldgen.transportation.meshing import build_intersections, intersection_nodes
+from worldgen.transportation.junctions import compute_junctions
+from worldgen.transportation.meshing import build_intersections
 from worldgen.vegetation.classify import classify_vegetation
 from worldgen.vegetation.placement import Exclusions, concat_tables, place_ground_cover, place_trees
 from worldgen.vegetation.regions import extract_regions
@@ -52,39 +55,62 @@ def acquire(region: Region, cfg: WorldConfig, cache_dir: str | Path, offline: bo
     bbox_osm = region.wgs84_bbox(margin)
     bbox_raster = region.wgs84_bbox(max(margin, 4 * cfg.terrain.resolution) + 60.0)
 
+    progress = current()
+
     def guarded(name: str, fn):  # noqa: ANN001, ANN202
+        progress.source(name, "start")
+        n_before = len(bundle.records)
         try:
-            return fn()
+            res = fn()
         except SourceError as exc:
             log.error("%s acquisition failed: %s", name, exc)
             bundle.records.append(SourceRecord(name, "error", "-", "-", status="failed", notes=[str(exc)]))
+            progress.source(name, "failed", str(exc))
             return None
+        progress.step("acquire", SOURCE_ORDER.index(name) + 1, len(SOURCE_ORDER), name)
+        return res
+
+    def report(rec: SourceRecord) -> None:
+        detail = "from cache" if cache.last_hit else "downloaded"
+        if rec.status == "disabled":
+            detail = "disabled in config"
+        elif rec.dataset_version:
+            detail = f"{detail} · {rec.dataset_version}"
+        progress.source(rec.name, rec.status, detail)
 
     if cfg.sources.osm.enabled:
         res = guarded("osm", lambda: OverpassClient(cfg.sources.osm, cache).fetch(bbox_osm))
         if res is not None:
             bundle.osm, rec = res
             bundle.records.append(rec)
+            report(rec)
     else:
         bundle.records.append(SourceRecord("osm", "overpass", "-", "-", status="disabled"))
+        report(bundle.records[-1])
     dem = guarded("dem", lambda: fetch_dem(cfg.sources.dem, bbox_raster, cache))
     if dem is not None:
         bundle.dem = dem.raster
         bundle.records.append(dem.record)
+        report(dem.record)
         bundle.dem_datum = dem.record.vertical_datum or cfg.sources.dem.vertical_datum
     wc = guarded("worldcover", lambda: fetch_worldcover(cfg.sources.worldcover, bbox_raster, cache))
     if wc is not None:
         bundle.worldcover, rec = wc
         bundle.records.append(rec)
-    if cfg.vegetation.enabled:
+        report(rec)
+    if not cfg.vegetation.enabled:
+        progress.source("canopy_height", "disabled", "vegetation disabled")
+    else:
         ch = guarded("canopy_height", lambda: fetch_canopy_height(cfg.sources.canopy_height, bbox_raster, cache))
         if ch is not None:
             bundle.canopy, rec = ch
             bundle.records.append(rec)
+            report(rec)
     ov = guarded("overture", lambda: fetch_overture_buildings(cfg.sources.overture, bbox_osm, region.frame, cache))
     if ov is not None:
         bundle.overture_buildings, rec = ov
         bundle.records.append(rec)
+        report(rec)
     return bundle
 
 
@@ -164,12 +190,18 @@ def compile_world(region: Region, cfg: WorldConfig, bundle: SourceBundle) -> Can
         world.terrain_codes = classify_terrain(world.terrain, region, bundle.worldcover, world.landcover, world.water)
 
     with stage("intersections", t):
-        patches = intersection_nodes(graph, world.profiles) if cfg.roads.intersections else set()
-        world.intersections, _ = build_intersections(graph, patches, cfg, TileGrid(cfg.tiling.tile_size))
+        layout = compute_junctions(graph, world.profiles, cfg)
+        if not cfg.roads.intersections:
+            layout.junctions.clear()
+            layout.trims.clear()
+        world.junctions = layout
+        world.intersections, _ = build_intersections(graph, layout, TileGrid(cfg.tiling.tile_size))
 
     if cfg.vegetation.enabled:
         with stage("vegetation", t):
             _vegetation(world, bundle, cfg)
+    else:
+        current().stage_skipped("vegetation")
 
     _assign_edge_tiles(world)
     world.stats.update(_stats(world))
@@ -184,13 +216,6 @@ def _shape_terrain(world: CanonicalWorld, cfg: WorldConfig) -> None:
                                 world.covered_waterways, cfg)
     n_water = carve_polygons(hf, polys)
     n_water += apply_corridors(hf, wcorr)
-    # Keep bridge decks visible: terrain never rises above a deck surface.
-    bridge_corr = []
-    for b in world.bridges:
-        for eid in b.edge_ids:
-            p = world.profiles[eid]
-            bridge_corr.append(Corridor(p.xy, p.z - 0.4, graph.edges[eid].width / 2.0 + 0.5, 1.5, mode="max"))
-    n_bridge = apply_corridors(hf, bridge_corr)
     n_road = 0
     if cfg.terrain.road_conformance:
         road_corr = []
@@ -203,16 +228,29 @@ def _shape_terrain(world: CanonicalWorld, cfg: WorldConfig) -> None:
             # the road surface can rise above it.
             road_corr.append(Corridor(p.xy, p.z, e.width / 2.0 + 1.5 * hf.resolution, cfg.terrain.road_shoulder_m))
         n_road = apply_corridors(hf, road_corr)
+    # Last, so nothing raises it again: terrain never rises above a bridge deck (a deck next to
+    # a higher ground road would otherwise be buried by that road's conformance).
+    bridge_corr = []
+    for b in world.bridges:
+        for eid in b.edge_ids:
+            p = world.profiles[eid]
+            bridge_corr.append(Corridor(p.xy, p.z - 0.4, graph.edges[eid].width / 2.0 + hf.resolution, 1.5,
+                                        mode="max"))
+    n_bridge = apply_corridors(hf, bridge_corr)
     world.stats["terrain_shaping"] = {"water_nodes": n_water, "bridge_nodes": n_bridge, "road_nodes": n_road}
 
 
 def _vegetation(world: CanonicalWorld, bundle: SourceBundle, cfg: WorldConfig) -> None:
     vc = cfg.vegetation
+    progress = current()
     grid = classify_vegetation(world.region, vc, bundle.worldcover, bundle.canopy, world.landcover, world.water)
     world.vegetation_grid = grid
+    progress.step("vegetation", 1, 4, "classified")
     world.vegetation_regions = extract_regions(grid, world.landcover, vc)
+    progress.step("vegetation", 2, 4, f"{len(world.vegetation_regions)} regions")
     excl = vegetation_exclusions(world, vc.exclusion_buffer)
     trees = place_trees(grid, world.terrain, excl, world.observed_trees, vc)  # type: ignore[arg-type]
+    progress.step("vegetation", 3, 4, f"{len(trees)} trees placed")
     if len(trees) > vc.max_trees:
         log.warning("tree count %d exceeds vegetation.max_trees %d; keeping observed and the first generated",
                     len(trees), vc.max_trees)

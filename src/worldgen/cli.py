@@ -55,6 +55,8 @@ def cmd_build(args: argparse.Namespace) -> int:
     cfg = load_config(args.profile, args.config, overrides, region)
     only = set(args.tiles.split(",")) if args.tiles else None
     opts = BuildOptions(Path(args.output), Path(args.cache_dir), args.offline, args.fixture, only, args.force)
+    if args.progress == "jsonl":
+        return _build_jsonl(cfg, opts)
     res = build(cfg, opts)
     m = res.manifest
     s = m["statistics"]
@@ -69,6 +71,33 @@ def cmd_build(args: argparse.Namespace) -> int:
     print(f"  validation : {v['errors']} errors, {v['warnings']} warnings, {v['info']} info -> diagnostics.json")
     for src in m["sources"]:
         print(f"  source     : {src['name']:<14} {src.get('status', 'ok'):<9} {src.get('dataset_version', '')}")
+    return 0
+
+
+def _build_jsonl(cfg, opts) -> int:  # noqa: ANN001
+    """Run a build emitting progress events as JSON lines on stdout (docs/studio-api.md)."""
+    import logging
+
+    from worldgen.build import build
+    from worldgen.progress import Progress, jsonl_sink, use
+
+    logger = logging.getLogger("worldgen")
+    logger.setLevel(logging.INFO)
+    for h in logger.handlers:
+        h.setLevel(logging.CRITICAL + 1)   # every log record travels as a ``log`` event instead
+    progress = Progress(jsonl_sink(sys.stdout))
+    with use(progress):
+        try:
+            res = build(cfg, opts)
+        except Exception as exc:  # report every failure as an event, then a non-zero exit
+            progress.emit("error", message=f"{type(exc).__name__}: {exc}")
+            return 1
+        m = res.manifest
+        stats = {k: v for k, v in m["statistics"].items() if isinstance(v, (int, float))}
+        progress.emit("done", output=str(opts.output.resolve()), summary={
+            "statistics": stats, "validation": m["validation"], "tiles_built": len(res.tiles_written),
+            "tiles_unchanged": len(res.tiles_skipped), "duration_s": m["build"]["duration_s"],
+        }, overall=1.0)
     return 0
 
 
@@ -185,7 +214,8 @@ def cmd_fixtures(args: argparse.Namespace) -> int:
 def cmd_serve(args: argparse.Namespace) -> int:
     from worldgen.serve import serve
 
-    return serve(Path(args.world), args.port, Path(args.viewer) if args.viewer else None, args.open)
+    return serve(Path(args.world) if args.world else None, args.port, Path(args.viewer) if args.viewer else None,
+                 args.open, Path(args.output_root), Path(args.cache_dir))
 
 
 def make_parser() -> argparse.ArgumentParser:
@@ -211,6 +241,8 @@ def make_parser() -> argparse.ArgumentParser:
     b.add_argument("--offline", action="store_true", help="use cached source data only (no network)")
     b.add_argument("--tiles", help="comma-separated tile ids to (re)build, e.g. 0_0,1_0")
     b.add_argument("--force", action="store_true", help="rebuild tiles even when their inputs are unchanged")
+    b.add_argument("--progress", choices=["none", "jsonl"], default="none",
+                   help="jsonl: write progress events (docs/studio-api.md) to stdout instead of a summary")
     b.set_defaults(func=cmd_build)
 
     r = sub.add_parser("route", help="shortest path on a compiled world's road graph")
@@ -240,8 +272,10 @@ def make_parser() -> argparse.ArgumentParser:
     f = sub.add_parser("fixtures", help="list the synthetic test scenarios")
     f.set_defaults(func=cmd_fixtures)
 
-    s = sub.add_parser("serve", help="serve the viewer with a compiled world")
-    s.add_argument("--world", required=True)
+    s = sub.add_parser("serve", help="serve the viewer, compiled worlds and the generation API")
+    s.add_argument("--world", help="compiled world served at /world/ (optional)")
+    s.add_argument("--output-root", default="generated", help="directory of worlds built from the browser")
+    s.add_argument("--cache-dir", default=".worldgen-cache", help="source cache used by browser builds")
     s.add_argument("--port", type=int, default=8765)
     s.add_argument("--viewer", help="path to the built viewer (default: viewer/dist)")
     s.add_argument("--open", action="store_true", help="open a browser")

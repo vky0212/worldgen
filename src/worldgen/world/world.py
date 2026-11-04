@@ -64,6 +64,7 @@ class CanonicalWorld:
     crossings: list[Any] = field(default_factory=list)
     water_crossings: list[Any] = field(default_factory=list)
     profiles: dict[str, Any] = field(default_factory=dict)
+    junctions: Any = None                # JunctionLayout (trims, mitres, junction polygons)
     water_levels: dict[str, float] = field(default_factory=dict)
     waterway_profiles: dict[str, Any] = field(default_factory=dict)
     covered_waterways: set[str] = field(default_factory=set)

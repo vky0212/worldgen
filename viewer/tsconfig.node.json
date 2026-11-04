@@ -15,5 +15,5 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true
   },
-  "include": ["vite.config.ts", "test", "src/routing.ts"]
+  "include": ["vite.config.ts", "test", "src/routing.ts", "src/generate/progress.ts", "src/generate/region.ts", "src/apiTypes.ts"]
 }

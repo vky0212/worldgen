@@ -51,6 +51,7 @@ import {
   h,
   renderLegend,
 } from './ui';
+import { hasWorldParam, studioInfo, worldPicker, worldSwitcher } from './studio';
 import { ValidationOverlay, hasLocation, renderIssueList } from './validation';
 import type { IssueFilter } from './validation';
 import { WorldModel } from './world';
@@ -166,6 +167,7 @@ class App {
     this.toasts.onLog = (e) => this.addLoadMessage(`${e.level}: ${e.text}`);
 
     this.bindEvents();
+    void this.initStudio();
     new ResizeObserver(() => this.resize()).observe(this.viewport);
     this.resize();
     this.renderer.setAnimationLoop(() => this.frame());
@@ -184,6 +186,7 @@ class App {
       // Schema-version rejections are not a serving problem; everything else is.
       const servingProblem = e instanceof HttpError || /not valid JSON/.test(errorText(e));
       this.showFatal('Could not load the world manifest', errorText(e), servingProblem);
+      if (servingProblem && !hasWorldParam()) void this.offerWorldPicker();
     }
     const m = this.manifest;
     this.geo = new GeoFrame(m);
@@ -660,6 +663,25 @@ class App {
       h('button', { class: 'btn', onclick: () => (this.overlayMessage.hidden = true) }, 'Dismiss'),
     ]);
     this.overlayMessage.hidden = false;
+  }
+
+  // ------------------------------------------------------------ worldgen serve integration
+
+  /** With a reachable WorldGen API: a "World" selector above the sidebar sections. */
+  private async initStudio(): Promise<void> {
+    const info = await studioInfo();
+    if (!info) return;
+    this.sections.before(worldSwitcher(info, this.base));
+  }
+
+  /** The default world failed to load: offer the API's worlds (if any) instead. */
+  private async offerWorldPicker(): Promise<void> {
+    const info = await studioInfo();
+    if (!info || this.overlayMessage.hidden) return;
+    clear(this.overlayMessage);
+    appendChildren(this.overlayMessage, worldPicker(info, () => (this.overlayMessage.hidden = true)));
+    this.overlayMessage.hidden = false;
+    this.progress.hide();
   }
 
   // ------------------------------------------------------------ events

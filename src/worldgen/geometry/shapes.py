@@ -164,15 +164,25 @@ def polyline_frames(xy: np.ndarray, miter_limit: float = 3.0) -> tuple[np.ndarra
 
 
 def ribbon(xy: np.ndarray, z: np.ndarray, width: float | np.ndarray, s0: float = 0.0,
-           uv_scale: float | None = None) -> Mesh:
-    """Flat upward strip of ``width`` centred on the polyline (cross-section horizontal)."""
+           uv_scale: float | None = None, start_offset: np.ndarray | None = None,
+           end_offset: np.ndarray | None = None) -> Mesh:
+    """Flat upward strip of ``width`` centred on the polyline (cross-section horizontal).
+
+    ``start_offset``/``end_offset`` replace the left-edge offset vector at the first/last
+    station (used for mitred joints so adjacent ribbons share their end vertices).
+    """
     n = len(xy)
     if n < 2:
         return empty_mesh()
     left, scale = polyline_frames(xy)
     half = (np.asarray(width) / 2.0) * scale if np.ndim(width) else (width / 2.0) * scale
-    lpos = xy + left * np.reshape(half, (-1, 1))
-    rpos = xy - left * np.reshape(half, (-1, 1))
+    offset = left * np.reshape(half, (-1, 1))
+    if start_offset is not None:
+        offset[0] = start_offset
+    if end_offset is not None:
+        offset[-1] = end_offset
+    lpos = xy + offset
+    rpos = xy - offset
     pos = np.empty((2 * n, 3))
     pos[0::2, :2] = lpos
     pos[1::2, :2] = rpos

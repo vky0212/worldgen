@@ -22,7 +22,6 @@ from worldgen.transportation.meshing import (
     build_intersections,
     build_road_pieces,
     build_tunnel_pieces,
-    intersection_nodes,
 )
 from worldgen.vegetation.regions import ARCHETYPE_ORDER, archetype_meshes, instance_transforms, region_outline_pieces
 from worldgen.world.world import CanonicalWorld
@@ -90,10 +89,9 @@ def generate_pieces(world: CanonicalWorld, wanted: set[str]) -> dict[str, list[P
     grid = TileGrid(cfg.tiling.tile_size)
     graph = world.graph
     pieces: list[Piece] = []
-    patches = intersection_nodes(graph, world.profiles) if cfg.roads.intersections else set()
-    _, inter_pieces = build_intersections(graph, patches, cfg, grid)
+    _, inter_pieces = build_intersections(graph, world.junctions, grid)
     pieces += [p for p in inter_pieces if p.tile in wanted]
-    pieces += build_road_pieces(graph, world.profiles, patches, cfg, grid, wanted)
+    pieces += build_road_pieces(graph, world.profiles, world.junctions, cfg, grid, wanted)
     pieces += build_bridge_pieces(world.bridges, graph, world.profiles, world.terrain.sample, cfg, grid, wanted)
     pieces += build_tunnel_pieces(world.tunnels, graph, world.profiles, cfg, grid, wanted)
     pieces += build_building_pieces(world.buildings, cfg.buildings, grid, wanted)

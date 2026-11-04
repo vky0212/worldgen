@@ -42,13 +42,21 @@ def configure_logging(verbosity: int = 0) -> None:
 
 @contextmanager
 def stage(name: str, timings: dict[str, float] | None = None) -> Iterator[None]:
+    from worldgen.progress import current
+
     log = get_logger("pipeline")
     log.info("stage %s ...", name)
+    progress = current()
+    progress.stage_start(name)
     t0 = time.perf_counter()
+    ok = False
     try:
         yield
+        ok = True
     finally:
         dt = time.perf_counter() - t0
         if timings is not None:
             timings[name] = round(dt, 3)
+        if ok:
+            progress.stage_end(name, dt)
         log.info("stage %s done in %.2fs", name, dt)

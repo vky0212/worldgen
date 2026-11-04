@@ -44,6 +44,12 @@ cd viewer && npm ci && npm run build && cd ..
 uv run worldgen serve --world ./generated/taipei --open
 ```
 
+Or generate worlds from the browser: `uv run worldgen serve --open` opens
+`generate.html`, where you pick a region on a world map, start the build and
+watch its progress live (stages, sources, tiles on the map, log), then open the
+result in the 3D viewer. The API behind it is documented in
+[`docs/studio-api.md`](docs/studio-api.md).
+
 The first build fetches the source data into `.worldgen-cache/` (about 7 MB for
 the 1 km Taipei region; raster sources are read as small windows of
 Cloud-Optimized GeoTIFFs) and takes about 1–2 minutes, mostly the Overpass query.
@@ -66,7 +72,8 @@ uv run worldgen build --fixture demo_town --output ./generated/demo
 | `worldgen compare DIR_A DIR_B` | report which sources, config keys and output files differ between two worlds |
 | `worldgen transform --world DIR LAT,LON …` (`--inverse` for x,y) | convert between WGS84 and the world's local metres |
 | `worldgen fixtures` | list the synthetic scenarios |
-| `worldgen serve --world DIR` | serve `viewer/dist` with the world at `/world/` |
+| `worldgen serve [--world DIR] [--output-root generated]` | serve the viewer, every world under the output root at `/worlds/<name>/`, the region picker at `/generate.html` and the generation API |
+| `worldgen build … --progress jsonl` | emit machine-readable progress events (one JSON object per line) instead of the summary |
 
 ## Profiles
 
@@ -119,7 +126,10 @@ Highlights:
 
 ## Viewer
 
-`viewer/` (TypeScript + Three.js + Vite): orbit and fly cameras, layer toggles,
+`viewer/` (TypeScript + Three.js + Vite). `generate.html`: world map region
+picker (circle or rectangle), live tile-grid preview, build progress (overall
+bar, stage timeline, per-source status, tiles colouring in on the map as they
+are exported, log), cancel, and links to the result. `index.html`: orbit and fly cameras, layer toggles,
 click-to-inspect metadata (observed vs. inferred vs. missing), colour modes
 (observed/inferred, confidence, source), road-topology overlay, client-side
 routing, validation markers and issue list, lat/lon readout and go-to. See

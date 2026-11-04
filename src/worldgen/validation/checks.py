@@ -21,6 +21,7 @@ from scipy.spatial import cKDTree
 from worldgen import SCHEMA_VERSION
 from worldgen.buildings.buildings import building_mesh
 from worldgen.geometry.shapes import polygons_of
+from worldgen.progress import current
 from worldgen.tiling.grid import TileGrid, parse_tile_id, tile_id
 from worldgen.vegetation.classify import CAT, TREE_CATEGORIES
 from worldgen.world.world import CanonicalWorld
@@ -42,6 +43,7 @@ class Report:
     issues: list[Issue] = field(default_factory=list)
     checks: dict[str, dict[str, Any]] = field(default_factory=dict)
     max_per_check: int = 200
+    expected_checks: int = 0
 
     def add(self, issue: Issue) -> None:
         self.issues.append(issue)
@@ -61,6 +63,7 @@ class Report:
         if details:
             entry.update(details)
         self.checks[name] = entry
+        current().step("validate", len(self.checks), max(self.expected_checks, len(self.checks)), name)
 
     def to_dict(self, world: CanonicalWorld) -> dict[str, Any]:
         frame = world.region.frame
@@ -89,7 +92,8 @@ class Report:
 
 def validate_world(world: CanonicalWorld) -> Report:
     cfg = world.config
-    rep = Report(max_per_check=cfg.validation.max_issues_per_check)
+    veg = cfg.vegetation.enabled and world.vegetation_grid is not None
+    rep = Report(max_per_check=cfg.validation.max_issues_per_check, expected_checks=16 + (2 if veg else 0))
     for raw in world.stage_issues:
         rep.add(Issue(raw["check"], raw["severity"], raw["message"], raw.get("entity_ids", []),
                       raw.get("x"), raw.get("y"), raw.get("z")))
