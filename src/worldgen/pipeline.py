@@ -263,6 +263,12 @@ def _shape_terrain(world: CanonicalWorld, cfg: WorldConfig) -> None:
             bridge_corr.append(Corridor(p.xy, p.z - 0.4, graph.edges[eid].width / 2.0 + hf.resolution, 1.5,
                                         mode="max"))
     n_bridge = apply_corridors(hf, bridge_corr)
+    q = cfg.height_quantum()
+    if q > 0:
+        # Exact multiples of the quantum, before anything is placed on the terrain (draped roads,
+        # tree ground heights, building bases): heightmap tiles store these heights as integers,
+        # so a runtime mesh reproduces exactly the surface everything else was fitted to.
+        hf.z[:] = np.round(hf.z / q) * q
     world.stats["terrain_shaping"] = {"water_nodes": n_water, "bridge_nodes": n_bridge, "road_nodes": n_road}
 
 

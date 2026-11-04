@@ -140,7 +140,12 @@ Highlights:
 * each pickable vertex carries `_FEATURE_ID_0`, an index into the mesh's
   `extras.feature_ids`, resolved in `tiles/<tile>.meta.json`;
 * trees use `EXT_mesh_gpu_instancing` (instance transforms separate from the
-  archetype meshes).
+  archetype meshes);
+* `--set export.mode=data` writes **data-first tiles** (format 2.x): one `.wgt`
+  container per tile with the terrain as a 1 cm heightmap that viewers and engines
+  mesh themselves, the other layers as an embedded GLB, and a `tiles/tileset.json`
+  + per-4 km subtree index instead of one flat `tiles/index.json`. The bundled
+  viewer reads them from the next release; `baked` (the default) is unchanged.
 
 ## Viewer
 

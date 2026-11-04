@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,7 @@ from typing import Any
 import numpy as np
 import trimesh
 
+from worldgen.export.container import decode_heights, read_container
 from worldgen.export.gltf import read_glb_json
 from worldgen.hashing import sha256_file
 from worldgen.topology.graph import RoadGraph
@@ -49,19 +51,29 @@ def validate_outputs(world: Path) -> dict[str, Any]:
             errors += 1
             lines.append(f"ERROR non-finite elevations on {e.id}")
             break
-    # 3. Tile meshes.
-    index = json.loads((world / "tiles" / "index.json").read_text(encoding="utf-8"))
+    # 3. Tile meshes (baked GLBs, or the GLB section and heightmaps of data-first tiles).
+    tiles = _tile_files(world, m)
     degenerate = bad_normals = 0
     feature_errors = 0
-    for t in index["tiles"]:
-        data = (world / t["glb"]).read_bytes()
-        doc = read_glb_json(data)
+    heights: dict[tuple[int, int], np.ndarray] = {}
+    for t in tiles:
+        data = (world / t["content"]).read_bytes()
+        if t["data"]:
+            c = read_container(data)
+            data = c.sections.get("GLB", b"")
+            heights[(c.i, c.j)] = decode_heights(c.sections["HGT"]).z[1:-1, 1:-1]
+            if not np.isfinite(heights[(c.i, c.j)]).all():
+                errors += 1
+                lines.append(f"ERROR non-finite terrain heights in {t['content']}")
         meta = json.loads((world / t["meta"]).read_text(encoding="utf-8"))
+        if not data:
+            continue
+        doc = read_glb_json(data)
         for mesh in doc.get("meshes", []):
             for fid in mesh.get("extras", {}).get("feature_ids", []):
                 if fid not in meta["entities"]:
                     feature_errors += 1
-        scene = trimesh.load(world / t["glb"], file_type="glb", force="scene", process=False)
+        scene = trimesh.load(io.BytesIO(data), file_type="glb", force="scene", process=False)
         for name, geom in scene.geometry.items():
             if not isinstance(geom, trimesh.Trimesh) or len(geom.faces) == 0:
                 continue
@@ -73,7 +85,17 @@ def validate_outputs(world: Path) -> dict[str, Any]:
         errors += 1
         lines.append(f"ERROR {feature_errors} feature ids without metadata")
     else:
-        lines.append(f"ok    {len(index['tiles'])} tiles: every feature id has metadata")
+        lines.append(f"ok    {len(tiles)} tiles: every feature id has metadata")
+    if heights:
+        seams = sum(1 for (i, j), z in heights.items() for (di, dj) in ((1, 0), (0, 1))
+                    if (i + di, j + dj) in heights and not np.array_equal(
+                        z[:, -1] if di else z[-1, :], heights[(i + di, j + dj)][:, 0] if di
+                        else heights[(i + di, j + dj)][0, :]))
+        if seams:
+            errors += 1
+            lines.append(f"ERROR {seams} heightmap tile seams with different edge heights")
+        else:
+            lines.append(f"ok    heightmaps: {len(heights)} tiles, shared edges identical")
     if bad_normals:
         errors += 1
         lines.append(f"ERROR {bad_normals} vertices with invalid normals")
@@ -89,6 +111,25 @@ def validate_outputs(world: Path) -> dict[str, Any]:
     for name, c in sorted(s["checks"].items()):
         lines.append(f"      {c['status']:<5} {name} ({c['issues']})")
     return {"errors": errors, "warnings": warnings, "lines": lines}
+
+
+def _tile_files(world: Path, manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every tile's content and meta paths, for either export mode."""
+    tiling = manifest.get("tiling", {})
+    if tiling.get("tileset"):
+        tileset = json.loads((world / tiling["tileset"]).read_text(encoding="utf-8"))
+        uri = tileset["uri"]
+        out = []
+        for st in tileset["subtrees"]:
+            sub = json.loads((world / uri["subtree"].format(si=st["si"], sj=st["sj"])).read_text(encoding="utf-8"))
+            for lvl in sub["levels"]:
+                for i, j in zip(lvl["i"], lvl["j"]):
+                    keys = {"level": lvl["level"], "si": st["si"], "sj": st["sj"], "i": i, "j": j}
+                    out.append({"content": uri["content"].format(**keys), "meta": uri["meta"].format(**keys),
+                                "data": True})
+        return out
+    index = json.loads((world / tiling.get("index", "tiles/index.json")).read_text(encoding="utf-8"))
+    return [{"content": t["glb"], "meta": t["meta"], "data": False} for t in index["tiles"]]
 
 
 def compare_worlds(a: Path, b: Path) -> dict[str, Any]:

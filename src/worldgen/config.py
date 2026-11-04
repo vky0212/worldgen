@@ -210,6 +210,9 @@ class TerrainConfig:
     # "source" keeps the DEM datum; "EGM2008" or "WGS84_ellipsoid" convert when possible.
     output_vertical_datum: str = "source"
     lod_strides: list[int] = field(default_factory=lambda: [1])
+    # Shaped terrain heights are rounded to this step (m); 0 = no rounding. export.mode "data"
+    # needs exact integer heights in its heightmaps, so it uses 0.01 when this is 0.
+    height_quantum_m: float = 0.0
 
 
 @dataclass
@@ -421,8 +424,16 @@ class SmoothingConfig:
     forest_edge_thinning: float = 0.5
 
 
+EXPORT_MODES = ("baked", "data")
+
+
 @dataclass
 class ExportConfig:
+    # "baked": every layer as meshes in tile GLBs (tiles/index.json, format 1.x).
+    # "data": data-first tiles (tiles/tileset.json + one .wgt container per tile, format 2.x):
+    #   terrain as quantised heightmaps that viewers and engines mesh at runtime, the other
+    #   layers as an embedded GLB. See docs/output-format.md.
+    mode: str = "baked"
     combined_glb: bool = True
     # world.glb (every tile in one file) is only written up to this many tiles (0: no limit).
     # Large worlds are streamed tile by tile, and GLB files cannot exceed 4 GiB.
@@ -464,6 +475,11 @@ class WorldConfig:
     def hash(self) -> str:
         return sha256_json(self.to_dict())
 
+    def height_quantum(self) -> float:
+        """Rounding step of the shaped terrain (m); 0 = none."""
+        q = self.terrain.height_quantum_m
+        return q if q > 0 else (0.01 if self.export.mode == "data" else 0.0)
+
     def section_hash(self, *names: str, exclude: dict[str, tuple[str, ...]] | None = None) -> str:
         """Hash of the named sections; ``exclude`` drops keys of a section (section -> keys)."""
         data = self.to_dict()
@@ -487,6 +503,10 @@ class WorldConfig:
             raise ConfigError(f"unknown projection method {self.projection.method!r}")
         if self.roads.surface_mode not in ("drape", "ribbon"):
             raise ConfigError("roads.surface_mode must be drape or ribbon")
+        if self.export.mode not in EXPORT_MODES:
+            raise ConfigError(f"export.mode must be one of {', '.join(EXPORT_MODES)}")
+        if self.terrain.height_quantum_m < 0:
+            raise ConfigError("terrain.height_quantum_m must not be negative")
         if self.vegetation.quality not in ("low", "medium", "high"):
             raise ConfigError("vegetation.quality must be low, medium or high")
         sm = self.smoothing

@@ -155,7 +155,11 @@ def _output_sizes(out: Path) -> dict[str, int]:
         rel = p.relative_to(out).as_posix()
         if rel.startswith("tiles/"):
             name = p.name
-            if name.endswith(".collision.glb"):
+            if name.endswith(".wgt"):
+                key = "tiles_wgt"
+            elif rel.startswith("tiles/sub/") or name in ("index.json", "tileset.json"):
+                key = "tiles_index"
+            elif name.endswith(".collision.glb"):
                 key = "tiles_collision"
             elif name.endswith(".glb"):
                 key = "tiles_glb"

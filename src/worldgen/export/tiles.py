@@ -68,12 +68,19 @@ def trees_by_tile(world: CanonicalWorld) -> dict[str, np.ndarray]:
 
 # Configuration keys that never change a tile's files, kept out of the tile input hashes.
 NOT_TILE_INPUTS: dict[str, tuple[str, ...]] = {"export": ("combined_glb_max_tiles",)}
+# Keys added after format 1.0, hashed only when set away from their default, so worlds built
+# with the defaults keep their tile hashes (and incremental rebuilds) across the upgrade.
+LATER_KEY_DEFAULTS: dict[str, dict[str, Any]] = {"export": {"mode": "baked"}, "terrain": {"height_quantum_m": 0.0}}
 
 
 def tile_config_hash(cfg: Any) -> str:
     """Hash of the configuration sections that can change a tile's files."""
+    exclude = {s: list(keys) for s, keys in NOT_TILE_INPUTS.items()}
+    data = cfg.to_dict()
+    for section, defaults in LATER_KEY_DEFAULTS.items():
+        exclude.setdefault(section, []).extend(k for k, v in defaults.items() if data[section][k] == v)
     return cfg.section_hash("tiling", "terrain", "roads", "bridges", "tunnels", "buildings", "water",
-                            "vegetation", "smoothing", "export", exclude=NOT_TILE_INPUTS)
+                            "vegetation", "smoothing", "export", exclude={k: tuple(v) for k, v in exclude.items()})
 
 
 def tile_input_hash(world: CanonicalWorld, tid: str, entity_tree: tuple[STRtree, list[Any]] | None = None,
@@ -274,13 +281,15 @@ def tile_blocks(tiles: list[str], block: int) -> list[list[str]]:
 def build_tile_assets(world: CanonicalWorld, tid: str, pieces: list[Piece], terrain_normals: np.ndarray | None,
                       terrain_rgba: np.ndarray, arche: dict[str, dict[str, Any]], *,
                       trees_in_tile: np.ndarray | None = None,
-                      entity_index: dict[str, Any] | None = None) -> dict[str, Any]:
+                      entity_index: dict[str, Any] | None = None, terrain_mesh: bool = True) -> dict[str, Any]:
     """Return {"glb": bytes, "collision": bytes|None, "meta": dict, "counts": dict, "zrange": [..]}.
 
     ``terrain_normals`` may be None: the terrain meshes then compute normals for the tile's own
     window (same values). ``trees_in_tile`` (this tile's entry of ``trees_by_tile``) and
     ``entity_index`` (``world.entity_index()``) are computed once per export by the caller;
-    without them they are derived here, which costs O(trees + entities) per tile.
+    without them they are derived here, which costs O(trees + entities) per tile. Without
+    ``terrain_mesh`` (data-first tiles, whose terrain ships as a heightmap) the GLB has no
+    terrain layer; the terrain record and height range are still produced.
     """
     cfg = world.config
     grid = TileGrid(cfg.tiling.tile_size)
@@ -290,9 +299,14 @@ def build_tile_assets(world: CanonicalWorld, tid: str, pieces: list[Piece], terr
     layers: dict[str, LayerBuilder] = {name: LayerBuilder(name) for name in LAYER_ORDER}
     collision = LayerBuilder("collision")
     # Terrain.
-    tmesh = hf.tile_mesh(x0, y0, x1, y1, colors=terrain_rgba, normals=terrain_normals)
     terrain_id = f"terrain:{tid}"
-    layers["terrain"].add(tmesh, "terrain", terrain_id)
+    zmin, zmax = np.inf, -np.inf
+    if terrain_mesh:
+        tmesh = hf.tile_mesh(x0, y0, x1, y1, colors=terrain_rgba, normals=terrain_normals)
+        layers["terrain"].add(tmesh, "terrain", terrain_id)
+    else:
+        win = hf.z[_node_window(hf, (x0, y0, x1, y1))]
+        zmin, zmax = float(win.min()), float(win.max())
     if cfg.export.collision:
         collision.add(hf.tile_mesh(x0, y0, x1, y1, stride=2, normals=terrain_normals), "collision", terrain_id)
     for p in pieces:
@@ -303,7 +317,6 @@ def build_tile_assets(world: CanonicalWorld, tid: str, pieces: list[Piece], terr
 
     gb = GltfBuilder()
     children = []
-    zmin, zmax = np.inf, -np.inf
     for name in LAYER_ORDER:
         lb = layers[name]
         if name == "trees" or lb.is_empty():
@@ -356,8 +369,21 @@ def build_tile_assets(world: CanonicalWorld, tid: str, pieces: list[Piece], terr
     meta = tile_metadata(world, tid, layers, np.concatenate(tree_idx) if tree_idx else NO_TREES, entity_index)
     counts = {name: len(layers[name].features) for name in LAYER_ORDER if name != "trees"}
     counts["trees"] = n_trees
+    if not terrain_mesh:
+        # The runtime terrain mesh carries this feature id; its record stays in the tile's meta.
+        meta["entities"] = dict(sorted({**meta["entities"], terrain_id: terrain_record(world, tid)}.items()))
+        counts["terrain"] = 1
     return {"glb": glb, "collision": col_bytes, "meta": meta, "counts": counts,
             "zrange": [round(zmin, 3), round(zmax, 3)] if np.isfinite(zmin) else None}
+
+
+def _node_window(hf: Any, bounds: tuple[float, float, float, float]) -> tuple[slice, slice]:
+    """Grid nodes of a tile (shared edges included), as ``Heightfield.tile_mesh`` picks them."""
+    x0, y0, x1, y1 = bounds
+    r = hf.resolution
+    c0, c1 = max(int(round((x0 - hf.xmin) / r)), 0), min(int(round((x1 - hf.xmin) / r)), hf.cols - 1)
+    r0, r1 = max(int(round((y0 - hf.ymin) / r)), 0), min(int(round((y1 - hf.ymin) / r)), hf.rows - 1)
+    return slice(r0, r1 + 1), slice(c0, c1 + 1)
 
 
 def tile_metadata(world: CanonicalWorld, tid: str, layers: dict[str, LayerBuilder], tree_idx: np.ndarray,
