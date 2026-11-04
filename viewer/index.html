@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WorldGen viewer</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%233b82f6'/%3E%3Cpath d='M2 9h12M8 1v14' stroke='%23fff' stroke-width='1.2'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="./src/style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <aside id="sidebar">
+        <header class="brand">
+          <span class="logo">WorldGen</span>
+          <span class="subtitle">viewer</span>
+        </header>
+        <div id="sidebar-sections"></div>
+      </aside>
+      <main id="viewport">
+        <div id="progress" class="progress"></div>
+        <div id="tool-hint" class="tool-hint" hidden></div>
+        <div id="toasts" class="toasts" aria-live="polite"></div>
+        <div id="overlay-message" class="overlay-message" hidden></div>
+        <aside id="info" class="info-panel"></aside>
+      </main>
+      <footer id="statusbar" class="statusbar"></footer>
+    </div>
+    <script type="module" src="./src/main.ts"></script>
+  </body>
+</html>

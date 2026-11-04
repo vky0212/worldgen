@@ -1,0 +1,27 @@
+{
+  "name": "worldgen-viewer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Interactive Three.js viewer for compiled WorldGen worlds",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json",
+    "test": "node --test test/routing.test.ts"
+  },
+  "dependencies": {
+    "proj4": "2.22.0",
+    "three": "0.187.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "@types/three": "0.187.0",
+    "typescript": "7.0.2",
+    "vite": "8.3.5"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  }
+}

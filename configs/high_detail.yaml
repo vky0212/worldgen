@@ -1,0 +1,17 @@
+# High-detail profile: finer terrain and road sampling, overture buildings, better vegetation meshes.
+extends: procedural
+terrain:
+  resolution: 2.0
+  road_shoulder_m: 2.0
+roads:
+  sample_spacing: 2.0
+  collision_spacing: 8.0
+bridges:
+  pier_spacing: 25.0
+sources:
+  overture:
+    enabled: true
+vegetation:
+  quality: high
+  resolution: 5.0
+  cell_size: 12.0

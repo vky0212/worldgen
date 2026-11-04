@@ -1,0 +1,13 @@
+# Procedural profile: basic + deterministic procedural enrichment of missing data.
+# All procedural values are recorded as inferred properties with their method.
+extends: basic
+buildings:
+  procedural_variation: 0.25   # +/- 25% deterministic variation on estimated heights
+  procedural_roofs: true       # gabled roofs for small rectangular residential buildings
+vegetation:
+  quality: medium
+  ground_cover:
+    enabled: true
+    shrub_density: 0.02
+    grass_density: 0.01
+    max_instances: 60000

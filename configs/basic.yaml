@@ -1,0 +1,15 @@
+# Basic profile: the reference MVP configuration.
+# Every key not listed here uses the defaults in src/worldgen/config.py.
+tiling:
+  tile_size: 256
+terrain:
+  resolution: 4.0
+roads:
+  sample_spacing: 4.0
+vegetation:
+  enabled: true
+  quality: low
+  resolution: 8.0
+export:
+  combined_glb: true
+  geoparquet: true

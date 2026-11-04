@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * 1"
+
+jobs:
+  compiler:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install (locked)
+        run: uv sync --frozen --extra dev
+      - name: Unit, integration and regression tests (offline fixtures)
+        run: uv run pytest
+      - name: Build the demo world through the CLI
+        run: uv run worldgen build --fixture demo_town --output generated/demo
+      - name: Re-validate the written files
+        run: uv run worldgen validate --world generated/demo
+
+  live-data:
+    # Real OSM / Copernicus / WorldCover / CHM sources; runs on demand and weekly.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --frozen --extra dev
+      - run: uv run pytest -m network
+        env:
+          WORLDGEN_NETWORK_TESTS: "1"
+
+  viewer:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: viewer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: viewer/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
