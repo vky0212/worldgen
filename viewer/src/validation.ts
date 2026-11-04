@@ -58,6 +58,12 @@ function normSeverity(s: string): string {
 /** z for a marker: issue z, or the supplied ground lookup, or 0. */
 export type GroundLookup = (x: number, y: number) => number | null;
 
+/** Whether a marker is on the loaded ground or on a fallback height. */
+interface GroundZ {
+  z: number;
+  exact: boolean;
+}
+
 export class ValidationOverlay {
   readonly group = new Group();
   readonly issues: Issue[];
@@ -66,10 +72,18 @@ export class ValidationOverlay {
   private points: Points | null = null;
   private pins: LineSegments | null = null;
   private readonly ground: GroundLookup;
+  private readonly approxGround: GroundLookup;
+  /** Ground heights found on loaded terrain (tiles come and go; the ground does not move). */
+  private readonly groundCache = new Map<Issue, number>();
 
-  constructor(diagnostics: Diagnostics, ground: GroundLookup) {
+  /**
+   * `ground` raycasts the loaded terrain; `approxGround` (e.g. the tile index
+   * z range) stands in where no terrain is loaded yet.
+   */
+  constructor(diagnostics: Diagnostics, ground: GroundLookup, approxGround: GroundLookup = () => null) {
     this.diagnostics = diagnostics;
     this.ground = ground;
+    this.approxGround = approxGround;
     this.group.name = 'validation_overlay';
     this.issues = (Array.isArray(diagnostics.issues) ? diagnostics.issues : [])
       .filter((i) => i && typeof i === 'object')
@@ -96,9 +110,34 @@ export class ValidationOverlay {
 
   /** Elevation used for an issue marker. */
   markerZ(issue: Issue): number {
+    return this.groundZ(issue).z;
+  }
+
+  private groundZ(issue: Issue): GroundZ {
     const l = issue.location!;
-    if (typeof l.z === 'number' && Number.isFinite(l.z)) return l.z;
-    return this.ground(l.x, l.y) ?? 0;
+    if (typeof l.z === 'number' && Number.isFinite(l.z)) return { z: l.z, exact: true };
+    const cached = this.groundCache.get(issue);
+    if (cached !== undefined) return { z: cached, exact: true };
+    const z = this.ground(l.x, l.y);
+    if (z !== null) {
+      this.groundCache.set(issue, z);
+      return { z, exact: true };
+    }
+    return { z: this.approxGround(l.x, l.y) ?? 0, exact: false };
+  }
+
+  /**
+   * True when a shown marker inside `bounds` ([xmin, ymin, xmax, ymax]) still
+   * sits on a fallback height, i.e. newly loaded terrain there can place it.
+   */
+  needsGroundIn(bounds: readonly number[]): boolean {
+    for (const issue of this.shown) {
+      const l = issue.location!;
+      if (l.x < bounds[0] || l.x > bounds[2] || l.y < bounds[1] || l.y > bounds[3]) continue;
+      if (typeof l.z === 'number' && Number.isFinite(l.z)) continue;
+      if (!this.groundCache.has(issue)) return true;
+    }
+    return false;
   }
 
   /** Rebuilds the markers for the issues matching the filter. */

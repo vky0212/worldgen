@@ -811,6 +811,12 @@ table.kv.inferred th {
 .sb-fps.slow {
   color: var(--error);
 }
+.sb-tiles {
+  color: var(--muted);
+}
+.sb-tiles.over-budget {
+  color: var(--warn);
+}
 .range {
   flex: 1;
   min-width: 0;

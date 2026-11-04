@@ -7,6 +7,7 @@
  */
 import { Box3, BufferAttribute, BufferGeometry, InstancedMesh, Vector3 } from 'three';
 import type { Object3D } from 'three';
+import { markShared } from '../stream/content';
 import type { QualitySettings } from './quality';
 import type { TileEntry } from '../types';
 
@@ -64,6 +65,28 @@ export class TreeLod {
     const box = new Box3(new Vector3(b[0], z[0], -b[3]), new Vector3(b[2], z[1] + 40, -b[1]));
     this.tiles.set(tileId, { box, groups, state: -1, shadows: false });
     this.lastUpdate = -Infinity;
+  }
+
+  /**
+   * Forgets an unloaded tile. Impostors live in the tile's scene graph and
+   * go with it; they get their canopy's own material back first so the
+   * tile's disposal never sees a shared (colour-mode) material on them.
+   */
+  removeTile(tileId: string): void {
+    const t = this.tiles.get(tileId);
+    if (!t) return;
+    for (const g of t.groups) {
+      if (g.lod && g.foliage[0]) {
+        g.lod.material = g.foliage[0].material;
+        g.lod.instanceColor = g.foliage[0].instanceColor;
+      }
+    }
+    this.tiles.delete(tileId);
+  }
+
+  /** Number of tiles with trees registered (for leak checks). */
+  get tileCount(): number {
+    return this.tiles.size;
   }
 
   /**
@@ -143,7 +166,8 @@ function makeImpostor(src: InstancedMesh | undefined): InstancedMesh | null {
   const key = `${name}:${bb.min.toArray().map((v) => v.toFixed(2))}:${bb.max.toArray().map((v) => v.toFixed(2))}`;
   let geo = lodGeometries.get(key);
   if (!geo) {
-    geo = name.includes('conifer') ? pyramid(bb) : octahedron(bb);
+    // Shared by every tile with this canopy: never disposed with a tile.
+    geo = markShared(name.includes('conifer') ? pyramid(bb) : octahedron(bb));
     lodGeometries.set(key, geo);
   }
   const lod = new InstancedMesh(geo, src.material, src.count);

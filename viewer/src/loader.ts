@@ -1,9 +1,7 @@
 /**
- * Fetching of world documents and progressive tile loading.
+ * Fetching of world documents (tiles stream through stream/TileStreamer).
  */
-import type { Group } from 'three';
-import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-import type { SchemaDoc, TileEntry, TileMeta } from './types';
+import type { SchemaDoc } from './types';
 
 /** Major schema version this viewer understands. */
 export const SUPPORTED_MAJOR = 1;
@@ -89,102 +87,6 @@ export function checkSchema(doc: unknown, expectedSchema: string, label: string)
     }
   }
   return warnings;
-}
-
-export interface TileLoadCallbacks {
-  /** Called as soon as a tile's GLB has been parsed. */
-  onTile(entry: TileEntry, scene: Group): void;
-  /** Called when a tile's meta.json has loaded (null = not available). */
-  onMeta(entry: TileEntry, meta: TileMeta | null, error: string | null): void;
-  onProgress(state: TileProgress): void;
-  onError(entry: TileEntry, message: string): void;
-}
-
-export interface TileProgress {
-  total: number;
-  loaded: number;
-  failed: number;
-  done: boolean;
-}
-
-/**
- * Loads every tile GLB (+ meta.json alongside), nearest to `focus` first, with
- * a small concurrency limit. Failures are reported per tile and never abort the
- * whole load.
- */
-export class TileLoader {
-  private readonly gltf = new GLTFLoader();
-  private readonly base: URL;
-  private readonly concurrency: number;
-
-  constructor(base: URL, concurrency = 4) {
-    this.base = base;
-    this.concurrency = Math.max(1, concurrency);
-  }
-
-  async loadAll(entries: TileEntry[], focus: { x: number; y: number }, cb: TileLoadCallbacks): Promise<void> {
-    const queue = [...entries].sort((a, b) => tileDistance(a, focus) - tileDistance(b, focus));
-    const state: TileProgress = { total: queue.length, loaded: 0, failed: 0, done: queue.length === 0 };
-    cb.onProgress({ ...state });
-    let next = 0;
-    const metaPromises: Promise<void>[] = [];
-
-    const worker = async (): Promise<void> => {
-      while (next < queue.length) {
-        const entry = queue[next++];
-        metaPromises.push(this.loadMeta(entry, cb));
-        try {
-          if (!entry.glb) throw new Error('tile index entry has no "glb" path');
-          const gltf = await this.gltf.loadAsync(worldUrl(this.base, entry.glb));
-          cb.onTile(entry, gltf.scene);
-          state.loaded++;
-        } catch (e) {
-          state.failed++;
-          cb.onError(entry, `Tile ${entry.id}: ${describeLoadError(e)}`);
-        }
-        cb.onProgress({ ...state });
-      }
-    };
-
-    await Promise.all(Array.from({ length: Math.min(this.concurrency, queue.length) }, worker));
-    await Promise.all(metaPromises);
-    state.done = true;
-    cb.onProgress({ ...state });
-  }
-
-  private async loadMeta(entry: TileEntry, cb: TileLoadCallbacks): Promise<void> {
-    if (!entry.meta) {
-      cb.onMeta(entry, null, 'tile index entry has no "meta" path');
-      return;
-    }
-    try {
-      const meta = await fetchOptionalJson<TileMeta>(worldUrl(this.base, entry.meta));
-      if (!meta) {
-        cb.onMeta(entry, null, `${entry.meta} not found`);
-        return;
-      }
-      checkSchema(meta, 'worldgen.tile_meta', entry.meta);
-      if (!meta.entities || typeof meta.entities !== 'object') meta.entities = {};
-      cb.onMeta(entry, meta, null);
-    } catch (e) {
-      cb.onMeta(entry, null, errorText(e));
-    }
-  }
-}
-
-function tileDistance(t: TileEntry, focus: { x: number; y: number }): number {
-  const b = t.bounds;
-  if (!b || b.length < 4) return Number.MAX_VALUE;
-  const cx = (b[0] + b[2]) / 2;
-  const cy = (b[1] + b[3]) / 2;
-  return Math.hypot(cx - focus.x, cy - focus.y);
-}
-
-function describeLoadError(e: unknown): string {
-  // GLTFLoader reports HTTP failures as "fetch for "<url>" responded with 404: Not Found".
-  const msg = errorText(e);
-  if (/responded with 404/.test(msg)) return 'GLB not found (404)';
-  return msg;
 }
 
 export function errorText(e: unknown): string {

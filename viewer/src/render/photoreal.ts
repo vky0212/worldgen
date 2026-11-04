@@ -39,6 +39,7 @@ import { MaterialPatcher } from './materials';
 import type { OrthoInfo } from './materials';
 import { FEATURE_LABELS, FpsGovernor, LEVELS, LEVEL_LABELS, applyShed, higherLevel, lowerLevel, sheddable } from './quality';
 import type { GraphicsLevel, LevelChoice, QualitySettings } from './quality';
+import { ShadowFitter } from './shadowFit';
 import { dayOfYear, solarPosition, sunDirectionEnu } from './sun';
 import { TextureEngine } from './textureEngine';
 import { TreeLod } from './treeLod';
@@ -75,7 +76,6 @@ interface SavedState {
   sun: { intensity: number; color: Color; castShadow: boolean; position: Vector3; target: Vector3 };
 }
 
-const UP = new Vector3(0, 1, 0);
 /** Radiance scale of the visible sky dome and of the sky used for lighting. */
 const SKY_SCALE = 0.2;
 const DOME_SCALE = 1.6;
@@ -95,6 +95,10 @@ export class PhotorealRenderer {
   /** Local solar time, hours. */
   timeOfDay = 10.5;
   onStats: ((s: PhotorealStats) => void) | null = null;
+  /** GPU memory a tile gained or lost outside its content (orthophoto textures). */
+  onTileBytes: ((tileId: string, bytes: number) => void) | null = null;
+  /** GPU frame timer (shared with the standard rendering and the benchmark). */
+  readonly gpu: GpuTimer;
 
   private readonly renderer: WebGLRenderer;
   private readonly scene: Scene;
@@ -104,7 +108,7 @@ export class PhotorealRenderer {
   private readonly hemi: HemisphereLight;
   private readonly textures: TextureEngine;
   private readonly trees = new TreeLod();
-  private readonly gpu: GpuTimer;
+  private readonly shadowFit = new ShadowFitter();
   private readonly sky = new Sky();
   private readonly envScene = new Scene();
   private readonly envSky = new Sky();
@@ -125,11 +129,9 @@ export class PhotorealRenderer {
   private readonly sunDir = new Vector3(0, 1, 0);
   private sunElevation = 1;
   private lastFrame = 0;
-  private shadowKey = '';
-  private shadowUpdates = 0;
+  private lastTileAddedAt = -Infinity;
   private statsAt = 0;
   private readonly size = new Vector2();
-  private readonly tmp = new Vector3();
   private time = 0;
   ground: GroundMode = 'procedural';
   private orthoBase: URL | null = null;
@@ -200,9 +202,7 @@ export class PhotorealRenderer {
 
   setBounds(b: LocalBounds): void {
     this.bounds = b;
-    const extent = Math.max(100, b.xmax - b.xmin, b.ymax - b.ymin);
     const u = this.patcher.uniforms;
-    u.uPrFogDensity.value = 1 / (extent * 6);
     u.uPrFogBase.value = b.zmin ?? 0;
     u.uPrFogFalloff.value = Math.max(250, ((b.zmax ?? 0) - (b.zmin ?? 0)) * 0.6);
   }
@@ -262,8 +262,15 @@ export class PhotorealRenderer {
         tex.wrapS = ClampToEdgeWrapping;
         tex.wrapT = ClampToEdgeWrapping;
         tex.anisotropy = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
+        if (this.world.tiles.get(id) !== tile) {
+          // The tile was unloaded while its image was on the way.
+          tex.dispose();
+          return;
+        }
         this.orthoTextures.set(id, tex);
         this.setOrtho(tile, { texture: tex, bounds: tile.entry.bounds, metresPerPixel: this.orthoMpp });
+        const img = tex.image as { width?: number; height?: number } | undefined;
+        this.onTileBytes?.(id, Math.round((img?.width ?? 0) * (img?.height ?? 0) * 4 * (4 / 3)));
       },
       undefined,
       () => this.orthoLoading.delete(id),
@@ -279,16 +286,43 @@ export class PhotorealRenderer {
 
   /** A tile GLB arrived. */
   onTileAdded(tile: LoadedTile): void {
-    this.collectOverlays(tile.scene);
-    this.patcher.hookTile(tile.scene, (o) => this.world.pickableFor(o)?.layer ?? layerOf(o));
+    this.collectOverlays(tile.entry.id, tile.root);
+    this.patcher.hookTile(tile.root, (o) => this.world.pickableFor(o)?.layer ?? layerOf(o));
     this.trees.addTile(tile.entry.id, tile.entry, tile.layers.get('trees') ?? []);
     this.updateBuildings(tile);
     if (this.ground === 'satellite') this.loadOrtho(tile);
     if (this.enabled) {
-      this.applyMeshShadows(tile.scene);
-      this.shadowKey = '';
-      this.governor.pause(performance.now() + 1200);
+      this.applyMeshShadows(tile.root);
+      this.shadowFit.invalidate();
+      // Loading hitches are not a reason to lower the quality: hold the governor
+      // when tiles start arriving, but not for every tile of a continuous stream.
+      const now = performance.now();
+      if (now - this.lastTileAddedAt > 2000) this.governor.pause(now + 1200);
+      this.lastTileAddedAt = now;
     }
+  }
+
+  /** A tile is being unloaded: frees what this renderer created for it. */
+  onTileRemoved(tile: LoadedTile): void {
+    const id = tile.entry.id;
+    const tex = this.orthoTextures.get(id);
+    if (tex) {
+      for (const p of tile.pickables) {
+        if (p.layer === 'terrain' && p.object instanceof Mesh) this.patcher.setOrtho(p.object, null);
+      }
+      tex.dispose();
+      this.orthoTextures.delete(id);
+    }
+    this.orthoLoading.delete(id);
+    this.overlays.delete(id);
+    this.patcher.forgetTile(tile.root);
+    this.trees.removeTile(id);
+    this.shadowFit.invalidate();
+  }
+
+  /** Resources held per tile, for leak checks (should follow the loaded tiles). */
+  resourceCounts(): { ortho: number; overlays: number; styleTextures: number; treeTiles: number } {
+    return { ortho: this.orthoTextures.size, overlays: this.overlays.size, styleTextures: this.patcher.styleTextureCount, treeTiles: this.trees.tileCount };
   }
 
   /** A tile's meta.json arrived: building styles can use the real records now. */
@@ -303,8 +337,11 @@ export class PhotorealRenderer {
     }
   }
 
-  /** Draws a frame. `focus` is what the camera looks at, `viewDistance` how far away it is. */
-  render(focus: Vector3, viewDistance: number): void {
+  /**
+   * Draws a frame. `focus` is what the camera looks at, `viewDistance` how
+   * far away it is, `viewRange` how far the camera sees (far plane).
+   */
+  render(focus: Vector3, viewDistance: number, viewRange: number): void {
     const now = performance.now();
     const frameMs = this.lastFrame ? now - this.lastFrame : 16.7;
     this.lastFrame = now;
@@ -317,9 +354,11 @@ export class PhotorealRenderer {
     const s = this.settings;
     const u = this.patcher.uniforms;
     u.uPrTime.value = this.time;
+    // Haze thick enough to soften the far plane, thin when looking from high up.
+    u.uPrFogDensity.value = 1 / (Math.max(viewRange, 1000) * 1.5);
     this.sky.position.copy(this.camera.position);
     this.sky.material.uniforms.time.value = this.time;
-    if (this.trees.update(this.camera.position, s, now)) this.shadowKey = '';
+    if (this.trees.update(this.camera.position, s, now)) this.shadowFit.invalidate();
     this.fitShadow(focus, viewDistance);
     this.ensureTargets();
 
@@ -357,7 +396,7 @@ export class PhotorealRenderer {
       shed: this.governor.shed.map((f) => FEATURE_LABELS[f]),
       trees: this.trees.counts,
       bakeMs: this.textures.lastBakeMs,
-      shadowUpdates: this.shadowUpdates,
+      shadowUpdates: this.shadowFit.updates,
     };
   }
 
@@ -403,7 +442,7 @@ export class PhotorealRenderer {
     this.applyMeshShadows(this.world.root);
     this.setOverlaysVisible(false);
     this.loadAllOrtho();
-    this.shadowKey = '';
+    this.shadowFit.invalidate();
     this.lastFrame = 0;
   }
 
@@ -468,7 +507,7 @@ export class PhotorealRenderer {
     if (prev.terrainCastsShadow !== s.terrainCastsShadow) this.applyMeshShadows(this.world.root);
     this.trees.update(this.camera.position, s, performance.now(), true);
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2) * s.renderScale * this.governor.scale);
-    this.shadowKey = '';
+    this.shadowFit.invalidate();
   }
 
   private handleGovernor(now: number, frameMs: number): void {
@@ -522,7 +561,7 @@ export class PhotorealRenderer {
       this.renderer.toneMappingExposure = DAY_EXPOSURE + (NIGHT_EXPOSURE - DAY_EXPOSURE) * (1 - day);
       this.envDirty = true;
       this.envDirtyAt = performance.now() + 120;
-      this.shadowKey = '';
+      this.shadowFit.invalidate();
     }
   }
 
@@ -544,41 +583,10 @@ export class PhotorealRenderer {
       return;
     }
     this.renderer.shadowMap.enabled = true;
-    // Quantised size: steps of 25 % so zooming does not re-render every frame.
-    const want = Math.min(s.shadowMaxHalf, Math.max(40, viewDistance * 0.9));
-    const half = 40 * 1.25 ** Math.ceil(Math.log(want / 40) / Math.log(1.25));
-    const texel = (2 * half) / s.shadowMapSize;
-    const L = this.sunDir;
-    const right = this.tmp.crossVectors(L, Math.abs(L.y) > 0.99 ? new Vector3(1, 0, 0) : UP).normalize();
-    const upL = new Vector3().crossVectors(right, L).normalize();
-    // Snap the centre to shadow-map texels (no shimmering while panning).
-    const snap = (v: number): number => Math.round(v / (texel * 8)) * texel * 8;
-    const cr = snap(focus.dot(right));
-    const cu = snap(focus.dot(upL));
-    const cl = focus.dot(L);
-    const center = new Vector3().addScaledVector(right, cr).addScaledVector(upL, cu).addScaledVector(L, cl);
-    const key = `${cr.toFixed(2)}|${cu.toFixed(2)}|${half}|${L.x.toFixed(4)},${L.y.toFixed(4)},${L.z.toFixed(4)}|${s.shadowMapSize}`;
-    if (key === this.shadowKey) return;
-    this.shadowKey = key;
-    const zspan = Math.max(200, ((this.bounds.zmax ?? 0) - (this.bounds.zmin ?? 0)) + 200);
-    const dist = half * 1.5 + zspan;
-    light.target.position.copy(center);
-    light.target.updateMatrixWorld();
-    light.position.copy(center).addScaledVector(L, dist);
-    light.updateMatrixWorld();
-    const cam = light.shadow.camera;
-    cam.left = -half;
-    cam.right = half;
-    cam.top = half;
-    cam.bottom = -half;
-    cam.near = 1;
-    cam.far = dist + half * 1.5 + zspan;
-    cam.updateProjectionMatrix();
-    light.shadow.bias = -0.0003;
-    light.shadow.normalBias = texel * 1.6;
-    light.shadow.needsUpdate = true;
-    this.renderer.shadowMap.needsUpdate = true;
-    this.shadowUpdates++;
+    const zSpan = (this.bounds.zmax ?? 0) - (this.bounds.zmin ?? 0);
+    if (this.shadowFit.fit(light, this.sunDir, focus, viewDistance, { maxHalf: s.shadowMaxHalf, mapSize: s.shadowMapSize, zSpan })) {
+      this.renderer.shadowMap.needsUpdate = true;
+    }
   }
 
   private ensureTargets(): void {
@@ -631,20 +639,22 @@ export class PhotorealRenderer {
     }
   }
 
-  /** Data-visualisation lines in tiles (vegetation region outlines): hidden in photo mode. */
-  private readonly overlays: Object3D[] = [];
+  /** Data-visualisation lines in tiles (vegetation region outlines), per tile: hidden in photo mode. */
+  private readonly overlays = new Map<string, Object3D[]>();
 
-  private collectOverlays(root: Object3D): void {
+  private collectOverlays(tileId: string, root: Object3D): void {
+    const list: Object3D[] = [];
     root.traverse((o) => {
       if ((o as Line).isLine || (o as Points).isPoints) {
-        this.overlays.push(o);
+        list.push(o);
         if (this.enabled) o.visible = false;
       }
     });
+    if (list.length) this.overlays.set(tileId, list);
   }
 
   private setOverlaysVisible(v: boolean): void {
-    for (const o of this.overlays) o.visible = v;
+    for (const list of this.overlays.values()) for (const o of list) o.visible = v;
   }
 
   private applyMeshShadows(root: Object3D): void {

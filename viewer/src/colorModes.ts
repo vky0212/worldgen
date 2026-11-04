@@ -18,8 +18,9 @@ import {
 } from 'three';
 import type { BufferGeometry, Material, Side } from 'three';
 import { FEATURE_ATTR } from './picking';
+import { markShared } from './stream/content';
 import type { EntityRecord } from './types';
-import type { Pickable, WorldModel } from './world';
+import type { LoadedTile, Pickable, WorldModel } from './world';
 
 export type ColorMode = 'materials' | 'observed' | 'confidence' | 'source';
 
@@ -66,7 +67,6 @@ interface SavedState {
 
 interface SavedGeometry {
   colorAttr: BufferAttribute | null;
-  generated: BufferAttribute | null;
 }
 
 export class ColorModeManager {
@@ -74,6 +74,12 @@ export class ColorModeManager {
   private readonly saved = new WeakMap<Pickable['object'], SavedState>();
   /** Per geometry (geometries may be shared between objects). */
   private readonly savedGeometry = new WeakMap<BufferGeometry, SavedGeometry>();
+  /**
+   * Colour buffers written by the analytic modes, kept across mode switches
+   * (reused instead of re-allocated) until their tile is unloaded.
+   */
+  private readonly generatedColor = new WeakMap<BufferGeometry, BufferAttribute>();
+  private readonly generatedInstanceColor = new WeakMap<InstancedMesh, InstancedBufferAttribute>();
   private readonly materials = new Map<string, Material>();
   private readonly sourceColors = new Map<string, string>();
 
@@ -92,6 +98,31 @@ export class ColorModeManager {
     const tile = world.tiles.get(tileId);
     if (!tile) return;
     for (const p of tile.pickables) this.applyTo(p, world);
+  }
+
+  /**
+   * A tile is being unloaded: puts its own materials back and leaves the
+   * colour buffers this manager generated attached to the tile's geometries
+   * (under a private name) so the tile's disposal frees them on the GPU too.
+   */
+  forgetTile(tile: LoadedTile): void {
+    for (const p of tile.pickables) {
+      this.restore(p);
+      const obj = p.object;
+      const geometry = obj.geometry as BufferGeometry;
+      const gen = this.generatedColor.get(geometry);
+      if (gen) {
+        geometry.setAttribute('_wg_release_color', gen);
+        this.generatedColor.delete(geometry);
+      }
+      if (obj instanceof InstancedMesh) {
+        const ic = this.generatedInstanceColor.get(obj);
+        if (ic) {
+          geometry.setAttribute('_wg_release_instance_color', ic);
+          this.generatedInstanceColor.delete(obj);
+        }
+      }
+    }
   }
 
   legend(): LegendEntry[] {
@@ -172,7 +203,7 @@ export class ColorModeManager {
   private saveGeometry(geometry: BufferGeometry): SavedGeometry {
     let g = this.savedGeometry.get(geometry);
     if (!g) {
-      g = { colorAttr: (geometry.getAttribute('color') as BufferAttribute | undefined) ?? null, generated: null };
+      g = { colorAttr: (geometry.getAttribute('color') as BufferAttribute | undefined) ?? null };
       this.savedGeometry.set(geometry, g);
     }
     return g;
@@ -189,6 +220,7 @@ export class ColorModeManager {
       const geometry = obj.geometry as BufferGeometry;
       const g = this.savedGeometry.get(geometry);
       if (g) {
+        // The generated buffer stays in generatedColor for reuse and release.
         if (g.colorAttr) geometry.setAttribute('color', g.colorAttr);
         else geometry.deleteAttribute('color');
         this.savedGeometry.delete(geometry);
@@ -202,7 +234,7 @@ export class ColorModeManager {
     const fid = geometry.getAttribute(FEATURE_ATTR);
     if (!fid || !p.featureIds) return;
     const saved = this.save(obj);
-    const savedGeom = this.saveGeometry(geometry);
+    this.saveGeometry(geometry);
 
     // Colour table per feature index.
     const tmp = new Color();
@@ -218,10 +250,10 @@ export class ColorModeManager {
     const fallback = new Color(UNKNOWN);
 
     const n = fid.count;
-    let attr = savedGeom.generated;
+    let attr = this.generatedColor.get(geometry);
     if (!attr || attr.count !== n) {
       attr = new BufferAttribute(new Float32Array(n * 3), 3);
-      savedGeom.generated = attr;
+      this.generatedColor.set(geometry, attr);
     }
     geometry.setAttribute('color', attr);
     const arr = attr.array as Float32Array;
@@ -251,12 +283,13 @@ export class ColorModeManager {
     const ids = p.instanceIds!;
     this.save(obj);
     const n = obj.count;
-    let ic = obj.instanceColor;
     const saved = this.saved.get(obj)!;
-    if (!ic || ic === saved.instanceColor || ic.count !== n) {
+    let ic = this.generatedInstanceColor.get(obj);
+    if (!ic || ic.count !== n) {
       ic = new InstancedBufferAttribute(new Float32Array(n * 3), 3);
-      obj.instanceColor = ic;
+      this.generatedInstanceColor.set(obj, ic);
     }
+    obj.instanceColor = ic;
     const tmp = new Color();
     const cache = new Map<string, string>();
     for (let i = 0; i < n; i++) {
@@ -277,10 +310,11 @@ export class ColorModeManager {
     let m = this.materials.get(key);
     if (!m) {
       // Instanced meshes get their colour from instanceColor (no vertex colours).
-      m =
+      m = markShared(
         kind === 'line'
           ? new LineBasicMaterial({ vertexColors: true })
-          : new MeshLambertMaterial({ vertexColors: kind === 'mesh', side });
+          : new MeshLambertMaterial({ vertexColors: kind === 'mesh', side }),
+      );
       this.materials.set(key, m);
     }
     return m;

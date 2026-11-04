@@ -1,7 +1,9 @@
 /**
  * Camera handling: map/orbit mode (three's MapControls) and a fly mode
  * (WASD + Q/E, Shift = faster, mouse-drag look). Also framing, animated
- * fly-to and dynamic near/far planes for a few-km world.
+ * fly-to and dynamic near/far planes. The far plane follows the view range
+ * (altitude above the ground), not the world's size, so the streamed area
+ * stays bounded on large worlds.
  */
 import { Euler, MathUtils, PerspectiveCamera, Vector3 } from 'three';
 import { MapControls } from 'three/addons/controls/MapControls.js';
@@ -12,6 +14,20 @@ export type CameraMode = 'orbit' | 'fly';
 
 /** Returns the world-space point hit by a ray (for re-targeting orbit mode). */
 export type GroundProbe = (origin: Vector3, direction: Vector3) => Vector3 | null;
+
+/** Approximate ground elevation (ENU z) at local (x, y), or null when unknown. */
+export type GroundLevel = (x: number, y: number) => number | null;
+
+/** View range (m) at ground level and its upper limit. */
+export const MIN_VIEW_RANGE = 6000;
+export const MAX_VIEW_RANGE = 60000;
+/** Extra view range per metre of altitude above the ground. */
+const RANGE_PER_ALTITUDE = 8;
+
+/** How far the camera sees from `altitude` metres above the ground. */
+export function viewRangeAt(altitude: number): number {
+  return MathUtils.clamp(MIN_VIEW_RANGE + Math.max(0, altitude) * RANGE_PER_ALTITUDE, MIN_VIEW_RANGE, MAX_VIEW_RANGE);
+}
 
 interface Tween {
   fromPos: Vector3;
@@ -30,6 +46,10 @@ export class CameraRig {
   mode: CameraMode = 'orbit';
   onModeChange: ((mode: CameraMode) => void) | null = null;
   probe: GroundProbe | null = null;
+  /** Ground under the camera (fly-mode view distance, view range). */
+  groundLevel: GroundLevel | null = null;
+  /** When true the camera is driven from outside (benchmark): input and tweens are ignored. */
+  external = false;
 
   private readonly dom: HTMLElement;
   private bounds: LocalBounds = { xmin: -500, ymin: -500, xmax: 500, ymax: 500, zmin: 0, zmax: 50 };
@@ -138,12 +158,27 @@ export class CameraRig {
 
   /** Approximate distance from the camera to what it looks at. */
   viewDistance(): number {
-    if (this.mode === 'orbit') return this.camera.position.distanceTo(this.map.target);
-    const groundY = this.bounds.zmin ?? 0;
-    return Math.max(5, this.camera.position.y - groundY);
+    if (this.mode === 'orbit' && !this.external) return this.camera.position.distanceTo(this.map.target);
+    return Math.max(5, this.altitude());
+  }
+
+  /** Height (m) of the camera above the ground below it. */
+  altitude(): number {
+    const p = this.camera.position;
+    const ground = this.groundLevel?.(p.x, -p.z) ?? this.bounds.zmin ?? 0;
+    return p.y - ground;
+  }
+
+  /** How far the camera sees (m): the far plane, fog and streamed area follow it. */
+  viewRange(): number {
+    return viewRangeAt(this.altitude());
   }
 
   update(dt: number): void {
+    if (this.external) {
+      this.updateClipping();
+      return;
+    }
     if (this.tween) {
       const tw = this.tween;
       tw.t = tw.duration > 0 ? Math.min(1, tw.t + dt / tw.duration) : 1;
@@ -216,7 +251,8 @@ export class CameraRig {
   private updateClipping(): void {
     const d = this.viewDistance();
     const near = MathUtils.clamp(d * 0.002, 0.1, 20);
-    const far = Math.max(this.extent * 8, d * 20, 5000);
+    // What the camera looks at always stays in front of the far plane.
+    const far = Math.max(this.viewRange(), d * 1.5);
     if (Math.abs(near - this.camera.near) / this.camera.near > 0.1 || Math.abs(far - this.camera.far) / this.camera.far > 0.1) {
       this.camera.near = near;
       this.camera.far = far;

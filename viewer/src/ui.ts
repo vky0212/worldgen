@@ -101,6 +101,7 @@ export class StatusBar {
   readonly elevation: HTMLElement;
   readonly hint: HTMLElement;
   readonly fps: HTMLElement;
+  readonly tiles: HTMLElement;
   readonly attribution: HTMLElement;
 
   constructor(root: HTMLElement) {
@@ -110,8 +111,9 @@ export class StatusBar {
     this.elevation = h('span', { class: 'sb-item', title: 'Elevation of the surface under the cursor' }, 'z —');
     this.hint = h('span', { class: 'sb-item sb-hint' });
     this.fps = h('span', { class: 'sb-item sb-fps', title: 'Frame rate' }, '— fps');
+    this.tiles = h('span', { class: 'sb-item sb-tiles', title: 'Streamed tiles' }, '');
     this.attribution = h('span', { class: 'sb-attribution' });
-    root.append(this.mode, this.latlon, this.local, this.elevation, this.hint, this.fps, this.attribution);
+    root.append(this.mode, this.latlon, this.local, this.elevation, this.hint, this.tiles, this.fps, this.attribution);
   }
 
   setCursor(latlon: LatLon | null, x: number | null, y: number | null, z: number | null, datum = ''): void {
