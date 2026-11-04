@@ -38,7 +38,7 @@ import { MetaCache } from './stream/metaCache';
 import type { NearTile } from './stream/metaCache';
 import { keyAt, keyId } from './stream/quadtree';
 import { TileStreamer } from './stream/TileStreamer';
-import { tilesetFromIndex } from './stream/tileset';
+import { fillUri, indexFromTileset, tilesetFromIndex } from './stream/tileset';
 import type { TileNode, Tileset } from './stream/tileset';
 import type { TraversalResult } from './stream/traversal';
 import { TopologyOverlay } from './topology';
@@ -51,9 +51,11 @@ import type {
   LocalBounds,
   Manifest,
   RoadGraph,
+  SubtreeDoc,
   TileEntry,
   TileIndex,
   TileMeta,
+  TilesetDoc,
   TurnRestriction,
 } from './types';
 import {
@@ -275,12 +277,25 @@ class App {
     this.photoNote.textContent = `Building styles: ${this.photoreal.regionLabel}`;
     this.renderWorldInfo();
 
-    // Tile index (attempted even without a manifest).
+    // Tile index (attempted even without a manifest): a 2.x tileset with its subtrees, or a 1.x flat index.
     let index: TileIndex | null = null;
-    const indexPath = m?.tiling?.index ?? 'tiles/index.json';
+    const tilesetPath = m?.tiling?.tileset;
+    const indexPath = tilesetPath ?? m?.tiling?.index ?? 'tiles/index.json';
     try {
-      index = await fetchJson<TileIndex>(worldUrl(this.base, indexPath));
-      for (const w of checkSchema(index, 'worldgen.tile_index', indexPath)) this.toasts.show(w, 'warn');
+      if (tilesetPath) {
+        const ts = await fetchJson<TilesetDoc>(worldUrl(this.base, tilesetPath));
+        for (const w of checkSchema(ts, 'worldgen.tileset', tilesetPath)) this.toasts.show(w, 'warn');
+        const subtrees = await Promise.all((ts.subtrees ?? []).map(async (st) => {
+          const path = fillUri(ts.uri.subtree, { si: st.si, sj: st.sj });
+          const sub = await fetchJson<SubtreeDoc>(worldUrl(this.base, path));
+          checkSchema(sub, 'worldgen.tileset_subtree', path);
+          return sub;
+        }));
+        index = indexFromTileset(ts, subtrees);
+      } else {
+        index = await fetchJson<TileIndex>(worldUrl(this.base, indexPath));
+        for (const w of checkSchema(index, 'worldgen.tile_index', indexPath)) this.toasts.show(w, 'warn');
+      }
       if (!Array.isArray(index.tiles)) throw new Error(`${indexPath} has no "tiles" array`);
     } catch (e) {
       index = null;

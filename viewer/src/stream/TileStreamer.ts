@@ -15,6 +15,7 @@
 import { Frustum, Matrix4 } from 'three';
 import type { Group, PerspectiveCamera } from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { buildWgtScene } from '../content/wgtScene';
 import { HttpError, errorText, worldUrl } from '../loader';
 import { DEFAULT_GPU_BUDGET, LruCache } from './cache';
 import { disposeTree } from './content';
@@ -386,12 +387,14 @@ export class TileStreamer {
     if (!res.ok) throw new HttpError(res.status, url, res.status === 404 ? 'GLB not found (404)' : `HTTP ${res.status} for ${url}`);
     const data = await res.arrayBuffer();
     if (signal.aborted) throw new DOMException('aborted', 'AbortError');
-    const gltf = await this.gltf.parseAsync(data, new URL('.', url).href);
+    const scene = entry.format === 'wgt'
+      ? await buildWgtScene(data, this.gltf, new URL('.', url).href, this.tileset.tileSize)
+      : ((await this.gltf.parseAsync(data, new URL('.', url).href)).scene as Group);
     if (signal.aborted) {
-      disposeTree(gltf.scene);
+      disposeTree(scene);
       throw new DOMException('aborted', 'AbortError');
     }
-    this.parsed.push({ node, scene: gltf.scene });
+    this.parsed.push({ node, scene });
     this.parsedIds.add(id);
   }
 

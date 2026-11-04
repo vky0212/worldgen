@@ -3,8 +3,8 @@
  */
 import type { SchemaDoc } from './types';
 
-/** Major schema version this viewer understands. */
-export const SUPPORTED_MAJOR = 1;
+/** Major schema versions this viewer understands (2 = data-first tiles). */
+export const SUPPORTED_MAJORS: readonly number[] = [1, 2];
 
 export class HttpError extends Error {
   readonly status: number;
@@ -80,9 +80,9 @@ export function checkSchema(doc: unknown, expectedSchema: string, label: string)
     const major = Number.parseInt(String(d.schema_version).split('.')[0], 10);
     if (!Number.isFinite(major)) {
       warnings.push(`${label}: unparseable schema_version "${d.schema_version}"`);
-    } else if (major !== SUPPORTED_MAJOR) {
+    } else if (!SUPPORTED_MAJORS.includes(major)) {
       throw new Error(
-        `${label} has schema_version ${d.schema_version}; this viewer only understands ${SUPPORTED_MAJOR}.x`,
+        `${label} has schema_version ${d.schema_version}; this viewer only understands ${SUPPORTED_MAJORS.map((m) => `${m}.x`).join(" and ")}`,
       );
     }
   }

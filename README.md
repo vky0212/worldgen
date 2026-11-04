@@ -145,7 +145,7 @@ Highlights:
   container per tile with the terrain as a 1 cm heightmap that viewers and engines
   mesh themselves, the other layers as an embedded GLB, and a `tiles/tileset.json`
   + per-4 km subtree index instead of one flat `tiles/index.json`. The bundled
-  viewer reads them from the next release; `baked` (the default) is unchanged.
+  viewer reads both; `baked` (the default) is unchanged.
 
 ## Viewer
 
