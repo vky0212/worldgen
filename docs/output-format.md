@@ -18,9 +18,12 @@ Major version 2 is the **data-first** layout (`export.mode: data`, see
 [Data-first tiles](#data-first-tiles-format-2x)): terrain ships as heightmaps that
 consumers mesh themselves. `export.mode: baked` (the default) keeps writing 1.x.
 
+* **2.1.0** — trees as data: `TRE `/`TOB ` sections and `tiles/archetypes.glb`
+  replace the GLB `trees` layer and the tree records of `meta.json`. Readers of 2.1
+  still accept 2.0 tiles (trees as GLB instances).
 * **2.0.0** — `tiles/tileset.json`, subtree files and one `.wgt` container per tile
   (heightmap, colours, land cover, and the other layers as an embedded GLB). The
-  manifest, tileset and subtree documents carry 2.0.0; the other documents keep their
+  manifest, tileset and subtree documents carry 2.x; the other documents keep their
   1.x layout and version.
 
 ## Directory layout
@@ -290,7 +293,22 @@ Readers ignore unknown tags. Sections:
 | `HGT ` | 48-byte header `u16 nx, u16 ny, u8 dtype (1 = u16, 2 = u32), u8 apron (1), u16 reserved, f64 spacing, f64 quantum, i64 offset, f64 x0, f64 y0`, then `nx·ny` heights, row 0 south, west to east. Height = `(offset + value) × quantum` (float64). The grid is the tile's nodes (shared edges included, 65 × 65 for 256 m tiles at 4 m) plus a one-node **apron** on every side; `(x0, y0)` is the apron's south-west node. Beyond the edge of the world the apron is linearly extrapolated. |
 | `RGB ` | `u16 nx, u16 ny`, then `u8 r, g, b` per tile node (no apron): the blended terrain colour (the `COLOR_0` of a baked tile). |
 | `LCC ` | `u16 nx, u16 ny`, then the `u8` land-cover code per tile node (`landcover_codes`). |
-| `GLB ` | The tile's other layers as a GLB, exactly like a baked tile minus its `terrain` layer node. |
+| `TRE ` | (2.1) The tile's rendered trees, shrubs and grass clusters: `u32 count`, `u32 record size (16)`, then per tree `u16 x, u16 y` (position in the tile × 65535 / T), `u16 height (cm)`, `u16 k`, `u8 crown radius (dm)`, `u8 trunk radius (cm)`, `u8 yaw (× 256 / 2π)`, `u8 archetype | category << 4` (indices into `tileset.trees.archetypes` / `categories`), `u8 confidence (× 255)`, `u8 flags` (bit 0 observed, bit 1 record in `TOB `, bit 2 ground-cover id), `u8 dx, u8 dy`. Grouped by archetype in `archetypes` order. |
+| `TOB ` | (2.1) JSON `[{"id", "record"}]`: full records of the trees whose id cannot be derived (mapped trees), referenced by `k` from `TRE `. |
+| `GLB ` | The tile's other layers as a GLB, exactly like a baked tile minus its `terrain` layer node (and, from 2.1, minus its `trees` layer). |
+
+**Trees** (2.1). A tree's entity id is derived: `tree:gen:<cx + dx>_<cy + dy>_<k>` (ground
+cover: `…_g<k>`) with `(cx, cy) = (floor(xmin / cell_size), floor(ymin / cell_size))`
+(`tileset.trees.cell_size`); with flag bit 1 it is `TOB[k].id`. Its ground height is the
+terrain height at its position (mesh triangles of `HGT `). It is drawn like the baked
+instances: the archetype of `tiles/archetypes.glb` (one root node per archetype, unit size)
+translated to `(x − xmin, ground − sink, −(y − ymin))` with `sink = 0.15 + trunk radius`,
+rotated `yaw` about +Y and scaled `(crown, height + sink, crown)`. Its inspect record is the
+1.x `meta.json` record at the record's precision: source `procedural`, `source_id
+seed:<tileset.trees.seed>`, the published per-tree `seed` =
+`hash_u64(seed, 3 (6 for ground cover), cx + dx, cy + dy, k) & 0x7FFF…FFFF`
+(`docs/vegetation.md`), `height`, `crown_radius`, `trunk_radius` inferred (method
+`procedural`, confidence 0.3), `species` missing. `meta.json` holds no tree records.
 
 The shaped terrain is rounded to `quantum` (1 cm) **before** roads are draped, trees placed
 and buildings founded, so decoding a heightmap gives bit for bit the surface everything was
@@ -304,8 +322,9 @@ reference): one vertex per tile node; two triangles per cell, `(c,r)-(c+1,r)-(c+
 and its record is in the tile's `meta.json`.
 
 **Conformance:** `tests/conformance/` (written by `python -m worldgen.conformance`)
-holds `hash64.json` and `terrain_tiles.json` — containers with the exact vertex arrays of
-their baked terrain — that every implementation can test against.
+holds `hash64.json`, `terrain_tiles.json` — containers with the exact vertex arrays of
+their baked terrain — and `tree_tiles.json` — a tile's tree records with their ids,
+instance transforms and seeds — that every implementation can test against.
 
 ## graph/road_graph.json
 

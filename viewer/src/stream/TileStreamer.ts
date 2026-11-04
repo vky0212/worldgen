@@ -16,6 +16,7 @@ import { Frustum, Matrix4 } from 'three';
 import type { Group, PerspectiveCamera } from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { buildWgtScene } from '../content/wgtScene';
+import type { WgtWorld } from '../content/wgtScene';
 import { HttpError, errorText, worldUrl } from '../loader';
 import { DEFAULT_GPU_BUDGET, LruCache } from './cache';
 import { disposeTree } from './content';
@@ -45,6 +46,8 @@ export interface TileStreamerOptions {
   onError?(node: TileNode, message: string): void;
   /** After each traversal (meta prefetch, overlays). */
   onTraversal?(result: TraversalResult): void;
+  /** World-level inputs of data-first (.wgt) tiles: tree archetypes and parameters. */
+  dataWorld?: Omit<WgtWorld, 'tileSize'>;
 }
 
 export interface StreamStats {
@@ -388,7 +391,7 @@ export class TileStreamer {
     const data = await res.arrayBuffer();
     if (signal.aborted) throw new DOMException('aborted', 'AbortError');
     const scene = entry.format === 'wgt'
-      ? await buildWgtScene(data, this.gltf, new URL('.', url).href, this.tileset.tileSize)
+      ? await buildWgtScene(data, this.gltf, new URL('.', url).href, { tileSize: this.tileset.tileSize, ...this.opts.dataWorld })
       : ((await this.gltf.parseAsync(data, new URL('.', url).href)).scene as Group);
     if (signal.aborted) {
       disposeTree(scene);

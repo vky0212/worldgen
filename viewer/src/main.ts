@@ -37,6 +37,8 @@ import { DEFAULT_GPU_BUDGET, parseBudgetMb } from './stream/cache';
 import { MetaCache } from './stream/metaCache';
 import type { NearTile } from './stream/metaCache';
 import { keyAt, keyId } from './stream/quadtree';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { loadArchetypes } from './content/archetypes';
 import { TileStreamer } from './stream/TileStreamer';
 import { fillUri, indexFromTileset, tilesetFromIndex } from './stream/tileset';
 import type { TileNode, Tileset } from './stream/tileset';
@@ -158,6 +160,8 @@ class App {
   private readonly loadMessages: string[] = [];
   private tileset: Tileset | null = null;
   private streamer: TileStreamer | null = null;
+  /** tiles/tileset.json of a data-first (2.x) world. */
+  private tilesetDoc: TilesetDoc | null = null;
   private metaCache: MetaCache | null = null;
   private readonly standardShadow = new ShadowFitter();
   private bench: FlyBench | null = null;
@@ -292,6 +296,7 @@ class App {
           return sub;
         }));
         index = indexFromTileset(ts, subtrees);
+        this.tilesetDoc = ts;
       } else {
         index = await fetchJson<TileIndex>(worldUrl(this.base, indexPath));
         for (const w of checkSchema(index, 'worldgen.tile_index', indexPath)) this.toasts.show(w, 'warn');
@@ -405,9 +410,21 @@ class App {
       onLoaded: (id, meta, error) => this.onMetaLoaded(id, meta, error),
       onEvicted: (id) => this.onMetaEvicted(id),
     });
+    const ts = this.tilesetDoc;
     this.streamer = new TileStreamer({
       base: this.base,
       tileset,
+      dataWorld: ts ? {
+        archetypes: ts.archetypes
+          ? loadArchetypes(new GLTFLoader(), worldUrl(this.base, ts.archetypes)).catch((e: unknown) => {
+            this.addLoadMessage(`Tree archetypes unavailable: ${errorText(e)}`);
+            return null;
+          })
+          : undefined,
+        trees: ts.trees
+          ? { cellSize: ts.trees.cell_size, seed: ts.trees.seed, archetypes: ts.trees.archetypes, categories: ts.trees.categories }
+          : undefined,
+      } : undefined,
       camera: this.camera,
       viewportHeight: () => this.renderer.domElement.clientHeight,
       budgetBytes: budget,

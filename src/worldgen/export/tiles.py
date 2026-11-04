@@ -281,7 +281,8 @@ def tile_blocks(tiles: list[str], block: int) -> list[list[str]]:
 def build_tile_assets(world: CanonicalWorld, tid: str, pieces: list[Piece], terrain_normals: np.ndarray | None,
                       terrain_rgba: np.ndarray, arche: dict[str, dict[str, Any]], *,
                       trees_in_tile: np.ndarray | None = None,
-                      entity_index: dict[str, Any] | None = None, terrain_mesh: bool = True) -> dict[str, Any]:
+                      entity_index: dict[str, Any] | None = None, terrain_mesh: bool = True,
+                      trees_as_data: bool = False) -> dict[str, Any]:
     """Return {"glb": bytes, "collision": bytes|None, "meta": dict, "counts": dict, "zrange": [..]}.
 
     ``terrain_normals`` may be None: the terrain meshes then compute normals for the tile's own
@@ -289,7 +290,9 @@ def build_tile_assets(world: CanonicalWorld, tid: str, pieces: list[Piece], terr
     ``entity_index`` (``world.entity_index()``) are computed once per export by the caller;
     without them they are derived here, which costs O(trees + entities) per tile. Without
     ``terrain_mesh`` (data-first tiles, whose terrain ships as a heightmap) the GLB has no
-    terrain layer; the terrain record and height range are still produced.
+    terrain layer; the terrain record and height range are still produced. With
+    ``trees_as_data`` the GLB has no tree instances and meta.json no tree records: the trees
+    ship as a ``TRE `` section built from ``tree_idx`` (rendered trees, in TRE order).
     """
     cfg = world.config
     grid = TileGrid(cfg.tiling.tile_size)
@@ -342,13 +345,14 @@ def build_tile_assets(world: CanonicalWorld, tid: str, pieces: list[Piece], terr
             idx = trees_in_tile[tile_arch == arch]
             if len(idx) == 0:
                 continue
-            ids = [tr.ids[i] for i in idx]
             tree_idx.append(idx)
             n_trees += len(idx)
-            mi = gb.add_mesh(f"tree_{arch}", arche[arch], (0.0, 0.0, 0.0), extras={"archetype": arch})
-            ext = gb.instancing(instance_transforms(tr, idx, (x0, y0)))
-            tree_children.append(gb.add_node(arch, mesh=mi, extras={"layer": "trees", "archetype": arch,
-                                                                     "instance_ids": ids}, extensions=ext))
+            if not trees_as_data:
+                ids = [tr.ids[i] for i in idx]
+                mi = gb.add_mesh(f"tree_{arch}", arche[arch], (0.0, 0.0, 0.0), extras={"archetype": arch})
+                ext = gb.instancing(instance_transforms(tr, idx, (x0, y0)))
+                tree_children.append(gb.add_node(arch, mesh=mi, extras={"layer": "trees", "archetype": arch,
+                                                                         "instance_ids": ids}, extensions=ext))
             top = tr.ground_z[idx] + tr.height[idx]
             zmax = max(zmax, float(top.max()))
         if tree_children:
@@ -366,14 +370,15 @@ def build_tile_assets(world: CanonicalWorld, tid: str, pieces: list[Piece], terr
         cb.add_node(f"tile_{tid}_collision", children=[node], translation=(x0, 0.0, -y0), root=True)
         col_bytes = cb.to_glb()
 
-    meta = tile_metadata(world, tid, layers, np.concatenate(tree_idx) if tree_idx else NO_TREES, entity_index)
+    all_trees = np.concatenate(tree_idx) if tree_idx else NO_TREES
+    meta = tile_metadata(world, tid, layers, NO_TREES if trees_as_data else all_trees, entity_index)
     counts = {name: len(layers[name].features) for name in LAYER_ORDER if name != "trees"}
     counts["trees"] = n_trees
     if not terrain_mesh:
         # The runtime terrain mesh carries this feature id; its record stays in the tile's meta.
         meta["entities"] = dict(sorted({**meta["entities"], terrain_id: terrain_record(world, tid)}.items()))
         counts["terrain"] = 1
-    return {"glb": glb, "collision": col_bytes, "meta": meta, "counts": counts,
+    return {"glb": glb, "collision": col_bytes, "meta": meta, "counts": counts, "tree_idx": all_trees,
             "zrange": [round(zmin, 3), round(zmax, 3)] if np.isfinite(zmin) else None}
 
 
