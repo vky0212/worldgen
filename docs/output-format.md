@@ -20,7 +20,8 @@ consumers must reject major versions they do not understand.
 │   ├── index.json                # spatial tile index
 │   ├── <tile>.glb                # tile geometry (all layers)
 │   ├── <tile>.collision.glb      # simplified collision geometry
-│   └── <tile>.meta.json          # semantic metadata of every feature in the tile
+│   ├── <tile>.meta.json          # semantic metadata of every feature in the tile
+│   └── <tile>.ortho.jpg          # optional: orthophoto of the tile (sources.imagery)
 ├── vectors/                      # GeoParquet, EPSG:4326 geometry
 │   ├── roads.parquet  bridges.parquet  tunnels.parquet  buildings.parquet
 │   ├── water.parquet  landcover.parquet  vegetation_regions.parquet
@@ -79,12 +80,30 @@ covers local `x ∈ [i·T, (i+1)·T)`, `y ∈ [j·T, (j+1)·T)` where `T` is the
 }
 ```
 
+`sources` always lists `imagery` (on by default; `"status": "disabled"` when
+`sources.imagery.enabled` is false). A failed or, with `--offline`, uncached
+fetch does not fail the build: the entry is `"status": "failed"` with the
+reason in `notes` (`"missing"` when there is no usable imagery, e.g. synthetic
+fixtures), and the world simply has no orthophotos. Otherwise its `coverage`
+holds the effective resolution (`m_per_px`, `effective_m_per_px`),
+`valid_fraction` and, for Sentinel-2, the composited `scenes` (`id`,
+`datetime`, `cloud_cover`, `clear_fraction`, `preferred_season`), the
+`months_used` and the `season` preference; every `tiles/<tile>.ortho.jpg` is
+listed in `outputs`.
+
 ## tiles/index.json
 
 ```jsonc
 {
   "schema": "worldgen.tile_index", "schema_version": "1.0.0",
   "tile_size": 256,
+  "ortho": {                                    // null when no imagery was baked
+    "format": "image/jpeg", "pixels": 32,       // every ortho image is pixels x pixels
+    "m_per_px": 8.0,                            // tile_size / pixels
+    "source_m_per_px": 10.0, "effective_source_m_per_px": 10.0,
+    "levels": {"black": [..], "white": [..], "gain": [..], "gamma": 1.3},
+    "orientation": "...", "uv": "...", "version": 1
+  },
   "tiles": [{
     "id": "0_0", "i": 0, "j": 0,
     "bounds": [xmin, ymin, xmax, ymax],        // local ENU metres
@@ -92,11 +111,56 @@ covers local `x ∈ [i·T, (i+1)·T)`, `y ∈ [j·T, (j+1)·T)` where `T` is the
     "glb": "tiles/0_0.glb",
     "collision": "tiles/0_0.collision.glb",     // may be null
     "meta": "tiles/0_0.meta.json",
+    "ortho": "tiles/0_0.ortho.jpg",             // optional; null or absent without imagery
     "hash": "sha256 of the tile inputs",
     "counts": {"buildings": 12, "road_pieces": 30, "trees": 410, ...}
   }]
 }
 ```
+
+## tiles/<tile>.ortho.jpg
+
+Orthophoto of one tile, written whenever imagery was acquired
+(`sources.imagery`, on by default; see `src/worldgen/export/ortho.py`). When it
+was not (disabled, failed, offline without cache), every tile has
+`"ortho": null` and `index.ortho` is `null`. Provenance (provider, scenes or tile
+service, licence, attribution, resolution) is the `imagery` entry of
+`manifest.sources`; the image settings are `tiles/index.json` → `ortho`.
+
+* Baseline JPEG, RGB, `N × N` pixels with `N` a power of two (32 … `tile_px_max`),
+  the same `N` for every tile of a world: `N = min(tile_px_max, T / m_per_px)`
+  rounded up to a power of two, where `m_per_px` is the source ground resolution
+  but never finer than `max_m_per_px`.
+* **Coverage:** exactly the tile square `bounds = [xmin, ymin, xmax, ymax]`,
+  pixel-is-area, no border. Pixel `(column c, row r)` is centred at
+  `x = xmin + (c + 0.5)·T/N`, `y = ymax − (r + 0.5)·T/N`.
+* **Orientation:** north up. **Row 0 is the north edge** (`y = ymax`),
+  **column 0 the west edge** (`x = xmin`).
+* **Texture coordinates** of a local point `(x, y)` (ENU metres; for a glTF
+  vertex `(gx, gy, gz)` in tile-local coordinates, `x − xmin = gx` and
+  `y − ymin = −gz`):
+
+  ```text
+  u = (x − xmin) / T          0 at the west edge, 1 at the east edge
+  v = (y − ymin) / T          0 at the south edge, 1 at the north edge (image row 0)
+  ```
+
+  This is the convention of WebGL with `UNPACK_FLIP_Y`, i.e. three.js
+  `Texture.flipY = true` (the `TextureLoader` default): `v = 1` samples image
+  row 0. With `flipY = false` (the glTF convention, image row 0 at `v = 0`) use
+  `v' = 1 − v = (ymax − y) / T`. Use clamp-to-edge wrapping.
+* **Seams:** all tiles sample one world-level image at their own pixel centres
+  (bilinear), so edge pixels interpolate imagery up to half a pixel beyond the
+  tile edge and adjacent tiles meet without a seam.
+* **Colour:** normalised once per world (per-channel 1st/99th percentile
+  levels, a weak gray-world white balance, gamma lift, and a soft highlight
+  shoulder: display values above `knee` = 0.8 are compressed as
+  `knee + a·ln(1 + (v − knee)/a)` instead of clipped, with `a` = `shoulder`
+  fitted so the brightest 0.5 % of every tile stays at or below 0.86, i.e.
+  219/255); the parameters are in `index.ortho.levels`. Holes without any
+  source imagery get the mean colour.
+* Tiles are rebuilt incrementally: the imagery content hash and bake settings
+  are part of every tile's input `hash`.
 
 ## Tile GLB
 

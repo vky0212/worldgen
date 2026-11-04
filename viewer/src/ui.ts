@@ -100,6 +100,7 @@ export class StatusBar {
   readonly local: HTMLElement;
   readonly elevation: HTMLElement;
   readonly hint: HTMLElement;
+  readonly fps: HTMLElement;
   readonly attribution: HTMLElement;
 
   constructor(root: HTMLElement) {
@@ -108,8 +109,9 @@ export class StatusBar {
     this.local = h('span', { class: 'sb-item', title: 'Cursor local ENU x (east), y (north) in metres' }, 'x, y —');
     this.elevation = h('span', { class: 'sb-item', title: 'Elevation of the surface under the cursor' }, 'z —');
     this.hint = h('span', { class: 'sb-item sb-hint' });
+    this.fps = h('span', { class: 'sb-item sb-fps', title: 'Frame rate' }, '— fps');
     this.attribution = h('span', { class: 'sb-attribution' });
-    root.append(this.mode, this.latlon, this.local, this.elevation, this.hint, this.attribution);
+    root.append(this.mode, this.latlon, this.local, this.elevation, this.hint, this.fps, this.attribution);
   }
 
   setCursor(latlon: LatLon | null, x: number | null, y: number | null, z: number | null, datum = ''): void {

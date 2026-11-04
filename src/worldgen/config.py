@@ -8,8 +8,11 @@ manifest together with its hash, so every output is traceable to its settings.
 
 from __future__ import annotations
 
+import calendar
 import dataclasses
+import datetime as _dt
 import json
+import re
 import types
 import typing
 from dataclasses import dataclass, field
@@ -105,6 +108,77 @@ class CanopySourceConfig:
     local_path: str | None = None
 
 
+IMAGERY_PROVIDERS = ("sentinel2_l2a", "xyz", "local")
+IMAGERY_SEASONS = ("growing", "custom", "any")
+IMAGERY_COMPOSITES = ("clear_quantile", "median")
+
+
+@dataclass
+class ImagerySourceConfig:
+    """Orthoimagery baked per tile into ``tiles/<id>.ortho.jpg`` (see docs/output-format.md).
+
+    On by default; a failed or (offline) uncached fetch never fails the build, the tiles then
+    have no orthophoto. ``sentinel2_l2a`` is an open 10 m cloud-free composite; ``xyz`` reads any
+    EPSG:3857 XYZ/WMTS tile service (licensed, higher resolution) and requires ``license`` and
+    ``attribution``; ``local`` (or any ``local_path``) reads an RGB GeoTIFF.
+    """
+
+    enabled: bool = True
+    provider: str = "sentinel2_l2a"
+    # Finest ground resolution kept (m/px); finer imagery is averaged down to it.
+    max_m_per_px: float = 0.25
+    # Largest per-tile image edge in pixels (a power of two).
+    tile_px_max: int = 1024
+    jpeg_quality: int = 88
+    # -- sentinel2_l2a: STAC search (Element 84 Earth Search; COGs on AWS Open Data) -----------
+    stac_url: str = "https://earth-search.aws.element84.com/v1"
+    collection: str = "sentinel-2-l2a"
+    # "YYYY-MM-DD/YYYY-MM-DD", or a period "P<n>Y" / "P<n>M" ending on the retrieval date.
+    date_range: str = "P3Y"
+    max_cloud_pct: float = 20.0      # scene-level eo:cloud_cover filter
+    max_scenes: int = 10             # scenes in the per-pixel composite
+    # "clear_quantile": per pixel, the lower-third-by-blue of the non-shadow clear observations
+    # (rejects the haze and cloud fringes SCL misses); "median": per-channel median.
+    composite: str = "clear_quantile"
+    # Preferred acquisition months. "growing": May-Oct north of the equator, Nov-Apr south of it
+    # (from the bbox latitude); "custom": season_months; "any": no preference. Scenes from other
+    # months are used only where the preferred ones are too few or leave pixels clouded.
+    season: str = "growing"
+    season_months: list[int] = field(default_factory=list)
+    # -- xyz: Web-Mercator tiles; the template must contain {z}, {x} and {y} -------------------
+    url_template: str | None = None
+    zoom: int = 18
+    license: str = ""
+    attribution: str = ""
+    max_tiles: int = 2500            # refuse requests above this many tiles
+    # Local RGB GeoTIFF overriding the remote provider (any CRS).
+    local_path: str | None = None
+
+
+def parse_date_range(text: str, today: _dt.date) -> tuple[_dt.date, _dt.date]:
+    """``"2023-01-01/2025-12-31"`` or a period ``"P3Y"`` / ``"P18M"`` ending on ``today``."""
+    t = text.strip()
+    m = re.fullmatch(r"P(\d+)([YM])", t, flags=re.IGNORECASE)
+    if m:
+        n = int(m.group(1))
+        months = n * 12 if m.group(2).upper() == "Y" else n
+        if months <= 0:
+            raise ConfigError(f"date range {text!r} must be a positive period")
+        y, mo = divmod(today.year * 12 + today.month - 1 - months, 12)
+        day = min(today.day, calendar.monthrange(y, mo + 1)[1])
+        return _dt.date(y, mo + 1, day), today
+    parts = t.split("/")
+    if len(parts) != 2:
+        raise ConfigError(f"date range {text!r} must be 'YYYY-MM-DD/YYYY-MM-DD' or a period like 'P3Y'")
+    try:
+        start, end = (_dt.date.fromisoformat(p.strip()) for p in parts)
+    except ValueError as exc:
+        raise ConfigError(f"date range {text!r}: {exc}") from exc
+    if start > end:
+        raise ConfigError(f"date range {text!r} starts after it ends")
+    return start, end
+
+
 @dataclass
 class SourcesConfig:
     osm: OsmSourceConfig = field(default_factory=OsmSourceConfig)
@@ -112,6 +186,7 @@ class SourcesConfig:
     dem: DemSourceConfig = field(default_factory=DemSourceConfig)
     worldcover: WorldCoverSourceConfig = field(default_factory=WorldCoverSourceConfig)
     canopy_height: CanopySourceConfig = field(default_factory=CanopySourceConfig)
+    imagery: ImagerySourceConfig = field(default_factory=ImagerySourceConfig)
 
 
 @dataclass
@@ -377,6 +452,46 @@ class WorldConfig:
             raise ConfigError("region requires center_lat/center_lon (+radius_m) or bbox")
         if reg.bbox is None and (reg.radius_m is None or reg.radius_m <= 0):
             raise ConfigError("region.radius_m must be positive")
+        validate_imagery(self.sources.imagery)
+
+
+def validate_imagery(im: ImagerySourceConfig) -> None:
+    p = "sources.imagery"
+    if im.provider not in IMAGERY_PROVIDERS:
+        raise ConfigError(f"{p}.provider must be one of {', '.join(IMAGERY_PROVIDERS)}, got {im.provider!r}")
+    if im.tile_px_max < 32 or im.tile_px_max > 8192 or im.tile_px_max & (im.tile_px_max - 1):
+        raise ConfigError(f"{p}.tile_px_max must be a power of two between 32 and 8192")
+    if not 1 <= im.jpeg_quality <= 100:
+        raise ConfigError(f"{p}.jpeg_quality must be between 1 and 100")
+    if im.max_m_per_px <= 0:
+        raise ConfigError(f"{p}.max_m_per_px must be positive")
+    if im.provider == "sentinel2_l2a":
+        if im.max_scenes < 1:
+            raise ConfigError(f"{p}.max_scenes must be at least 1")
+        if not 0 < im.max_cloud_pct <= 100:
+            raise ConfigError(f"{p}.max_cloud_pct must be in (0, 100]")
+        if im.composite not in IMAGERY_COMPOSITES:
+            raise ConfigError(f"{p}.composite must be one of {', '.join(IMAGERY_COMPOSITES)}, got {im.composite!r}")
+        if im.season not in IMAGERY_SEASONS:
+            raise ConfigError(f"{p}.season must be one of {', '.join(IMAGERY_SEASONS)}, got {im.season!r}")
+        if im.season == "custom" and not im.season_months:
+            raise ConfigError(f"{p}: season 'custom' requires season_months")
+        if any(not 1 <= m <= 12 for m in im.season_months):
+            raise ConfigError(f"{p}.season_months must be month numbers 1-12")
+        parse_date_range(im.date_range, _dt.date.today())
+    elif im.provider == "xyz":
+        tpl = im.url_template or ""
+        if not all(k in tpl for k in ("{z}", "{x}", "{y}")):
+            raise ConfigError(f"{p}.url_template must contain {{z}}, {{x}} and {{y}} for provider 'xyz'")
+        if not im.license.strip() or not im.attribution.strip():
+            raise ConfigError(f"{p}: provider 'xyz' requires a non-empty license and attribution "
+                              "(record the terms of the tile service you are allowed to use)")
+        if not 0 <= im.zoom <= 24:
+            raise ConfigError(f"{p}.zoom must be between 0 and 24")
+        if im.max_tiles < 1:
+            raise ConfigError(f"{p}.max_tiles must be at least 1")
+    elif im.provider == "local" and not im.local_path:
+        raise ConfigError(f"{p}: provider 'local' requires local_path")
 
 
 # --------------------------------------------------------------------------------------

@@ -18,6 +18,7 @@ from worldgen import SCHEMA_VERSION, __version__
 from worldgen.config import WorldConfig
 from worldgen.errors import ValidationFailed
 from worldgen.export.merge import merge_glbs
+from worldgen.export.ortho import ortho_baker
 from worldgen.export.tiles import (
     LAYER_ORDER,
     archetypes_for,
@@ -34,7 +35,7 @@ from worldgen.landcover.landcover import LANDCOVER_CODES
 from worldgen.log import get_logger, stage
 from worldgen.pipeline import acquire, bundle_from_fixture, compile_world
 from worldgen.progress import current
-from worldgen.sources.base import write_geotiff
+from worldgen.sources.base import SourceRecord, write_geotiff
 from worldgen.sources.synthetic import load_fixture
 from worldgen.spatial.raster import GeoRaster
 from worldgen.spatial.region import Region
@@ -84,6 +85,11 @@ def build(cfg: WorldConfig, opts: BuildOptions) -> BuildResult:
         if opts.fixture:
             fx = load_fixture(opts.fixture, region.center, cfg.projection.method)
             bundle = bundle_from_fixture(fx)
+            if not any(r.name == "imagery" for r in bundle.records):
+                im = cfg.sources.imagery
+                bundle.records.append(SourceRecord(
+                    "imagery", "synthetic", "-", "-", status="missing" if im.enabled else "disabled",
+                    notes=["synthetic fixtures carry no imagery"] if im.enabled else []))
             for rec in bundle.records:
                 progress.source(rec.name, rec.status, "synthetic fixture")
         else:
@@ -131,9 +137,12 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
     prev_tiles = prev.get("tiles", {})
     etree = entity_strtree(world)
     hashes = {t: tile_input_hash(world, t, etree) for t in tiles}
+    baker = ortho_baker(world)
     dirty = []
     for t in tiles:
         files_ok = (out / "tiles" / f"{t}.glb").is_file() and (out / "tiles" / f"{t}.meta.json").is_file()
+        if baker is not None:
+            files_ok = files_ok and (out / "tiles" / f"{t}.ortho.jpg").is_file()
         if opts.force or not files_ok or prev_tiles.get(t, {}).get("hash") != hashes[t]:
             dirty.append(t)
     if opts.only_tiles is not None:
@@ -163,23 +172,33 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
         elif col.exists():
             col.unlink()
         _write_json(out / "tiles" / f"{t}.meta.json", assets["meta"])
+        ortho = out / "tiles" / f"{t}.ortho.jpg"
+        if baker is not None:
+            ortho.write_bytes(baker.bake(grid.bounds(t)))
+        elif ortho.exists():
+            ortho.unlink()
         tile_state[t] = {"hash": hashes[t], "counts": assets["counts"], "zrange": assets["zrange"],
-                         "collision": assets["collision"] is not None}
+                         "collision": assets["collision"] is not None, "ortho": baker is not None}
         progress.tile(t, "built")
         progress.step("export", k + 1, total_steps, f"tile {t}")
     for t in list(tile_state):
         if t not in tiles:
             tile_state.pop(t)
 
+    ortho_info = baker.describe() if baker is not None else None
+    if ortho_info is not None:
+        world.stats["ortho"] = ortho_info
     index = {"schema": "worldgen.tile_index", "schema_version": SCHEMA_VERSION, "tile_size": cfg.tiling.tile_size,
-             "layers": LAYER_ORDER, "tiles": []}
+             "layers": LAYER_ORDER, "ortho": ortho_info, "tiles": []}
     for t in tiles:
         st = tile_state.get(t, {})
         index["tiles"].append({
             "id": t, "i": int(t.split("_")[0]), "j": int(t.split("_")[1]), "bounds": list(grid.bounds(t)),
             "zrange": st.get("zrange"), "glb": f"tiles/{t}.glb",
             "collision": f"tiles/{t}.collision.glb" if st.get("collision") else None,
-            "meta": f"tiles/{t}.meta.json", "hash": hashes[t], "counts": st.get("counts", {}),
+            "meta": f"tiles/{t}.meta.json",
+            "ortho": f"tiles/{t}.ortho.jpg" if st.get("ortho") else None,
+            "hash": hashes[t], "counts": st.get("counts", {}),
         })
     _write_json(out / "tiles" / "index.json", index, indent=1)
     _write_json(state_path, {"world_key": _world_key(world), "tiles": tile_state}, indent=1)
@@ -216,7 +235,7 @@ def plan_payload(region: Region, cfg: WorldConfig) -> dict[str, Any]:
         x0, y0, x1, y1 = grid.bounds(tid)
         tiles.append({"id": tid, "ring": ring([x0, x1, x1, x0], [y0, y0, y1, y1])})
     fp = np.asarray(region.footprint.exterior.coords)
-    sources = [n for n in ("osm", "dem", "worldcover", "canopy_height", "overture")
+    sources = [n for n in ("osm", "dem", "worldcover", "canopy_height", "overture", "imagery")
                if getattr(cfg.sources, n).enabled and (n != "canopy_height" or cfg.vegetation.enabled)]
     return {"region": region.describe(), "tiles": tiles, "footprint": ring(list(fp[:, 0]), list(fp[:, 1])),
             "tile_size": cfg.tiling.tile_size, "sources": sources}
