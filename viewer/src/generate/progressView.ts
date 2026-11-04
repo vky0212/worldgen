@@ -240,6 +240,8 @@ export class ProgressView {
     if (req?.profile) bits.push(`profile ${req.profile}`);
     if (req?.offline) bits.push('offline');
     if (req?.force) bits.push('force');
+    if (req?.budget && !req.budget.enabled) bits.push('no budget');
+    if (req?.road_surface === 'ribbon') bits.push('flat roads');
     this.subtitle.textContent = bits.join(' · ');
     const conn = this.connection;
     this.connDot.className = `conn-dot conn-${conn}`;

@@ -7,13 +7,14 @@ import '../style.css';
 import './generate.css';
 import * as L from 'leaflet';
 import { ApiError, api, errorMessage, isUnreachable, viewerHref } from '../api';
-import type { Health, Job, Plan, Profile, RegionInfo, WorldInfo } from '../apiTypes';
+import type { Health, Job, Plan, Profile, RegionInfo, RoadSurface, WorldInfo } from '../apiTypes';
 import { checkbox, clear, createSection, h } from '../dom';
 import { JobTileLayer, PlanPreviewLayer, TileLegend, WorldsLayer, createMap } from './mapLayers';
 import { isTerminal, tileRings } from './progress';
 import type { ProgressState } from './progress';
 import { ProgressView } from './progressView';
 import {
+  DEFAULT_BUDGET,
   DEFAULT_RADIUS_M,
   FALLBACK_MAX_RADIUS_M,
   LARGE_TILE_COUNT,
@@ -132,6 +133,10 @@ class GeneratePage {
   private profileDesc!: HTMLElement;
   private offlineCheck!: HTMLInputElement;
   private forceCheck!: HTMLInputElement;
+  private budgetCheck!: HTMLInputElement;
+  private budgetBuildings!: HTMLInputElement;
+  private budgetTrees!: HTMLInputElement;
+  private roadSurfaceSelect!: HTMLSelectElement;
   private generateBtn!: HTMLButtonElement;
   private generateReason!: HTMLElement;
   private jobsList!: HTMLElement;
@@ -287,6 +292,23 @@ class GeneratePage {
     const force = checkbox('Force (rebuild unchanged tiles)', false, () => this.updateGenerate());
     this.offlineCheck = offline.querySelector('input')!;
     this.forceCheck = force.querySelector('input')!;
+    const numberInput = (value: number, title: string): HTMLInputElement =>
+      h('input', { type: 'number', class: 'text', min: '1', step: '1', value: String(value), title });
+    this.budgetBuildings = numberInput(DEFAULT_BUDGET.buildings_per_tile, 'Buildings rendered per 256 m tile');
+    this.budgetTrees = numberInput(DEFAULT_BUDGET.trees_per_tile, 'Trees, shrubs and grass clusters per tile');
+    const budget = checkbox('Drop smaller buildings & trees over budget', DEFAULT_BUDGET.enabled, (v) => {
+      this.budgetBuildings.disabled = !v;
+      this.budgetTrees.disabled = !v;
+    });
+    this.budgetCheck = budget.querySelector('input')!;
+    const budgetRow = h('div', { class: 'budget-row' },
+      h('label', { class: 'lbl' }, h('span', null, 'Buildings / tile'), this.budgetBuildings),
+      h('label', { class: 'lbl' }, h('span', null, 'Trees / tile'), this.budgetTrees));
+    const budgetHint = h('div', { class: 'small muted' },
+      'Above the budget, smaller items are dropped first, at random; they stay in the GeoParquet data.');
+    this.roadSurfaceSelect = h('select', { class: 'select' },
+      h('option', { value: 'drape' }, 'Follow terrain (draped)'),
+      h('option', { value: 'ribbon' }, 'Flat ribbons on the road profile'));
     this.generateBtn = h('button', { class: 'btn btn-primary btn-big' }, 'Generate world');
     this.generateBtn.addEventListener('click', () => void this.generate());
     this.generateReason = h('div', { class: 'small generate-reason' });
@@ -295,6 +317,10 @@ class GeneratePage {
       this.nameHint,
       h('label', { class: 'lbl' }, h('span', null, 'Profile'), this.profileSelect),
       this.profileDesc,
+      h('label', { class: 'lbl' }, h('span', null, 'Road surface'), this.roadSurfaceSelect),
+      budget,
+      budgetRow,
+      budgetHint,
       offline,
       force,
       this.generateBtn,
@@ -611,6 +637,12 @@ class GeneratePage {
       profile: this.profileSelect.value || null,
       offline: this.offlineCheck.checked,
       force: this.forceCheck.checked,
+      budget: {
+        enabled: this.budgetCheck.checked,
+        buildings_per_tile: Number(this.budgetBuildings.value) || undefined,
+        trees_per_tile: Number(this.budgetTrees.value) || undefined,
+      },
+      roadSurface: this.roadSurfaceSelect.value as RoadSurface,
     });
     this.submitting = true;
     this.submitError = '';
@@ -1008,6 +1040,12 @@ class GeneratePage {
     }
     this.offlineCheck.checked = !!req.offline;
     this.forceCheck.checked = !!req.force;
+    const b = req.budget ?? DEFAULT_BUDGET;
+    this.budgetCheck.checked = b.enabled;
+    this.budgetBuildings.value = String(b.buildings_per_tile ?? DEFAULT_BUDGET.buildings_per_tile);
+    this.budgetTrees.value = String(b.trees_per_tile ?? DEFAULT_BUDGET.trees_per_tile);
+    this.budgetBuildings.disabled = this.budgetTrees.disabled = !b.enabled;
+    this.roadSurfaceSelect.value = req.road_surface ?? 'drape';
     this.editor.setRegion(region);
     this.editor.fit();
     this.updateName();

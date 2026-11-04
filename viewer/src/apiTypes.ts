@@ -82,6 +82,18 @@ export interface JobRequest {
   profile?: string;
   offline?: boolean;
   force?: boolean;
+  /** Instance budgets: above them, smaller buildings / trees are dropped at random. */
+  budget?: BudgetOptions;
+  /** "drape": roads follow the terrain triangles; "ribbon": flat cross-sections. */
+  road_surface?: RoadSurface;
+}
+
+export type RoadSurface = 'drape' | 'ribbon';
+
+export interface BudgetOptions {
+  enabled: boolean;
+  buildings_per_tile?: number;
+  trees_per_tile?: number;
 }
 
 export interface BuildSummary {

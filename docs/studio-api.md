@@ -72,8 +72,14 @@ Start a build. Body:
   "profile": "basic",                     // optional
   "offline": false,                       // optional: use cached sources only
   "force": false,                         // optional: rebuild unchanged tiles
-  "fixture": "demo_town"                  // optional: build a synthetic scenario instead (no network);
+  "fixture": "demo_town",                 // optional: build a synthetic scenario instead (no network);
                                           // centre/radius are then taken from the fixture
+  "budget": {                             // optional instance budgets (defaults: on, 250, 2500)
+    "enabled": true,                      // drop smaller buildings/trees at random above the budget
+    "buildings_per_tile": 250,
+    "trees_per_tile": 2500                // trees + shrubs + grass clusters
+  },
+  "road_surface": "drape"                 // optional: "drape" (follow terrain) or "ribbon"
 }
 ```
 

@@ -104,11 +104,24 @@ to the manifest.
    height. Unresolvable cases are marked uncertain and reported.
 6. **Terrain shaping**: carve water, keep terrain under bridge decks, conform
    terrain under roads.
-7. **Buildings** (heights from tags → levels → class defaults, flat /
+7. **Road surfaces** are draped onto the terrain by default
+   (`roads.surface_mode: drape`): ribbons and junction polygons are cut along
+   the terrain triangles and lifted a constant offset, so they follow uneven
+   ground exactly and can never be pierced by it (`ribbon` keeps flat
+   cross-sections on the road profile; bridges and tunnels always use their
+   solved deck profile).
+8. **Buildings** (heights from tags → levels → class defaults, flat /
    gabled / pyramidal / skillion roofs, holes, building parts), **water**,
    **land cover**, **vegetation** (classification, canopy field, regions,
    deterministic tile-independent tree placement).
-8. **Validate** and **export** per tile; unchanged tiles are skipped.
+9. **Instance budgets** (on by default): above `buildings.budget.max_per_tile`
+   (250) or `vegetation.budget.max_per_tile` (2500 trees, shrubs and grass
+   clusters) per tile, smaller items are dropped first, at random (weighted,
+   deterministic, tile-independent; mapped trees are protected). Dropped items
+   stay in the GeoParquet layers (`budget_dropped` / `rendered`) and are
+   reported in the diagnostics. Disable with
+   `--set buildings.budget.enabled=false --set vegetation.budget.enabled=false`.
+10. **Validate** and **export** per tile; unchanged tiles are skipped.
 
 See `docs/architecture.md` for the module map.
 

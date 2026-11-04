@@ -116,3 +116,22 @@ def test_rejects_bad_requests_and_cancels(server):
     with pytest.raises(urllib.error.HTTPError) as err:
         urllib.request.urlopen(f"{base}/worlds/..%2F..%2Fsecret.txt", timeout=5)
     assert err.value.code == 404
+
+
+def test_job_options_budget_and_road_surface(server):
+    base, jobs = server
+    body = {"fixture": "demo_town", "name": "budgeted", "road_surface": "ribbon",
+            "budget": {"enabled": True, "buildings_per_tile": 2, "trees_per_tile": 200}}
+    _, res = post(f"{base}/api/jobs", body)
+    req = res["job"]["request"]
+    assert req["budget"] == {"enabled": True, "buildings_per_tile": 2, "trees_per_tile": 200}
+    assert req["road_surface"] == "ribbon"
+    cmd = jobs.command(jobs.jobs[res["job"]["id"]])
+    assert "roads.surface_mode=ribbon" in cmd and "buildings.budget.max_per_tile=2" in cmd
+    events = sse_events(f"{base}/api/jobs/{res['job']['id']}/events")
+    done = next(e for e in events if e["type"] == "done")
+    stats = done["summary"]["statistics"]
+    assert stats["buildings_budget_dropped"] > 0 and stats["trees_budget_dropped"] > 0
+    with pytest.raises(urllib.error.HTTPError) as err:
+        post(f"{base}/api/jobs", {"fixture": "demo_town", "budget": {"trees_per_tile": 0}})
+    assert err.value.code == 400

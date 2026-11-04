@@ -5,7 +5,7 @@
  * No DOM and no Leaflet; only erasable TypeScript syntax and type-only
  * imports, so it runs under `node --test`.
  */
-import type { JobRequest, WorldInfo } from '../apiTypes';
+import type { BudgetOptions, JobRequest, RoadSurface, WorldInfo } from '../apiTypes';
 
 export interface CircleRegion {
   kind: 'circle';
@@ -98,7 +98,12 @@ export interface JobOptions {
   profile?: string | null;
   offline?: boolean;
   force?: boolean;
+  budget?: BudgetOptions;
+  roadSurface?: RoadSurface;
 }
+
+/** Server defaults (configs: buildings.budget / vegetation.budget). */
+export const DEFAULT_BUDGET: Required<BudgetOptions> = { enabled: true, buildings_per_tile: 250, trees_per_tile: 2500 };
 
 /** Body of `POST /api/jobs`. */
 export function jobBody(r: Region, opts: JobOptions = {}): JobRequest {
@@ -110,6 +115,17 @@ export function jobBody(r: Region, opts: JobOptions = {}): JobRequest {
   if (opts.profile) body.profile = opts.profile;
   body.offline = !!opts.offline;
   body.force = !!opts.force;
+  if (opts.budget) {
+    const b: BudgetOptions = { enabled: opts.budget.enabled };
+    if (opts.budget.enabled) {
+      for (const key of ['buildings_per_tile', 'trees_per_tile'] as const) {
+        const v = opts.budget[key];
+        if (v !== undefined && Number.isFinite(v) && v >= 1) b[key] = Math.round(v);
+      }
+    }
+    body.budget = b;
+  }
+  if (opts.roadSurface) body.road_surface = opts.roadSurface;
   return body;
 }
 

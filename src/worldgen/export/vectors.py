@@ -29,6 +29,7 @@ def entity_rows(world: CanonicalWorld, ents: list[Entity], extra: list[str]) -> 
         row = {
             "id": e.id, "kind": e.kind, "source": e.source, "source_id": e.source_id,
             "confidence": float(e.confidence), "uncertain": bool(e.uncertain),
+            "budget_dropped": bool(e.budget_dropped),
             "properties": json.dumps(rec["properties"], sort_keys=True, ensure_ascii=False),
             "inferred_properties": json.dumps(rec["inferred"], sort_keys=True, ensure_ascii=False),
             "missing": json.dumps(rec["missing"]),
@@ -91,6 +92,7 @@ def trees_frame(world: CanonicalWorld) -> gpd.GeoDataFrame:
         "placement_confidence": t.confidence, "observed": t.observed, "seed": t.seed.astype(np.int64),
         "source": t.source, "source_id": t.source_id,
         "inferred_properties": [json.dumps(sorted(v)) for v in t.inferred],
+        "rendered": t.rendered_mask(),
     }
     return gpd.GeoDataFrame(rows, geometry=gpd.points_from_xy(lon, lat), crs="EPSG:4326")
 

@@ -90,3 +90,30 @@ def test_changed_seed_changes_trees(compiled):
     other = place_trees(w.vegetation_grid, w.terrain, excl, w.observed_trees, cfg)
     base = place_trees(w.vegetation_grid, w.terrain, excl, w.observed_trees, w.config.vegetation)
     assert other.ids != base.ids
+
+
+def test_budgets_drop_small_buildings_and_trees_but_keep_semantics():
+    from conftest import fixture_config
+
+    from worldgen.export.tiles import generate_pieces, world_tiles
+    from worldgen.pipeline import bundle_from_fixture, compile_world
+    from worldgen.sources.synthetic import load_fixture
+    from worldgen.spatial.region import Region
+
+    cfg = fixture_config("demo_town", ["buildings.budget.max_per_tile=2", "vegetation.budget.max_per_tile=150"])
+    region = Region.from_config(cfg)
+    w = compile_world(region, cfg, bundle_from_fixture(load_fixture("demo_town", region.center)))
+    grid = TileGrid(cfg.tiling.tile_size)
+    dropped = [b for b in w.buildings if b.budget_dropped]
+    kept = [b for b in w.buildings if not b.budget_dropped]
+    assert dropped and kept and w.stats["buildings_budget_dropped"] == len(dropped)
+    pieces = generate_pieces(w, set(world_tiles(w)))
+    drawn = {p.feature_id for ps in pieces.values() for p in ps if p.layer == "buildings"}
+    assert drawn == {b.id for b in kept}
+    tr = w.trees
+    rendered = tr.rendered_mask()
+    tiles = grid.tiles_of(tr.x, tr.y)
+    assert all(rendered[tiles == t].sum() <= 150 for t in set(tiles))
+    assert rendered[tr.observed].all()                                    # mapped trees protected
+    assert len(tr) > rendered.sum()                                       # semantic table keeps all
+    assert any(i["check"] == "instance_budget" for i in w.stage_issues)

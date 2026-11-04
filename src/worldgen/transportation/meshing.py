@@ -16,11 +16,20 @@ from shapely.geometry import Point
 from shapely.strtree import STRtree
 
 from worldgen.config import WorldConfig
+from worldgen.geometry.drape import drape_polygons, drape_quads
 from worldgen.geometry.shapes import box, polyline_frames, ribbon, swept_box
+from worldgen.terrain.heightfield import Heightfield
 from worldgen.tiling.grid import Piece, TileGrid
 from worldgen.topology.graph import GraphEdge, RoadGraph
 from worldgen.transportation.elevation import EdgeProfile
-from worldgen.transportation.junctions import MAJOR, PATHS, JunctionLayout, surface_offset, trim_polyline
+from worldgen.transportation.junctions import (
+    MAJOR,
+    PATHS,
+    Junction,
+    JunctionLayout,
+    surface_offset,
+    trim_polyline,
+)
 from worldgen.world.model import Bridge, Intersection, Tunnel
 
 def road_material(cls: str) -> str:
@@ -40,11 +49,16 @@ def _runs(tiles: list[str]) -> Iterator[tuple[int, int, str]]:
             start = k
 
 
-def build_intersections(graph: RoadGraph, layout: JunctionLayout, grid: TileGrid
+def build_intersections(graph: RoadGraph, layout: JunctionLayout, grid: TileGrid,
+                        terrain: Heightfield | None = None, wanted: set[str] | None = None,
                         ) -> tuple[list[Intersection], list[Piece]]:
-    """Intersection entities (3+ road ends) and the surfaces of every junction polygon."""
+    """Intersection entities (3+ road ends) and the surfaces of every junction polygon.
+
+    With ``terrain`` the surfaces are draped onto it (``roads.surface_mode: drape``).
+    """
     ents: list[Intersection] = []
     pieces: list[Piece] = []
+    todo: list[tuple[str, Junction]] = []
     for nid in sorted(layout.junctions):
         j = layout.junctions[nid]
         n = graph.nodes[nid]
@@ -56,16 +70,31 @@ def build_intersections(graph: RoadGraph, layout: JunctionLayout, grid: TileGrid
                 properties={"node_id": nid, "degree": n.degree, "road_classes": classes,
                             **({"streets": names} if names else {})},
                 source="derived", source_id=nid, confidence=0.8, node_id=nid, elevation=n.z))
-        if not j.mesh.is_empty():
-            pieces.append(Piece(grid.tile_of(n.x, n.y), "roads", "road_major" if j.major else "road_minor",
-                                j.feature_id, j.mesh))
+        tile = grid.tile_of(n.x, n.y)
+        if wanted is None or tile in wanted:
+            todo.append((tile, j))
+    if terrain is not None and todo:
+        draped = drape_polygons([j.polygon for _, j in todo], terrain, np.array([j.offset for _, j in todo]),
+                                per_polygon=True)
+        meshes = [draped.get(k) for k in range(len(todo))]
+    else:
+        meshes = [j.mesh for _, j in todo]
+    for (tile, j), mesh in zip(todo, meshes):
+        if mesh is not None and not mesh.is_empty():
+            pieces.append(Piece(tile, "roads", "road_major" if j.major else "road_minor", j.feature_id, mesh))
     return ents, pieces
 
 
 def build_road_pieces(graph: RoadGraph, profiles: dict[str, EdgeProfile], layout: JunctionLayout,
-                      cfg: WorldConfig, grid: TileGrid, wanted: set[str] | None = None) -> list[Piece]:
+                      cfg: WorldConfig, grid: TileGrid, wanted: set[str] | None = None,
+                      terrain: Heightfield | None = None) -> list[Piece]:
+    """Road surfaces. Ground roads are draped onto ``terrain`` when given (cut along its
+    triangles, so the surface follows the terrain exactly); bridges and tunnels always use
+    flat ribbons on their solved deck profile."""
     pieces: list[Piece] = []
     exclude = set(cfg.roads.mesh_exclude_classes)
+    # Ground ribbons to drape, batched: (quads, offset, piece meta) per ribbon run.
+    batch: list[tuple[np.ndarray, float, tuple[str, str, str, str]]] = []
     for eid in sorted(graph.edges):
         e = graph.edges[eid]
         if e.road_class in exclude:
@@ -91,7 +120,21 @@ def build_road_pieces(graph: RoadGraph, profiles: dict[str, EdgeProfile], layout
             m = ribbon(xy[a:b + 1], z[a:b + 1] + off, e.width, s0=float(s[a]),
                        start_offset=start_mitre if a == 0 else None,
                        end_offset=end_mitre if b == last else None)
+            if terrain is not None and p.kind == "ground":
+                left, right = m.positions[0::2, :2], m.positions[1::2, :2]
+                batch.append((np.stack([left[:-1], right[:-1], right[1:], left[1:]], axis=1), off,
+                              (tile, _layer_for(p.kind), mat, e.road_id)))
+                continue
             pieces.append(Piece(tile, _layer_for(p.kind), mat, e.road_id, m))
+    if batch:
+        quads = np.concatenate([item[0] for item in batch])
+        offs = np.concatenate([np.full(len(item[0]), item[1]) for item in batch])
+        groups = np.repeat(np.arange(len(batch)), [len(item[0]) for item in batch])
+        draped = drape_quads(quads, terrain, offs, groups=groups)
+        for k, (_, _, (tile, layer, mat, road_id)) in enumerate(batch):
+            m = draped.get(k)
+            if m is not None and not m.is_empty():
+                pieces.append(Piece(tile, layer, mat, road_id, m))
     return pieces
 
 

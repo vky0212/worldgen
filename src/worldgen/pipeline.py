@@ -8,6 +8,7 @@ import numpy as np
 import shapely
 from shapely.ops import unary_union
 
+from worldgen.budget import building_sizes, select_within_budget, tree_sizes
 from worldgen.buildings.buildings import assign_base_elevations, prepare_buildings
 from worldgen.config import WorldConfig
 from worldgen.errors import SourceError
@@ -185,6 +186,7 @@ def compile_world(region: Region, cfg: WorldConfig, bundle: SourceBundle) -> Can
 
     with stage("buildings", t):
         assign_base_elevations(world.buildings, world.terrain)
+        _building_budget(world, cfg)
 
     with stage("landcover", t):
         world.terrain_codes = classify_terrain(world.terrain, region, bundle.worldcover, world.landcover, world.water)
@@ -251,19 +253,54 @@ def _vegetation(world: CanonicalWorld, bundle: SourceBundle, cfg: WorldConfig) -
     excl = vegetation_exclusions(world, vc.exclusion_buffer)
     trees = place_trees(grid, world.terrain, excl, world.observed_trees, vc)  # type: ignore[arg-type]
     progress.step("vegetation", 3, 4, f"{len(trees)} trees placed")
-    if len(trees) > vc.max_trees:
-        log.warning("tree count %d exceeds vegetation.max_trees %d; keeping observed and the first generated",
-                    len(trees), vc.max_trees)
-        keep = np.zeros(len(trees), dtype=bool)
-        keep[np.nonzero(trees.observed)[0]] = True
-        gen = np.nonzero(~trees.observed)[0][: max(0, vc.max_trees - int(trees.observed.sum()))]
-        keep[gen] = True
-        trees = trees.subset(keep)
-        world.stage_issues.append({"check": "vegetation_budget", "severity": "info",
-                                   "message": f"generated trees capped at vegetation.max_trees={vc.max_trees}",
-                                   "entity_ids": []})
     ground = place_ground_cover(grid, world.terrain, excl, vc)  # type: ignore[arg-type]
     world.trees = concat_tables([trees, ground])
+    _tree_budget(world, cfg)
+
+
+def _building_budget(world: CanonicalWorld, cfg: WorldConfig) -> None:
+    bc = cfg.buildings.budget
+    for b in world.buildings:
+        b.budget_dropped = False
+    # Building parts and outlines rendered by parts form landmarks; they are never dropped.
+    cand = [b for b in world.buildings if not b.is_part and not b.rendered_by_parts]
+    if not cand:
+        return
+    grid = TileGrid(cfg.tiling.tile_size)
+    pts = [b.geometry.representative_point() for b in cand]
+    tiles = grid.tiles_of(np.array([p.x for p in pts]), np.array([p.y for p in pts]))
+    res = select_within_budget([b.id for b in cand], tiles, building_sizes(cand),
+                               np.zeros(len(cand), dtype=bool), bc, cfg.vegetation.seed, "buildings")
+    for b, k in zip(cand, res.keep):
+        b.budget_dropped = not bool(k)
+    world.stats["buildings_budget_dropped"] = res.dropped
+    if res.dropped:
+        world.stage_issues.append({
+            "check": "instance_budget", "severity": "info", "entity_ids": [],
+            "message": f"{res.dropped} smaller buildings not rendered (budget {bc.max_per_tile}/tile"
+                       f"{f', {bc.max_total} total' if bc.max_total else ''}) in {len(res.tiles_over_budget)} "
+                       f"tile(s): {', '.join(res.tiles_over_budget[:8])}; still present in vectors/buildings.parquet",
+        })
+
+
+def _tree_budget(world: CanonicalWorld, cfg: WorldConfig) -> None:
+    vb = cfg.vegetation.budget
+    tr = world.trees
+    if not len(tr):
+        return
+    grid = TileGrid(cfg.tiling.tile_size)
+    protected = tr.observed.copy() if vb.keep_observed else np.zeros(len(tr), dtype=bool)
+    res = select_within_budget(tr.ids, grid.tiles_of(tr.x, tr.y), tree_sizes(tr.height, tr.crown_radius),
+                               protected, vb, cfg.vegetation.seed, "trees")
+    tr.rendered = res.keep
+    world.stats["trees_budget_dropped"] = res.dropped
+    if res.dropped:
+        world.stage_issues.append({
+            "check": "instance_budget", "severity": "info", "entity_ids": [],
+            "message": f"{res.dropped} smaller trees/plants not rendered (budget {vb.max_per_tile}/tile"
+                       f"{f', {vb.max_total} total' if vb.max_total else ''}) in {len(res.tiles_over_budget)} "
+                       f"tile(s); still present in vectors/trees.parquet",
+        })
 
 
 def vegetation_exclusions(world: CanonicalWorld, buffer: float) -> Exclusions:
@@ -318,4 +355,6 @@ def _stats(world: CanonicalWorld) -> dict:
         "vegetation_regions": len(world.vegetation_regions),
         "trees": len(world.trees),
         "trees_observed": int(np.sum(world.trees.observed)) if len(world.trees) else 0,
+        "trees_rendered": int(world.trees.rendered_mask().sum()) if len(world.trees) else 0,
+        "buildings_rendered": sum(1 for b in world.buildings if not b.budget_dropped),
     }

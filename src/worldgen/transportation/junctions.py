@@ -73,6 +73,7 @@ class Junction:
     degree: int
     feature_id: str          # entity the surface belongs to (intersection or the widest road)
     major: bool
+    offset: float = 0.0      # surface height above the terrain/profile at the corners
 
 
 @dataclass
@@ -242,6 +243,7 @@ def _junction_polygon(graph: RoadGraph, profiles: dict[str, EdgeProfile], cfg: W
             q = centre + c
             ring.append((q[0], q[1], corner_z))
     pts = np.array(ring)
+    lift = 0.0
     keep = [0]
     for k in range(1, len(pts)):
         if np.hypot(*(pts[k, :2] - pts[keep[-1], :2])) > 1e-3:
@@ -260,6 +262,7 @@ def _junction_polygon(graph: RoadGraph, profiles: dict[str, EdgeProfile], cfg: W
         ang = np.arctan2(pts[:, 1] - centre[1], pts[:, 0] - centre[0])
         pts = pts[np.argsort(ang, kind="stable")]
         pts[:, 2] += 0.01
+        lift = 0.01
         poly = Polygon(pts[:, :2])
         if not poly.is_valid:
             poly = shapely.convex_hull(shapely.MultiPoint(pts[:, :2]))
@@ -278,4 +281,5 @@ def _junction_polygon(graph: RoadGraph, profiles: dict[str, EdgeProfile], cfg: W
     widest = max(ends, key=lambda x: (x.hw, x.edge_id))
     feature = (f"intersection:{nid.removeprefix('n:')}" if degree >= 3
                else graph.edges[widest.edge_id].road_id)
-    return Junction(nid, poly, mesh, degree, feature, any(x.road_class in MAJOR for x in ends))
+    return Junction(nid, poly, mesh, degree, feature, any(x.road_class in MAJOR for x in ends),
+                    offset=corner_z - n.z + lift)

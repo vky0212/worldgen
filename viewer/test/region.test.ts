@@ -80,3 +80,20 @@ test('circle ↔ rectangle conversion', () => {
   assert.ok(Math.abs(back.radius_m - 1000) <= 2, String(back.radius_m));
   assert.ok(Math.abs(back.lat - circle.lat) < 1e-9);
 });
+
+test('jobBody carries budgets and road surface', () => {
+  const circle = { kind: 'circle' as const, lat: 25.033, lon: 121.5654, radius_m: 500 };
+  assert.deepEqual(
+    jobBody(circle, { budget: { enabled: true, buildings_per_tile: 120.4, trees_per_tile: 900 }, roadSurface: 'ribbon' }),
+    {
+      center: { lat: 25.033, lon: 121.5654 },
+      radius_m: 500,
+      offline: false,
+      force: false,
+      budget: { enabled: true, buildings_per_tile: 120, trees_per_tile: 900 },
+      road_surface: 'ribbon',
+    },
+  );
+  // A disabled budget sends no limits.
+  assert.deepEqual(jobBody(circle, { budget: { enabled: false, buildings_per_tile: 5 } }).budget, { enabled: false });
+});

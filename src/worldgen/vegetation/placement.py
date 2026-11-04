@@ -398,4 +398,6 @@ def concat_tables(tables: list[TreeTable]) -> TreeTable:
         archetype=lst("archetype"), species=lst("species"), category=lst("category"),
         confidence=cat("confidence"), observed=cat("observed"), seed=cat("seed"), source=lst("source"),
         source_id=lst("source_id"), inferred=lst("inferred"),
+        rendered=None if all(t.rendered is None for t in tables) else
+        np.concatenate([t.rendered_mask() for t in tables]),
     )

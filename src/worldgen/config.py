@@ -150,6 +150,9 @@ class RoadsConfig:
         }
     )
     lane_width: float = 3.25
+    # "drape": ground roads and junctions are cut along the terrain triangles and follow the
+    # terrain exactly (never pierced); "ribbon": flat cross-sections on the centreline profile.
+    surface_mode: str = "drape"
     surface_offset: float = 0.12
     # Ground roads never exceed this grade within an edge (cuttings/embankments shape the terrain).
     max_grade: float = 0.18
@@ -200,6 +203,20 @@ class TunnelsConfig:
 
 
 @dataclass
+class BudgetConfig:
+    """Rendering budget. Above it, smaller items are dropped first, at random (deterministic).
+
+    Dropped items stay in the semantic exports (``budget_dropped``) but get no geometry.
+    0 disables a limit.
+    """
+
+    enabled: bool = True
+    max_per_tile: int = 0
+    max_total: int = 0
+    keep_observed: bool = True   # trees: mapped (observed) trees are dropped last
+
+
+@dataclass
 class BuildingsConfig:
     floor_height: float = 3.0
     default_height: float = 9.0
@@ -223,6 +240,7 @@ class BuildingsConfig:
     procedural_roofs: bool = False
     building_parts: bool = True
     foundation_depth: float = 0.5
+    budget: BudgetConfig = field(default_factory=lambda: BudgetConfig(True, 250, 0))
 
 
 @dataclass
@@ -290,7 +308,8 @@ class VegetationConfig:
     exclusion_buffer: float = 1.0
     ground_cover: GroundCoverConfig = field(default_factory=GroundCoverConfig)
     quality: str = "low"
-    max_trees: int = 200000
+    # Trees, shrubs and grass clusters rendered per tile / in the whole world.
+    budget: BudgetConfig = field(default_factory=lambda: BudgetConfig(True, 2500, 200000))
 
 
 @dataclass
@@ -349,6 +368,8 @@ class WorldConfig:
             )
         if self.projection.method not in ("tmerc", "utm"):
             raise ConfigError(f"unknown projection method {self.projection.method!r}")
+        if self.roads.surface_mode not in ("drape", "ribbon"):
+            raise ConfigError("roads.surface_mode must be drape or ribbon")
         if self.vegetation.quality not in ("low", "medium", "high"):
             raise ConfigError("vegetation.quality must be low, medium or high")
         reg = self.region

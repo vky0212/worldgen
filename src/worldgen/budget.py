@@ -1,0 +1,68 @@
+"""Instance budgets: drop smaller buildings and trees at random when a tile is too dense.
+
+Selection is weighted random sampling without replacement (Efraimidis-Spirakis):
+every item gets the key ``ln(u) / size`` with ``u`` a deterministic hash of its
+id, and the items with the largest keys are kept. Larger items are therefore
+much more likely to survive, smaller ones are dropped first, and among similar
+sizes the choice is random. Budgets are applied per tile (only the tile's own
+items matter, so tiles stay independently rebuildable), then optionally to the
+whole world. Dropped items stay in the semantic exports, flagged, but are not
+rendered.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import numpy as np
+
+from worldgen.config import BudgetConfig
+from worldgen.hashing import unit_hash
+
+
+@dataclass
+class BudgetResult:
+    keep: np.ndarray            # bool per item
+    dropped: int
+    tiles_over_budget: list[str]
+
+
+def select_within_budget(ids: list[str], tiles: np.ndarray, sizes: np.ndarray, protected: np.ndarray,
+                         cfg: BudgetConfig, seed: int, salt: str) -> BudgetResult:
+    n = len(ids)
+    keep = np.ones(n, dtype=bool)
+    if not cfg.enabled or n == 0:
+        return BudgetResult(keep, 0, [])
+    u = np.array([max(unit_hash(seed, "budget", salt, i), 1e-12) for i in ids])
+    key = np.log(u) / np.maximum(np.asarray(sizes, dtype=float), 1e-6)
+    key = np.where(protected, np.inf, key)
+    over: list[str] = []
+    if cfg.max_per_tile > 0:
+        order = np.lexsort((np.array(ids, dtype=object), tiles))
+        t_sorted = tiles[order]
+        starts = np.flatnonzero(np.r_[True, t_sorted[1:] != t_sorted[:-1]])
+        ends = np.r_[starts[1:], n]
+        for a, b in zip(starts, ends):
+            if b - a <= cfg.max_per_tile:
+                continue
+            members = order[a:b]
+            ranked = members[np.argsort(-key[members], kind="stable")]
+            keep[ranked[cfg.max_per_tile:]] = False
+            over.append(str(t_sorted[a]))
+    if cfg.max_total > 0 and keep.sum() > cfg.max_total:
+        alive = np.nonzero(keep)[0]
+        ranked = alive[np.argsort(-key[alive], kind="stable")]
+        keep[ranked[cfg.max_total:]] = False
+    # Protected items rank first (infinite key); they are only dropped when they alone exceed the budget.
+    return BudgetResult(keep, int((~keep).sum()), sorted(over))
+
+
+def building_sizes(buildings: list) -> np.ndarray:  # noqa: ANN001
+    """Volume proxy (footprint area x height, m3)."""
+    return np.array([b.geometry.area * float(b.get("height", 3.0) or 3.0) for b in buildings])
+
+
+def tree_sizes(height: np.ndarray, crown_radius: np.ndarray) -> np.ndarray:
+    """Crown volume proxy (m3): grass clusters and shrubs are tiny, mature trees large."""
+    return np.asarray(height) * math.pi * np.asarray(crown_radius) ** 2

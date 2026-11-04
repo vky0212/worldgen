@@ -313,7 +313,7 @@ def build_building_pieces(buildings: list[Building], bc: BuildingsConfig, grid: 
                           wanted: set[str] | None = None) -> list[Piece]:
     pieces = []
     for b in buildings:
-        if b.rendered_by_parts:
+        if b.rendered_by_parts or b.budget_dropped:
             continue
         rp = b.geometry.representative_point()
         tile = grid.tile_of(rp.x, rp.y)
@@ -329,7 +329,7 @@ def build_building_collision(buildings: list[Building], bc: BuildingsConfig, gri
                              wanted: set[str] | None = None) -> list[Piece]:
     pieces = []
     for b in buildings:
-        if b.rendered_by_parts:
+        if b.rendered_by_parts or b.budget_dropped:
             continue
         rp = b.geometry.representative_point()
         tile = grid.tile_of(rp.x, rp.y)

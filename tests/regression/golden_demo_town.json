@@ -39,6 +39,8 @@
  "statistics": {
   "bridges": 2,
   "buildings": 18,
+  "buildings_budget_dropped": 0,
+  "buildings_rendered": 18,
   "buildings_with_observed_height": 1,
   "grade_separated_crossings": 1,
   "graph_edges": 29,
@@ -47,7 +49,9 @@
   "landcover_areas": 2,
   "roads": 15,
   "trees": 13426,
+  "trees_budget_dropped": 0,
   "trees_observed": 5,
+  "trees_rendered": 13426,
   "tunnels": 1,
   "turn_restrictions": 0,
   "turn_restrictions_enforced": 0,

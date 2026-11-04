@@ -1149,3 +1149,13 @@ path.world-dot {
     overflow: visible;
   }
 }
+
+/* Budget inputs side by side */
+.budget-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.budget-row input:disabled {
+  opacity: 0.5;
+}

@@ -72,7 +72,13 @@ compiler.
    are intersected (bevel when they diverge, chamfer when very acute), every
    road is trimmed back to its furthest corner, and the polygon's cut vertices
    are exactly the ribbon end vertices — no gaps, no overlapping surfaces.
-9. **Buildings, land cover, vegetation** on the shaped terrain.
+9. **Buildings, land cover, vegetation** on the shaped terrain. Terrain
+   shaping averages overlapping road corridors (weighted by their blend) so
+   parallel ways never create steps; ground road and junction surfaces are
+   then draped onto the terrain triangles (`geometry/drape.py`: convex ribbon
+   quads are clipped in vectorized numpy, other shapes through shapely), and
+   instance budgets (`budget.py`) decide which buildings and trees are
+   rendered.
 10. **Validation** (`validation.checks`) on the in-memory world.
 11. **Export** (`build.export_world`): tile hashes → only dirty tiles are
     regenerated → tile GLB/collision/meta, tile index, combined `world.glb`

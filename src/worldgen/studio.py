@@ -97,6 +97,46 @@ def plan_for(region: dict[str, Any], profile: str = "basic", tile_size: float | 
     return payload
 
 
+def build_options(body: dict[str, Any]) -> dict[str, Any]:
+    """Validated optional build settings: instance budgets and road surface mode."""
+    out: dict[str, Any] = {}
+    budget = body.get("budget")
+    if budget is not None:
+        if not isinstance(budget, dict):
+            raise RequestError("budget must be an object")
+        norm: dict[str, Any] = {"enabled": bool(budget.get("enabled", True))}
+        for key in ("buildings_per_tile", "trees_per_tile"):
+            if budget.get(key) is None:
+                continue
+            v = budget[key]
+            if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= 1_000_000:
+                raise RequestError(f"budget.{key} must be an integer between 1 and 1000000")
+            norm[key] = v
+        out["budget"] = norm
+    surface = body.get("road_surface")
+    if surface is not None:
+        if surface not in ("drape", "ribbon"):
+            raise RequestError("road_surface must be 'drape' or 'ribbon'")
+        out["road_surface"] = surface
+    return out
+
+
+def option_overrides(req: dict[str, Any]) -> list[str]:
+    """``--set`` overrides for the build command."""
+    sets: list[str] = []
+    b = req.get("budget")
+    if b is not None:
+        on = "true" if b.get("enabled", True) else "false"
+        sets += [f"buildings.budget.enabled={on}", f"vegetation.budget.enabled={on}"]
+        if b.get("buildings_per_tile"):
+            sets.append(f"buildings.budget.max_per_tile={int(b['buildings_per_tile'])}")
+        if b.get("trees_per_tile"):
+            sets.append(f"vegetation.budget.max_per_tile={int(b['trees_per_tile'])}")
+    if req.get("road_surface"):
+        sets.append(f"roads.surface_mode={req['road_surface']}")
+    return sets
+
+
 def default_name(region: dict[str, Any]) -> str:
     if "bbox" in region:
         s, w, n, e = region["bbox"]
@@ -205,6 +245,7 @@ class JobManager:
                    "force": bool(body.get("force", False))}
             if fixture is not None:
                 req["fixture"] = fixture
+            req.update(build_options(body))
             if "bbox" in region:
                 req["bbox"] = region["bbox"]
             else:
@@ -265,6 +306,8 @@ class JobManager:
             cmd += ["--bbox", ",".join(f"{v:.7f}" for v in r["bbox"])]
         else:
             cmd += ["--center", f"{r['center']['lat']:.7f},{r['center']['lon']:.7f}", "--radius", f"{r['radius_m']:g}"]
+        for s in option_overrides(r):
+            cmd += ["--set", s]
         if r.get("offline"):
             cmd.append("--offline")
         if r.get("force"):
@@ -272,7 +315,11 @@ class JobManager:
         return cmd
 
     def _run(self, job: Job) -> None:
-        job.state = "running"
+        with self._lock:
+            # A cancel may have raced with dequeuing; the state check and transition are atomic.
+            if job.state != "queued":
+                return
+            job.state = "running"
         job.started_utc = utc_now()
         job.add({"type": "job", "state": "running"})
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
@@ -282,6 +329,8 @@ class JobManager:
         job.proc = subprocess.Popen(self.command(job), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                     stdin=subprocess.DEVNULL, env=env, text=True, encoding="utf-8",
                                     errors="replace", bufsize=1, creationflags=flags)
+        if job.cancel_requested:   # cancelled between the state change and the process start
+            job.proc.terminate()
         stderr_tail: deque[str] = deque(maxlen=20)
 
         def pump_stderr() -> None:

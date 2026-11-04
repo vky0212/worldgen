@@ -71,7 +71,7 @@ def tile_input_hash(world: CanonicalWorld, tid: str, entity_tree: tuple[STRtree,
     parts["entities"] = sha256_json(round_floats(ent_parts, 3))
     tr = world.trees
     if len(tr):
-        m = (tr.x >= x0) & (tr.x < x1) & (tr.y >= y0) & (tr.y < y1)
+        m = (tr.x >= x0) & (tr.x < x1) & (tr.y >= y0) & (tr.y < y1) & tr.rendered_mask()
         idx = np.nonzero(m)[0]
         parts["trees"] = sha256_json([[tr.ids[i], round(float(tr.x[i]), 2), round(float(tr.y[i]), 2),
                                        round(float(tr.height[i]), 2), tr.archetype[i]] for i in idx])
@@ -89,9 +89,10 @@ def generate_pieces(world: CanonicalWorld, wanted: set[str]) -> dict[str, list[P
     grid = TileGrid(cfg.tiling.tile_size)
     graph = world.graph
     pieces: list[Piece] = []
-    _, inter_pieces = build_intersections(graph, world.junctions, grid)
-    pieces += [p for p in inter_pieces if p.tile in wanted]
-    pieces += build_road_pieces(graph, world.profiles, world.junctions, cfg, grid, wanted)
+    drape = world.terrain if cfg.roads.surface_mode == "drape" else None
+    _, inter_pieces = build_intersections(graph, world.junctions, grid, drape, wanted)
+    pieces += inter_pieces
+    pieces += build_road_pieces(graph, world.profiles, world.junctions, cfg, grid, wanted, drape)
     pieces += build_bridge_pieces(world.bridges, graph, world.profiles, world.terrain.sample, cfg, grid, wanted)
     pieces += build_tunnel_pieces(world.tunnels, graph, world.profiles, cfg, grid, wanted)
     pieces += build_building_pieces(world.buildings, cfg.buildings, grid, wanted)
@@ -145,7 +146,7 @@ def build_tile_assets(world: CanonicalWorld, tid: str, pieces: list[Piece], terr
     tree_ids: list[str] = []
     n_trees = 0
     if len(tr):
-        inside = (tr.x >= x0) & (tr.x < x1) & (tr.y >= y0) & (tr.y < y1)
+        inside = (tr.x >= x0) & (tr.x < x1) & (tr.y >= y0) & (tr.y < y1) & tr.rendered_mask()
         tree_children = []
         for arch in ARCHETYPE_ORDER:
             idx = np.nonzero(inside & (np.array(tr.archetype, dtype=object) == arch))[0]

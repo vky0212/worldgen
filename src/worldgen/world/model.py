@@ -52,6 +52,7 @@ class Entity:
     inferred_properties: dict[str, Inferred] = field(default_factory=dict)
     missing: set[str] = field(default_factory=set)
     uncertain: bool = False
+    budget_dropped: bool = False     # kept in semantic data, not rendered (instance budget)
 
     def get(self, name: str, default: Any = None) -> Any:
         """Observed value, else inferred value, else ``default``."""
@@ -78,7 +79,7 @@ class Entity:
 
     def record(self) -> dict[str, Any]:
         """Serializable metadata record (no geometry)."""
-        return {
+        rec = {
             "kind": self.kind,
             "layer": self.layer,
             "source": self.source,
@@ -89,6 +90,9 @@ class Entity:
             "missing": sorted(self.missing),
             "uncertain": bool(self.uncertain),
         }
+        if self.budget_dropped:
+            rec["budget_dropped"] = True
+        return rec
 
 
 def _jsonable(v: Any) -> Any:
@@ -273,6 +277,11 @@ class TreeTable:
     source_id: list[str] = field(default_factory=list)
     # Per-tree names of properties that were estimated (e.g. "height") for observed trees.
     inferred: list[list[str]] = field(default_factory=list)
+    # False where the instance budget dropped the tree from rendering (None: all rendered).
+    rendered: np.ndarray | None = None
+
+    def rendered_mask(self) -> np.ndarray:
+        return np.ones(len(self), dtype=bool) if self.rendered is None else self.rendered
 
     def __len__(self) -> int:
         return len(self.ids)
@@ -287,6 +296,7 @@ class TreeTable:
             species=pick(self.species), category=pick(self.category), confidence=self.confidence[idx],
             observed=self.observed[idx], seed=self.seed[idx], source=pick(self.source),
             source_id=pick(self.source_id), inferred=pick(self.inferred),
+            rendered=None if self.rendered is None else self.rendered[idx],
         )
 
     def record(self, i: int) -> dict[str, Any]:

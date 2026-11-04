@@ -157,16 +157,19 @@ def point_polyline_projection(px: np.ndarray, py: np.ndarray, xy: np.ndarray, z:
 def apply_corridors(hf: Heightfield, corridors: list[Corridor]) -> int:
     """Shape terrain along corridors. Returns the number of modified grid nodes.
 
-    Inside the half width terrain is set to the corridor elevation (or only
-    lowered for mode "max"); in the shoulder band it blends back to the original.
-    Where corridors overlap, the closest centreline wins.
+    Inside the half width the terrain takes the corridor elevation; in the shoulder band it
+    blends back to the original (smoothstep). Where "set" corridors overlap (a road and its
+    separately mapped sidewalks, dual carriageways) their targets are averaged with their
+    blend weights, so the terrain never steps between neighbouring roads. "max" corridors
+    only lower terrain; the most restrictive one wins.
     """
     rows, cols = hf.z.shape
-    best_d = np.full(hf.z.shape, np.inf)
-    target = np.full(hf.z.shape, np.nan)
-    reach = np.zeros(hf.z.shape)
-    halfw = np.zeros(hf.z.shape)
-    modes = np.zeros(hf.z.shape, dtype=np.int8)
+    z0 = hf.z.copy()
+    acc_wt = np.zeros(hf.z.shape)
+    acc_w = np.zeros(hf.z.shape)
+    max_w = np.zeros(hf.z.shape)
+    lowest = np.full(hf.z.shape, np.inf)
+    touched = np.zeros(hf.z.shape, dtype=bool)
     r = hf.resolution
     for cor in corridors:
         if len(cor.xy) < 2:
@@ -189,27 +192,27 @@ def apply_corridors(hf: Heightfield, corridors: list[Corridor]) -> int:
             continue
         ri, ci = rr.ravel()[inside], cc.ravel()[inside]
         d, tz = d[inside], tz[inside]
-        better = d < best_d[ri, ci]
-        ri, ci, d, tz = ri[better], ci[better], d[better], tz[better]
-        best_d[ri, ci] = d
-        target[ri, ci] = tz
-        reach[ri, ci] = ext
-        halfw[ri, ci] = cor.half_width
-        modes[ri, ci] = 1 if cor.mode == "max" else 0
-    sel = np.isfinite(target)
-    if not sel.any():
+        hw = cor.half_width
+        w = np.where(d <= hw, 1.0, np.clip((ext - d) / max(ext - hw, 1e-6), 0.0, 1.0))
+        w = w * w * (3 - 2 * w)  # smoothstep blend
+        touched[ri, ci] = True
+        if cor.mode == "max":
+            base = z0[ri, ci]
+            cand = base * (1 - w) + np.minimum(tz, base) * w
+            np.minimum.at(lowest, (ri, ci), cand)
+        else:
+            ww = np.maximum(w, 1e-6)
+            np.add.at(acc_wt, (ri, ci), ww * tz)
+            np.add.at(acc_w, (ri, ci), ww)
+            np.maximum.at(max_w, (ri, ci), w)
+    if not touched.any():
         return 0
-    z0 = hf.z[sel]
-    d = best_d[sel]
-    hw = halfw[sel]
-    ext = reach[sel]
-    w = np.where(d <= hw, 1.0, np.clip((ext - d) / np.maximum(ext - hw, 1e-6), 0.0, 1.0))
-    w = w * w * (3 - 2 * w)  # smoothstep blend
-    t = target[sel]
-    lower_only = modes[sel] == 1
-    t = np.where(lower_only, np.minimum(t, z0), t)
-    hf.z[sel] = z0 * (1 - w) + t * w
-    return int(sel.sum())
+    has_set = acc_w > 0
+    blended = np.where(has_set, acc_wt / np.where(has_set, acc_w, 1.0), z0)
+    z = z0 * (1 - max_w) + blended * max_w
+    z = np.minimum(z, lowest)
+    hf.z[:] = z
+    return int(touched.sum())
 
 
 def carve_polygons(hf: Heightfield, items: list[tuple[BaseGeometry, float]]) -> int:
