@@ -13,10 +13,13 @@ from worldgen.buildings.buildings import assign_base_elevations, prepare_buildin
 from worldgen.config import WorldConfig
 from worldgen.errors import SourceError
 from worldgen.landcover.landcover import classify_terrain
+from worldgen.landcover.smoothing import refine_vegetation, shape_shorelines, smooth_landcover
 from worldgen.landcover.water import (
     carve_inputs,
     compute_water_levels,
     sea_from_coastlines,
+    shore_inputs,
+    waterway_outlines,
     waterways_covered_by_areas,
 )
 from worldgen.log import get_logger, stage
@@ -196,6 +199,15 @@ def compile_world(region: Region, cfg: WorldConfig, bundle: SourceBundle) -> Can
 
     with stage("landcover", t):
         world.terrain_codes = classify_terrain(world.terrain, region, bundle.worldcover, world.landcover, world.water)
+        if cfg.vegetation.enabled:
+            world.vegetation_grid = classify_vegetation(region, cfg.vegetation, bundle.worldcover, bundle.canopy,
+                                                        world.landcover, world.water)
+
+    if cfg.smoothing.enabled:
+        with stage("smoothing", t):
+            _smooth_borders(world, cfg)
+    else:
+        current().stage_skipped("smoothing")
 
     with stage("intersections", t):
         layout = compute_junctions(graph, world.profiles, cfg)
@@ -207,7 +219,7 @@ def compile_world(region: Region, cfg: WorldConfig, bundle: SourceBundle) -> Can
 
     if cfg.vegetation.enabled:
         with stage("vegetation", t):
-            _vegetation(world, bundle, cfg)
+            _vegetation(world, cfg)
     else:
         current().stage_skipped("vegetation")
 
@@ -222,7 +234,13 @@ def _shape_terrain(world: CanonicalWorld, cfg: WorldConfig) -> None:
     graph = world.graph
     polys, wcorr = carve_inputs(world.water, world.water_levels, world.waterway_profiles,
                                 world.covered_waterways, cfg)
-    n_water = carve_polygons(hf, polys)
+    sm = cfg.smoothing
+    if sm.enabled and sm.shorelines:
+        # The terrain meets lake/river/sea surfaces on their mapped outline (no grid zig-zag).
+        n_water = shape_shorelines(hf, shore_inputs(world.water, world.water_levels, cfg),
+                                   world.region.extent_box, sm.shore_slope_min, sm.shore_slope_max)
+    else:
+        n_water = carve_polygons(hf, polys)
     n_water += apply_corridors(hf, wcorr)
     n_road = 0
     if cfg.terrain.road_conformance:
@@ -248,17 +266,35 @@ def _shape_terrain(world: CanonicalWorld, cfg: WorldConfig) -> None:
     world.stats["terrain_shaping"] = {"water_nodes": n_water, "bridge_nodes": n_bridge, "road_nodes": n_road}
 
 
-def _vegetation(world: CanonicalWorld, bundle: SourceBundle, cfg: WorldConfig) -> None:
+def _smooth_borders(world: CanonicalWorld, cfg: WorldConfig) -> None:
+    """Post-processing: smooth, natural land-cover and vegetation borders (landcover/smoothing.py)."""
+    sm = cfg.smoothing
+    seed = cfg.vegetation.seed
+    progress = current()
+    areas = [w.geometry for w in world.water if w.is_area]
+    res = smooth_landcover(world.terrain_codes, world.terrain, areas,
+                           waterway_outlines(world.water, world.waterway_profiles), sm, seed)
+    world.terrain_codes = res.codes
+    world.terrain_rgba = res.colors
+    stats = dict(res.stats)
+    progress.step("smoothing", 1, 2, "land cover")
+    if world.vegetation_grid is not None:
+        world.vegetation_grid = refine_vegetation(world.vegetation_grid, areas, sm, seed)
+        stats["vegetation_cells_changed"] = world.vegetation_grid.meta["smoothing"]["cells_changed"]
+    progress.step("smoothing", 2, 2, "vegetation")
+    world.stats["smoothing"] = stats
+
+
+def _vegetation(world: CanonicalWorld, cfg: WorldConfig) -> None:
     vc = cfg.vegetation
     progress = current()
-    grid = classify_vegetation(world.region, vc, bundle.worldcover, bundle.canopy, world.landcover, world.water)
-    world.vegetation_grid = grid
-    progress.step("vegetation", 1, 4, "classified")
-    world.vegetation_regions = extract_regions(grid, world.landcover, vc)
-    progress.step("vegetation", 2, 4, f"{len(world.vegetation_regions)} regions")
+    grid = world.vegetation_grid
+    # Region outlines keep the configured minimum size when the grid was refined.
+    world.vegetation_regions = extract_regions(grid, world.landcover, vc, min_area=2.0 * vc.resolution ** 2)
+    progress.step("vegetation", 1, 3, f"{len(world.vegetation_regions)} regions")
     excl = vegetation_exclusions(world, vc.exclusion_buffer)
     trees = place_trees(grid, world.terrain, excl, world.observed_trees, vc)  # type: ignore[arg-type]
-    progress.step("vegetation", 3, 4, f"{len(trees)} trees placed")
+    progress.step("vegetation", 2, 3, f"{len(trees)} trees placed")
     ground = place_ground_cover(grid, world.terrain, excl, vc)  # type: ignore[arg-type]
     world.trees = concat_tables([trees, ground])
     _tree_budget(world, cfg)

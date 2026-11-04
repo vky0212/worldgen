@@ -9,6 +9,7 @@ manifest together with its hash, so every output is traceable to its settings.
 from __future__ import annotations
 
 import calendar
+import copy
 import dataclasses
 import datetime as _dt
 import json
@@ -388,6 +389,39 @@ class VegetationConfig:
 
 
 @dataclass
+class SmoothingConfig:
+    """Post-processing of grid-derived borders (``landcover/smoothing.py``).
+
+    Land cover arrives as source pixels (ESA WorldCover is 10 m) sampled onto the terrain and
+    vegetation grids, and water is carved node by node, so every border is a staircase. This
+    stage turns them into smooth, slightly irregular natural borders. Distances in metres.
+    """
+
+    enabled: bool = True
+    # Gaussian sigma of the class-membership smoothing. Removes source-pixel stairs; specks
+    # smaller than about twice this vanish into their surroundings.
+    border_radius_m: float = 6.0
+    # Width of the colour transition across land-cover borders (0: no extra blending).
+    blend_width_m: float = 10.0
+    # Natural irregularity: borders are displaced by smooth world-space noise (0: off).
+    warp_amplitude_m: float = 5.0
+    warp_wavelength_m: float = 60.0
+    # A WorldCover water patch outside mapped (OSM) water that comes this close to it is a
+    # registration/tide mismatch: the whole patch takes the surrounding land class instead of
+    # painting the bank blue. Patches farther away (unmapped ponds) are kept.
+    water_snap_m: float = 30.0
+    # Shorelines: the terrain crosses the water surface exactly on the mapped outline. The bank
+    # gradient there follows the original terrain, clamped to these limits (m/m).
+    shorelines: bool = True
+    shore_slope_min: float = 0.03
+    shore_slope_max: float = 1.0
+    # The vegetation grid is refined by this integer factor so forest edges are not cell stairs.
+    vegetation_upsample: int = 2
+    # Fraction of tree density removed at the very edge of forests (fades in over the edge zone).
+    forest_edge_thinning: float = 0.5
+
+
+@dataclass
 class ExportConfig:
     combined_glb: bool = True
     geoparquet: bool = True
@@ -417,6 +451,7 @@ class WorldConfig:
     buildings: BuildingsConfig = field(default_factory=BuildingsConfig)
     water: WaterConfig = field(default_factory=WaterConfig)
     vegetation: VegetationConfig = field(default_factory=VegetationConfig)
+    smoothing: SmoothingConfig = field(default_factory=SmoothingConfig)
     export: ExportConfig = field(default_factory=ExportConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
 
@@ -447,6 +482,17 @@ class WorldConfig:
             raise ConfigError("roads.surface_mode must be drape or ribbon")
         if self.vegetation.quality not in ("low", "medium", "high"):
             raise ConfigError("vegetation.quality must be low, medium or high")
+        sm = self.smoothing
+        if min(sm.border_radius_m, sm.blend_width_m, sm.warp_amplitude_m, sm.water_snap_m) < 0:
+            raise ConfigError("smoothing distances must not be negative")
+        if sm.warp_wavelength_m <= 0:
+            raise ConfigError("smoothing.warp_wavelength_m must be positive")
+        if not 0 < sm.shore_slope_min <= sm.shore_slope_max:
+            raise ConfigError("smoothing requires 0 < shore_slope_min <= shore_slope_max")
+        if int(sm.vegetation_upsample) != sm.vegetation_upsample or not 1 <= sm.vegetation_upsample <= 8:
+            raise ConfigError("smoothing.vegetation_upsample must be an integer from 1 to 8")
+        if not 0 <= sm.forest_edge_thinning <= 1:
+            raise ConfigError("smoothing.forest_edge_thinning must be in [0, 1]")
         reg = self.region
         if reg.bbox is None and (reg.center_lat is None or reg.center_lon is None):
             raise ConfigError("region requires center_lat/center_lon (+radius_m) or bbox")
@@ -498,17 +544,18 @@ def validate_imagery(im: ImagerySourceConfig) -> None:
 # dict <-> dataclass plumbing
 
 
-def _coerce(tp: Any, value: Any, path: str) -> Any:
+def _coerce(tp: Any, value: Any, path: str, default: Any = None) -> Any:
+    """``default`` is the value the field would have had, used to fill a partial dataclass."""
     origin = typing.get_origin(tp)
     if dataclasses.is_dataclass(tp):
         if not isinstance(value, dict):
             raise ConfigError(f"{path}: expected a mapping, got {type(value).__name__}")
-        return from_dict(tp, value, path)
+        return from_dict(tp, value, path, default if isinstance(default, tp) else None)
     if origin in (typing.Union, types.UnionType):
         args = [a for a in typing.get_args(tp) if a is not type(None)]
         if value is None:
             return None
-        return _coerce(args[0], value, path)
+        return _coerce(args[0], value, path, default)
     if origin is dict:
         _, vt = typing.get_args(tp)
         if not isinstance(value, dict):
@@ -538,13 +585,36 @@ def _coerce(tp: Any, value: Any, path: str) -> Any:
     return value
 
 
-def from_dict(cls: type, data: dict[str, Any], path: str = "config") -> Any:
+def _field_default(f: dataclasses.Field) -> Any:
+    if f.default_factory is not dataclasses.MISSING:
+        return f.default_factory()
+    if f.default is not dataclasses.MISSING:
+        return f.default
+    return None
+
+
+def from_dict(cls: type, data: dict[str, Any], path: str = "config", default: Any = None) -> Any:
+    """Build ``cls`` from a (possibly partial) mapping.
+
+    Keys missing from ``data`` come from ``default`` -- the instance the enclosing field
+    would have had (e.g. ``vegetation.budget``'s ``default_factory``) -- or, without one,
+    from ``cls``'s own defaults. Nested dataclass sections are filled the same way, so
+    setting one key of a section never resets its siblings to the class defaults. Plain
+    dict and list values replace the default wholesale.
+    """
     hints = typing.get_type_hints(cls)
-    names = {f.name for f in dataclasses.fields(cls)}
-    unknown = set(data) - names
+    fields = {f.name: f for f in dataclasses.fields(cls)}
+    unknown = set(data) - set(fields)
     if unknown:
         raise ConfigError(f"{path}: unknown keys {sorted(unknown)}")
-    kwargs = {k: _coerce(hints[k], v, f"{path}.{k}") for k, v in data.items()}
+    kwargs: dict[str, Any] = {}
+    for k, v in data.items():
+        base = getattr(default, k) if default is not None else _field_default(fields[k])
+        kwargs[k] = _coerce(hints[k], v, f"{path}.{k}", base)
+    if default is not None:
+        for k, f in fields.items():
+            if k not in kwargs and f.init:
+                kwargs[k] = copy.deepcopy(getattr(default, k))
     return cls(**kwargs)
 
 

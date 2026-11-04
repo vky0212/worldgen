@@ -96,9 +96,10 @@ export const DEFAULT_STAGES: readonly Required<StageDef>[] = [
   { name: 'terrain_shaping', label: 'Terrain shaping', weight: 0.03 },
   { name: 'buildings', label: 'Buildings', weight: 0.02 },
   { name: 'landcover', label: 'Land cover', weight: 0.02 },
+  { name: 'smoothing', label: 'Smooth borders', weight: 0.02 },
   { name: 'intersections', label: 'Intersections', weight: 0.03 },
   { name: 'vegetation', label: 'Vegetation', weight: 0.1 },
-  { name: 'validate', label: 'Validate', weight: 0.1 },
+  { name: 'validate', label: 'Validate', weight: 0.08 },
   { name: 'export', label: 'Export tiles', weight: 0.28 },
   { name: 'manifest', label: 'Write manifest', weight: 0.03 },
 ];

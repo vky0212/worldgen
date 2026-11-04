@@ -48,10 +48,10 @@
   "intersections": 10,
   "landcover_areas": 2,
   "roads": 15,
-  "trees": 13426,
+  "trees": 13155,
   "trees_budget_dropped": 0,
   "trees_observed": 5,
-  "trees_rendered": 13426,
+  "trees_rendered": 13155,
   "tunnels": 1,
   "turn_restrictions": 0,
   "turn_restrictions_enforced": 0,
@@ -59,8 +59,8 @@
   "vegetation_regions": 6,
   "water_bodies": 2
  },
- "terrain_mean": 26.52,
- "trees_total_height": 125647.0,
+ "terrain_mean": 26.43,
+ "trees_total_height": 123706.0,
  "tunnel_deck_min": {
   "tunnel:osm:way/113": 45.0
  }

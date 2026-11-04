@@ -140,8 +140,9 @@ including any time spent queued) and `type`. Events that change overall progress
 Stages (in order, with progress weights): `acquire` (Download sources, 0.25),
 `normalize` (0.02), `terrain` (0.03), `topology` (0.03), `water_levels`
 (0.01), `road_elevation` (0.05), `terrain_shaping` (0.03), `buildings`
-(0.02), `landcover` (0.02), `intersections` (0.03), `vegetation` (0.10),
-`validate` (0.10), `export` (0.28), `manifest` (0.03). `plan.stages` is
+(0.02), `landcover` (0.02), `smoothing` (0.02), `intersections` (0.03),
+`vegetation` (0.10), `validate` (0.08), `export` (0.28), `manifest` (0.03).
+`plan.stages` is
 authoritative.
 
 The same event stream is available without the server:

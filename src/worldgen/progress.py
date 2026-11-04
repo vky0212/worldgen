@@ -28,9 +28,10 @@ STAGES: list[tuple[str, str, float]] = [
     ("terrain_shaping", "Terrain shaping", 0.03),
     ("buildings", "Buildings", 0.02),
     ("landcover", "Land cover", 0.02),
+    ("smoothing", "Smooth borders", 0.02),
     ("intersections", "Junctions", 0.03),
     ("vegetation", "Vegetation", 0.10),
-    ("validate", "Validation", 0.10),
+    ("validate", "Validation", 0.08),
     ("export", "Export tiles & data", 0.28),
     ("manifest", "Manifest", 0.03),
 ]
