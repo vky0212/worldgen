@@ -91,6 +91,14 @@ something is not cached. Keep the cache with a world to make it reproducible.
   region, identifies itself with a User-Agent, retries politely and caches the
   response. For large-scale compilation use a local Overpass instance or OSM
   extracts and point `sources.osm.endpoints` at it.
+* `sources.osm.endpoints` is a priority list, tried top to bottom. An entry is a
+  URL string or `{url, name, coverage_bbox}`; `coverage_bbox`
+  (`[south, west, north, east]`) marks a server holding only an extract, and it
+  is used only when the whole query bbox lies inside it. The default list starts
+  with the self-hosted Taiwan server `http://192.168.3.122/api/interpreter`, then
+  falls back to overpass-api.de and private.coffee. A server that refuses or
+  times out the connection (`connect_timeout_s`, default 10 s) is skipped
+  without retries, so builds off the office network fall through quickly.
 * Raster windows are read with HTTP range requests; only the bytes covering
   the region are transferred.
 * XYZ imagery tiles are fetched with a generic `worldgen/<version>`

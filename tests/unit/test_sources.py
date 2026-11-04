@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 import shapely
 from shapely.geometry import box
@@ -139,3 +141,77 @@ def test_cache_offline(tmp_path):
     assert data2 == b"payload" and meta2["sha256"] == meta["sha256"]
     with pytest.raises(OfflineCacheMiss):
         offline.get_bytes("osm", ["other"], lambda: (b"", {}))
+
+
+# --- Overpass endpoint priority list -------------------------------------------------
+
+def _overpass_client(tmp_path, endpoints):  # noqa: ANN001, ANN202
+    from worldgen.config import OsmSourceConfig, from_dict
+    from worldgen.sources.base import SourceCache
+    from worldgen.sources.osm import OverpassClient
+
+    cfg = from_dict(OsmSourceConfig, {"endpoints": endpoints, "connect_timeout_s": 1.0})
+    return OverpassClient(cfg, SourceCache(tmp_path))
+
+
+class _Resp:
+    status_code = 200
+    content = b'{"version":0.6,"osm3s":{"timestamp_osm_base":"t"},"elements":[]}'
+
+    def raise_for_status(self) -> None:
+        pass
+
+    def json(self) -> dict:
+        return json.loads(self.content)
+
+
+TAIPEI = (121.50, 25.03, 121.52, 25.05)  # west, south, east, north
+BERLIN = (13.39, 52.51, 13.41, 52.53)
+
+
+def test_default_priority_list_puts_taiwan_server_first():
+    from worldgen.config import OsmSourceConfig
+
+    eps = OsmSourceConfig().endpoints
+    assert eps[0].url == "http://192.168.3.122/api/interpreter"
+    assert eps[0].covers(TAIPEI) and not eps[0].covers(BERLIN)
+    assert all(ep.covers(BERLIN) for ep in eps[1:])
+
+
+def test_endpoint_string_shorthand_and_validation():
+    from worldgen.config import OsmSourceConfig, from_dict, validate_osm
+    from worldgen.errors import ConfigError
+
+    cfg = from_dict(OsmSourceConfig, {"endpoints": ["https://a/api/interpreter",
+                                                    {"url": "http://b/api/interpreter",
+                                                     "coverage_bbox": [21.8, 118.1, 26.5, 122.2]}]})
+    assert cfg.endpoints[0].coverage_bbox is None and cfg.endpoints[1].coverage_bbox
+    validate_osm(cfg)
+    with pytest.raises(ConfigError):
+        validate_osm(from_dict(OsmSourceConfig, {"endpoints": ["192.168.3.122/api/interpreter"]}))
+
+
+def test_fetch_skips_out_of_coverage_and_unreachable_endpoints(tmp_path, monkeypatch):
+    import requests
+
+    from worldgen.sources import osm
+
+    calls: list[str] = []
+
+    def fake_post(url, **kw):  # noqa: ANN001, ANN003, ANN202
+        calls.append(url)
+        if url.startswith("http://lan"):
+            raise requests.ConnectTimeout("no route")
+        return _Resp()
+
+    monkeypatch.setattr(osm.requests, "post", fake_post)
+    monkeypatch.setattr(osm.time, "sleep", lambda s: None)
+    eps = [{"url": "http://lan/api/interpreter", "coverage_bbox": [21.8, 118.1, 26.5, 122.2]},
+           "https://public/api/interpreter"]
+
+    _, rec = _overpass_client(tmp_path / "a", eps).fetch(BERLIN)
+    assert calls == ["https://public/api/interpreter"] and rec.url == "https://public/api/interpreter"
+
+    calls.clear()
+    _, rec = _overpass_client(tmp_path / "b", eps).fetch(TAIPEI)
+    assert calls == ["http://lan/api/interpreter", "https://public/api/interpreter"]  # one try, no retries
