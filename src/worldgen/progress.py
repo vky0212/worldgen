@@ -35,7 +35,7 @@ STAGES: list[tuple[str, str, float]] = [
     ("manifest", "Manifest", 0.03),
 ]
 WEIGHTS = {name: w for name, _, w in STAGES}
-SOURCES = ["osm", "dem", "worldcover", "canopy_height", "overture"]
+SOURCES = ["osm", "dem", "worldcover", "canopy_height", "overture", "imagery"]
 
 
 class Progress:

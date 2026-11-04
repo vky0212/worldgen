@@ -11,6 +11,7 @@ from shapely.strtree import STRtree
 from worldgen import SCHEMA_VERSION, __version__
 from worldgen.buildings.buildings import build_building_collision, build_building_pieces
 from worldgen.export.gltf import GltfBuilder
+from worldgen.export.ortho import imagery_hash
 from worldgen.geometry.mesh import LayerBuilder
 from worldgen.hashing import round_floats, sha256_bytes, sha256_json
 from worldgen.landcover.landcover import terrain_colors
@@ -75,6 +76,10 @@ def tile_input_hash(world: CanonicalWorld, tid: str, entity_tree: tuple[STRtree,
         idx = np.nonzero(m)[0]
         parts["trees"] = sha256_json([[tr.ids[i], round(float(tr.x[i]), 2), round(float(tr.y[i]), 2),
                                        round(float(tr.height[i]), 2), tr.archetype[i]] for i in idx])
+    # Orthophoto: imagery content + bake settings. World-level, because the colour levels are.
+    im_hash = imagery_hash(world)
+    if im_hash is not None:
+        parts["imagery"] = im_hash
     return sha256_json(parts)
 
 

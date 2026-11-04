@@ -1,0 +1,33 @@
+# Basic profile + Taiwan NLSC orthophoto draped on the terrain (tiles/<id>.ortho.jpg).
+#
+#   worldgen build --profile imagery_taiwan_nlsc --center 25.17667,121.537628 --radius 2075 \
+#       --output generated/n25_177_e121_538
+#
+# BEFORE USING: confirm that the terms of the National Land Surveying and Mapping Center
+# (NLSC, 內政部國土測繪中心) WMTS service allow your use, and that the licence and
+# attribution below are the ones it requires (https://maps.nlsc.gov.tw/ service terms and
+# https://data.gov.tw/license). WorldGen only records what you enter here in the manifest and
+# ATTRIBUTION.txt. The PHOTO2 tiles carry a visible "NLSC <year>" watermark.
+#
+# Service: https://wmts.nlsc.gov.tw/wmts (GetCapabilities), layer PHOTO2 (正射影像圖(通用)),
+# TileMatrixSet GoogleMapsCompatible (EPSG:3857, 256 px tiles). RESTful template:
+#   https://wmts.nlsc.gov.tw/wmts/{Layer}/{Style}/{TileMatrixSet}/{TileMatrix}/{TileRow}/{TileCol}
+# so TileMatrix = {z}, TileRow = {y}, TileCol = {x}.
+extends: basic
+sources:
+  imagery:
+    enabled: true
+    provider: xyz
+    url_template: "https://wmts.nlsc.gov.tw/wmts/PHOTO2/default/GoogleMapsCompatible/{z}/{y}/{x}"
+    # Zoom 18 is ~0.54 m/px at 25°N: 512 px per 256 m tile, ~1200 tiles for a 2 km radius.
+    # Zoom 19 (~0.27 m/px, 1024 px tiles) needs about four times as many tiles.
+    zoom: 18
+    max_tiles: 2500
+    tile_px_max: 1024
+    max_m_per_px: 0.25
+    jpeg_quality: 88
+    license: "Open Government Data License, version 1.0 (Taiwan)"
+    attribution: >-
+      Orthophoto © National Land Surveying and Mapping Center, Ministry of the Interior, Taiwan
+      (內政部國土測繪中心), released under the Open Government Data License, version 1.0
+      (政府資料開放授權條款－第1版, https://data.gov.tw/license)

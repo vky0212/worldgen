@@ -23,6 +23,7 @@ from worldgen.log import get_logger, stage
 from worldgen.progress import SOURCES as SOURCE_ORDER
 from worldgen.progress import current
 from worldgen.sources.base import SourceCache, SourceRecord
+from worldgen.sources.imagery import fetch_imagery
 from worldgen.sources.osm import OverpassClient
 from worldgen.sources.osm_normalize import normalize_osm
 from worldgen.sources.overture import fetch_overture_buildings
@@ -112,6 +113,11 @@ def acquire(region: Region, cfg: WorldConfig, cache_dir: str | Path, offline: bo
         bundle.overture_buildings, rec = ov
         bundle.records.append(rec)
         report(rec)
+    im = guarded("imagery", lambda: fetch_imagery(cfg.sources.imagery, bbox_raster, cache))
+    if im is not None:
+        bundle.imagery, rec = im
+        bundle.records.append(rec)
+        report(rec)
     return bundle
 
 
@@ -124,7 +130,7 @@ def bundle_from_fixture(fx: Fixture) -> SourceBundle:
 
 
 def compile_world(region: Region, cfg: WorldConfig, bundle: SourceBundle) -> CanonicalWorld:
-    world = CanonicalWorld(region=region, config=cfg, sources=list(bundle.records))
+    world = CanonicalWorld(region=region, config=cfg, sources=list(bundle.records), imagery=bundle.imagery)
     t = world.timings
     extent = region.extent_box
 

@@ -801,6 +801,29 @@ table.kv.inferred th {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.sb-fps {
+  color: var(--muted);
+  min-width: 70px;
+}
+.sb-fps.degraded {
+  color: var(--warn);
+}
+.sb-fps.slow {
+  color: var(--error);
+}
+.range {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--accent);
+}
+.range-value {
+  min-width: 38px;
+  text-align: right;
+  color: var(--muted);
+}
+#sidebar-sections:not(.photo-mode) .photo-only {
+  display: none;
+}
 .sb-attribution {
   margin-left: auto;
   color: var(--text);

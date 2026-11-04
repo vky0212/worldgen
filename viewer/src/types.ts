@@ -92,12 +92,27 @@ export interface TileEntry {
   glb: string;
   collision?: string | null;
   meta?: string | null;
+  /** Optional satellite orthophoto JPEG (north up, covering `bounds`). */
+  ortho?: string | null;
   hash?: string;
   counts?: Record<string, number>;
 }
 
+/** tiles/index.json → ortho: settings of the baked satellite orthophotos. */
+export interface OrthoIndexInfo {
+  format?: string;
+  pixels?: number;
+  /** Ground size of one image pixel (tile_size / pixels). */
+  m_per_px?: number;
+  /** Resolution of the imagery itself (the image may be upsampled). */
+  effective_source_m_per_px?: number;
+  source_m_per_px?: number;
+  [key: string]: unknown;
+}
+
 export interface TileIndex extends SchemaDoc {
   tile_size?: number;
+  ortho?: OrthoIndexInfo | null;
   tiles: TileEntry[];
 }
 

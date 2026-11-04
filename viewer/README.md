@@ -58,7 +58,8 @@ hides its API features (static hosting keeps working).
 ```sh
 npm run build      # tsc --noEmit (app + node configs) && vite build -> dist/
 npm run typecheck  # type-check only
-npm test           # unit tests (node --test): routing, job-progress reducer, region helpers
+npm test           # unit tests (node --test): routing, job-progress reducer, region helpers,
+                   # building styles, graphics levels + frame-rate governor, solar position
 ```
 
 `dist/` contains both pages (`index.html`, `generate.html`) and is built with `base: './'`,
@@ -73,6 +74,11 @@ Viewer (`index.html`):
 | Parameter | Meaning |
 |---|---|
 | `world` | Base URL of the compiled world directory. It can be absolute or relative to the page. Default: `world/` relative to the page, which is `/world/` when the viewer is served at `/`. A trailing `/` is added if missing. Example: `?world=https://example.org/worlds/taipei/` |
+| `render` | `photo` opens in the photo-realistic mode, `standard` in the standard one (default: the last choice, else standard) |
+| `graphics` | Photo-realistic graphics level: `auto` (default), `low`, `medium`, `high`, `ultra` |
+| `tod` | Local solar time in hours for the sun, 4.5 … 20.5 (default 10.5) |
+| `ground` | Photo-realistic ground colour: `satellite` (default when the world has `tiles/<tile>.ortho.jpg` imagery) or `procedural` (landcover colours). Overrides the **Ground** choice |
+| `cam` | Initial view `x,y,z[,distance,yaw,pitch]`: look at local ENU `(x, y, z)` from `distance` m (default 150), heading `yaw`° (0 = from the south, 90 = from the east), `pitch`° above the horizon (default 35). For reproducible screenshots and bug reports |
 
 Generate page (`generate.html`):
 
@@ -129,6 +135,67 @@ In the viewer, when the API answers `/api/health`, a **World** selector lists th
 | `F` | Switches between orbit and fly mode (the button in **View** does the same) |
 | Click | Inspects the clicked feature, graph edge or node, or validation marker |
 | `Esc` | Stops route picking, or clears the selection |
+
+## Photo-realistic mode
+
+**View → Render: Photo-realistic** switches to a physically based look. **Graphics** picks a level;
+**Time** moves the sun. **Ground** picks what the ground colour comes from. The choices are
+remembered in `localStorage`.
+
+- **Satellite ground.** Where a world has orthophotos (`sources.imagery`, see
+  `../docs/output-format.md`), they colour the ground by default. Up close, where one satellite
+  pixel would cover many screen pixels, the imagery fades to a low-frequency tint and the
+  procedural detail carries the surface. Very dark imagery (baked shadows) is lifted towards the
+  landcover brightness. Worlds without imagery use the landcover colours, and the selector is
+  disabled.
+
+- **Lighting.** A Preetham sky with clouds lights the scene through image-based lighting, and the
+  sun sits at the real solar position for the world's latitude and today's date. The sun-to-sky
+  ratio is about 6 : 1, as on a clear day. At night the windows light up.
+- **Atmosphere.** Height fog takes its colour from the sky, so valleys are hazier than ridges.
+- **Shadows.** One sun shadow map follows what the camera looks at. Its size is quantised and its
+  centre snapped to texels, and it re-renders only when it moves.
+- **Post-processing.** HDR rendering with MSAA, depth-only ambient occlusion (GTAO), bloom on
+  highlights only, and ACES tone mapping.
+- **Materials.** The tiles' glTF materials are patched in place: every kind compiles once and is
+  shared by all tiles, and the colour modes keep working.
+  - Terrain gets slope-dependent triplanar rock and grass, soil or forest-floor detail.
+  - Roads get asphalt and gravel; bridges and tunnels get concrete.
+  - Water gets animated normals and Fresnel reflection.
+  - Trees get per-instance colour variation, translucency and wind.
+- **Procedural texture engine.** On every graphics-level change, 22 material layers are baked on
+  the GPU into mipmapped texture arrays (no image assets): 10 facade archetypes, 5 roofs and 7
+  ground layers.
+- **Buildings from geo data.** Each building gets a facade archetype, a ground floor (shopfront
+  or not), a roof material, tints and a storey height.
+  - They come from its metadata: OSM class, amenity, `building:material`, `building:colour`,
+    `roof:colour`, `roof:shape`, levels/height (observed or inferred) and ground elevation.
+  - A regional style profile from the world's location sets the defaults. Examples:
+    subtropical East Asia → ceramic-tile facades with window grilles, metal roofs and rooftop
+    water tanks; Nordic → timber; Mediterranean → plaster and clay.
+  - Window rows line up with the real storeys, and results are deterministic per building id.
+  - See `src/render/buildingStyle.ts`.
+- **Tree level of detail.** Per tile, trees are drawn full near the camera, as canopies without
+  trunks further out, and as 4–8-triangle impostors beyond that. Past the draw distance they are
+  not drawn. Trees are most of a world's triangles.
+- **Frame rate.** Each level is sized to run well above 45 fps. A governor watches the frame time
+  (and the GPU time where `EXT_disjoint_timer_query_webgl2` exists) and holds 45 fps:
+  - It first lowers the render resolution (down to 0.5×).
+  - Then it drops effects in this order: AO, bloom, shadow resolution, tree shadows, tree
+    distance, MSAA, shadows.
+  - Everything comes back with hysteresis when there is headroom.
+  - **Auto** also moves between levels.
+  - The status bar shows fps, level and scale. It turns amber while effects are lowered; the
+    tooltip lists them.
+
+| Level | Resolution | Shadows | AO / bloom | Trees full / canopy / impostor | Textures |
+|---|---|---|---|---|---|
+| Low | 0.5× | 1024², no tree shadows | – | 150 / 350 / 1600 m | 128 px, albedo only |
+| Medium | 0.65× | 2048² | – | 250 / 550 / 2600 m | 256 px + normals |
+| High | 0.8× | 4096² | half-res / on | 350 / 800 / 4200 m | 256 px + glass reflections |
+| Ultra | 1× | 4096², terrain casts | full-res / on | 500 / 1200 m / all | 512 px + window parallax |
+
+(Resolution is relative to `min(devicePixelRatio, 2)`.)
 
 ## Features
 
@@ -209,6 +276,15 @@ In the viewer, when the API answers `/api/health`, a **World** selector lists th
 | `src/validation.ts` | Validation pins and the filterable issue list |
 | `src/controls.ts` | Orbit (MapControls) and fly camera, framing, fly-to, dynamic near/far |
 | `src/geo.ts` | proj4 WGS84 ↔ local ENU; ENU ↔ three axes `(x, z, -y)` |
+| `src/render/photoreal.ts` | Photo-realistic mode: sky + IBL, sun, fitted shadows, fog, post chain, governor wiring, satellite ground |
+| `src/render/quality.ts` | Graphics levels and the frame-rate governor. Pure; unit-tested |
+| `src/render/materials.ts` | In-place shader patching of the tile materials (one program per kind × flags) |
+| `src/render/shaders/` | GLSL: shared noise, the texture bake, the surface patches (terrain, roads, water, trees, buildings, fog) |
+| `src/render/textureEngine.ts` | GPU bake of the procedural material layers into mipmapped texture arrays |
+| `src/render/buildingStyle.ts` | Geo data → building style; regional profiles; texture layer layout. Pure; unit-tested |
+| `src/render/treeLod.ts` | Per-tile tree LOD with impostors sharing the instance matrices |
+| `src/render/sun.ts` | Solar position. Pure; unit-tested |
+| `src/render/gpuTimer.ts` | GPU frame time via `EXT_disjoint_timer_query_webgl2` |
 | `src/ui.ts` | DOM helpers, info panel, status bar, toasts, progress bar |
 | `src/dom.ts` | Shared DOM helpers (`h`, sections, checkboxes) without three.js |
 | `src/api.ts`, `src/apiTypes.ts` | `worldgen serve` API client and types (docs/studio-api.md) |
@@ -224,6 +300,9 @@ In the viewer, when the API answers `/api/health`, a **World** selector lists th
 | `test/routing.test.ts` | Routing tests on a hand-made mini graph (one-way edges, `no_left_turn`, mandatory turns, modes, U-turns) |
 | `test/progress.test.ts` | Reducer tests: full build, failure, cancel, replay idempotency, log trimming |
 | `test/region.test.ts` | Region helper tests: plan/job parameters, names, conversions |
+| `test/buildingStyle.test.ts` | Region profiles, class/material/levels mapping, colour parsing, determinism, packing |
+| `test/quality.test.ts` | Level monotonicity, feature shedding, governor scale-down/shed/recover/hysteresis |
+| `test/sun.test.ts` | Solar position: equinox, solstice, morning/afternoon, night |
 | `vite.config.ts` | Vite config: both pages, the `/world/*` middleware and the `/api` + `/worlds` proxy |
 
 ## How three.js' GLTFLoader exposes the contract

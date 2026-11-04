@@ -16,6 +16,10 @@ import {
 } from 'three';
 import type { Material, Object3D } from 'three';
 import { COLOR_MODES, ColorModeManager } from './colorModes';
+import { PhotorealRenderer } from './render/photoreal';
+import type { GroundMode, PhotorealStats } from './render/photoreal';
+import { LEVEL_LABELS } from './render/quality';
+import type { LevelChoice } from './render/quality';
 import type { ColorMode } from './colorModes';
 import { CameraRig, isTyping } from './controls';
 import { GeoFrame, enuToThree, formatLatLon, formatMetres, parseLatLon, threeToEnu } from './geo';
@@ -57,6 +61,24 @@ import type { IssueFilter } from './validation';
 import { WorldModel } from './world';
 
 const SKY = '#b9d3ea';
+const PREFS = { render: 'worldgen.viewer.render', graphics: 'worldgen.viewer.graphics', tod: 'worldgen.viewer.timeOfDay', ground: 'worldgen.viewer.ground' };
+type RenderMode = 'standard' | 'photo';
+
+function readPref(key: string): string | null {
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writePref(key: string, value: string): void {
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    // Private mode or blocked storage: preferences are just not remembered.
+  }
+}
 const DEFAULT_BOUNDS: LocalBounds = { xmin: -500, ymin: -500, xmax: 500, ymax: 500, zmin: 0, zmax: 50 };
 
 interface RouteEndpoint {
@@ -98,6 +120,7 @@ class App {
   private geo = new GeoFrame(null);
   private bounds: LocalBounds = DEFAULT_BOUNDS;
   private readonly world = new WorldModel();
+  private readonly photoreal: PhotorealRenderer;
   private readonly highlighter = new Highlighter();
   private colors = new ColorModeManager();
   private topology: TopologyOverlay | null = null;
@@ -123,6 +146,9 @@ class App {
   private hoverPending = false;
   private lastPointer: { x: number; y: number } | null = null;
   private lastFrame = performance.now();
+  private fpsEma = 60;
+  private fpsShownAt = 0;
+  private fogOn = false;
 
   // UI refs filled by buildSidebar()
   private worldInfoBody!: HTMLElement;
@@ -143,6 +169,15 @@ class App {
   private routeStats!: HTMLElement;
   private validationSummary!: HTMLElement;
   private issueListBody!: HTMLElement;
+  private renderSelect!: HTMLSelectElement;
+  private graphicsSelect!: HTMLSelectElement;
+  private todInput!: HTMLInputElement;
+  private groundSelect!: HTMLSelectElement;
+  private groundNote!: HTMLElement;
+  private todLabel!: HTMLElement;
+  private photoNote!: HTMLElement;
+  private fogCheck!: HTMLInputElement;
+  private shadowCheck!: HTMLInputElement;
 
   constructor() {
     this.renderer = new WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
@@ -156,6 +191,9 @@ class App {
     this.scene.add(this.hemi, this.sun, this.sun.target);
     this.scene.add(this.world.root, this.highlighter.group, this.routeView.group);
 
+    this.photoreal = new PhotorealRenderer(this.renderer, this.scene, this.camera, this.world, this.sun, this.hemi);
+    this.photoreal.onStats = (st) => this.showPhotoStats(st);
+
     this.rig = new CameraRig(this.camera, this.renderer.domElement);
     this.rig.probe = (origin, dir) => this.probeRay(origin, dir);
     this.rig.onModeChange = (mode) => this.onCameraMode(mode);
@@ -167,6 +205,7 @@ class App {
     this.toasts.onLog = (e) => this.addLoadMessage(`${e.level}: ${e.text}`);
 
     this.bindEvents();
+    this.applyRenderPrefs();
     void this.initStudio();
     new ResizeObserver(() => this.resize()).observe(this.viewport);
     this.resize();
@@ -192,6 +231,9 @@ class App {
     this.geo = new GeoFrame(m);
     if (m && this.geo.warning) this.toasts.show(this.geo.warning, 'warn');
     this.colors = new ColorModeManager((m?.sources ?? []).map((s) => s.name).filter(Boolean));
+    const where = m?.region?.center ?? m?.origin ?? null;
+    this.photoreal.setLocation(where?.lat ?? null, where?.lon ?? null);
+    this.photoNote.textContent = `Building styles: ${this.photoreal.regionLabel}`;
     this.renderWorldInfo();
 
     // Tile index (attempted even without a manifest).
@@ -208,6 +250,7 @@ class App {
 
     this.bounds = m?.local_bounds ?? boundsFromIndex(index) ?? DEFAULT_BOUNDS;
     this.setupFraming();
+    this.applyCameraParam();
 
     if (m || index) {
       void this.loadGraph();
@@ -227,22 +270,70 @@ class App {
     this.rig.setBounds(b);
     this.rig.frame(b);
     const extent = Math.max(100, b.xmax - b.xmin, b.ymax - b.ymin);
+    this.configureStandardSun();
+    this.fog.near = extent * 1.2;
+    this.fog.far = extent * 6;
+    this.photoreal.setBounds(b);
+  }
+
+  /**
+   * `?cam=x,y,z,distance,yaw,pitch`: look at local ENU (x, y, z) from `distance`
+   * metres, heading `yaw` degrees (0 = from the south, 90 = from the east) and
+   * `pitch` degrees above the horizon. Reproducible views for reviews and bug reports.
+   */
+  private applyCameraParam(): void {
+    const raw = new URLSearchParams(window.location.search).get('cam');
+    if (!raw) return;
+    const v = raw.split(',').map(Number);
+    if (v.length < 3 || v.slice(0, 3).some((n) => !Number.isFinite(n))) {
+      this.toasts.show('Ignoring ?cam: expected x,y,z[,distance,yaw,pitch].', 'warn');
+      return;
+    }
+    const [x, y, z, dist = 150, yaw = 0, pitch = 35] = v;
+    const target = enuToThree(x, y, z);
+    const yr = (yaw * Math.PI) / 180;
+    const pr = (pitch * Math.PI) / 180;
+    const offset = new Vector3(Math.sin(yr) * Math.cos(pr), Math.sin(pr), Math.cos(yr) * Math.cos(pr)).multiplyScalar(dist);
+    this.rig.map.target.copy(target);
+    this.camera.position.copy(target).add(offset);
+    this.camera.lookAt(target);
+    this.rig.map.update();
+  }
+
+  /** Fixed sun and whole-world shadow frustum of the standard rendering. */
+  private configureStandardSun(): void {
+    const b = this.bounds;
+    const extent = Math.max(100, b.xmax - b.xmin, b.ymax - b.ymin);
     const center = enuToThree((b.xmin + b.xmax) / 2, (b.ymin + b.ymax) / 2, b.zmin ?? 0);
     this.sun.position.copy(center).add(new Vector3(-0.5 * extent, 1.1 * extent, 0.6 * extent));
     this.sun.target.position.copy(center);
+    this.sun.target.updateMatrixWorld();
     const cam = this.sun.shadow.camera;
     cam.left = cam.bottom = -extent * 0.75;
     cam.right = cam.top = extent * 0.75;
     cam.near = 1;
     cam.far = extent * 4;
     cam.updateProjectionMatrix();
-    this.sun.shadow.mapSize.set(4096, 4096);
+    if (this.sun.shadow.mapSize.x !== 4096) {
+      this.sun.shadow.mapSize.set(4096, 4096);
+      this.sun.shadow.map?.dispose();
+      this.sun.shadow.map = null;
+    }
     this.sun.shadow.bias = -0.0005;
-    this.fog.near = extent * 1.2;
-    this.fog.far = extent * 6;
+    this.sun.shadow.normalBias = 0;
+    this.sun.shadow.radius = 1;
   }
 
   private async loadTiles(index: TileIndex): Promise<void> {
+    this.photoreal.setOrthoSource(this.base, index.ortho);
+    if (!index.ortho) {
+      // Worlds built without imagery: landcover colours only.
+      this.groundSelect.value = 'procedural';
+      this.groundSelect.disabled = true;
+      this.groundNote.textContent = 'This world has no satellite imagery (build with sources.imagery enabled).';
+      this.groundNote.hidden = false;
+      this.photoreal.setGround('procedural');
+    }
     const loader = new TileLoader(this.base, 4);
     const b = this.bounds;
     const focus = { x: (b.xmin + b.xmax) / 2, y: (b.ymin + b.ymax) / 2 };
@@ -251,13 +342,15 @@ class App {
     const tileErrors: string[] = [];
     await loader.loadAll(index.tiles, focus, {
       onTile: (entry, scene) => {
-        this.world.addTile(entry, scene);
-        if (this.shadows) applyShadows(scene, true);
+        const tile = this.world.addTile(entry, scene);
+        if (this.shadows && !this.photoreal.enabled) applyShadows(scene, true);
+        this.photoreal.onTileAdded(tile);
         if (this.colors.mode !== 'materials') this.colors.refreshTile(entry.id, this.world);
         if (++loadedTiles % 4 === 1) this.renderLayerList();
       },
       onMeta: (entry, meta, error) => {
         this.world.setMeta(entry, meta, error);
+        if (meta) this.photoreal.onMetaLoaded(entry.id);
         if (error) {
           metaFailures++;
           this.addLoadMessage(`meta ${entry.id}: ${error}`);
@@ -405,12 +498,51 @@ class App {
     this.modeButton.addEventListener('click', () => this.rig.toggleMode());
     const frameBtn = h('button', { class: 'btn', title: 'Frame the whole world' }, 'Frame world');
     frameBtn.addEventListener('click', () => this.rig.frame(this.bounds));
+    this.renderSelect = h('select', { class: 'select', title: 'Rendering style' });
+    this.renderSelect.append(h('option', { value: 'standard' }, 'Standard'), h('option', { value: 'photo' }, 'Photo-realistic'));
+    this.renderSelect.addEventListener('change', () => this.setRenderMode(this.renderSelect.value as RenderMode));
+    this.graphicsSelect = h('select', { class: 'select', title: 'Graphics level. The frame rate is held above 45 fps at every level by lowering the resolution, then expensive effects.' });
+    for (const c of ['auto', 'low', 'medium', 'high', 'ultra'] as const) this.graphicsSelect.append(h('option', { value: c }, LEVEL_LABELS[c]));
+    this.graphicsSelect.addEventListener('change', () => {
+      const v = this.graphicsSelect.value as LevelChoice;
+      writePref(PREFS.graphics, v);
+      this.photoreal.setLevel(v);
+    });
+    this.todInput = h('input', { type: 'range', min: '4.5', max: '20.5', step: '0.25', value: '10.5', class: 'range', title: 'Local solar time' });
+    this.todLabel = h('span', { class: 'range-value mono' }, '10:30');
+    this.todInput.addEventListener('input', () => {
+      const v = Number(this.todInput.value);
+      this.todLabel.textContent = formatHour(v);
+      this.photoreal.setTimeOfDay(v);
+      writePref(PREFS.tod, String(v));
+    });
+    this.groundSelect = h('select', { class: 'select', title: 'What the ground colour comes from, under the procedural detail' });
+    this.groundSelect.append(h('option', { value: 'satellite' }, 'Satellite imagery'), h('option', { value: 'procedural' }, 'Landcover colours'));
+    this.groundSelect.addEventListener('change', () => {
+      const v = this.groundSelect.value as GroundMode;
+      writePref(PREFS.ground, v);
+      this.photoreal.setGround(v);
+    });
+    this.groundNote = h('div', { class: 'note small photo-only' });
+    this.groundNote.hidden = true;
+    this.photoNote = h('div', { class: 'note small' }, '');
+    const fogLabel = checkbox('Fog', false, (v) => {
+      this.fogOn = v;
+      if (!this.photoreal.enabled) this.scene.fog = v ? this.fog : null;
+    });
+    this.fogCheck = fogLabel.querySelector('input')!;
+    const shadowLabel = checkbox('Shadows', false, (v) => this.setShadows(v));
+    this.shadowCheck = shadowLabel.querySelector('input')!;
     view.append(
       h('div', { class: 'btn-row' }, this.modeButton, frameBtn),
-      checkbox('Fog', false, (v) => {
-        this.scene.fog = v ? this.fog : null;
-      }),
-      checkbox('Shadows', false, (v) => this.setShadows(v)),
+      h('label', { class: 'field' }, h('span', null, 'Render'), this.renderSelect),
+      h('label', { class: 'field photo-only' }, h('span', null, 'Graphics'), this.graphicsSelect),
+      h('label', { class: 'field photo-only' }, h('span', null, 'Time'), this.todInput, this.todLabel),
+      h('label', { class: 'field photo-only' }, h('span', null, 'Ground'), this.groundSelect),
+      this.groundNote,
+      this.photoNote,
+      fogLabel,
+      shadowLabel,
       h(
         'div',
         { class: 'help small' },
@@ -743,7 +875,72 @@ class App {
     this.lastFrame = now;
     this.rig.update(dt);
     this.routeView.updateMarkerScale(this.rig.viewDistance());
-    this.renderer.render(this.scene, this.camera);
+    if (this.photoreal.enabled) {
+      this.photoreal.render(this.rig.focus, this.rig.viewDistance());
+    } else {
+      this.renderer.render(this.scene, this.camera);
+      if (dt > 0) this.fpsEma += (1 / dt - this.fpsEma) * 0.05;
+      if (now - this.fpsShownAt > 500) {
+        this.fpsShownAt = now;
+        this.status.fps.textContent = `${Math.round(this.fpsEma)} fps`;
+        this.status.fps.className = 'sb-item sb-fps';
+        this.status.fps.title = 'Frame rate (standard rendering)';
+      }
+    }
+  }
+
+  // ------------------------------------------------------------ render mode
+
+  private applyRenderPrefs(): void {
+    const params = new URLSearchParams(window.location.search);
+    const mode = (params.get('render') ?? readPref(PREFS.render)) === 'photo' ? 'photo' : 'standard';
+    const g = params.get('graphics') ?? readPref(PREFS.graphics) ?? 'auto';
+    const choice: LevelChoice = (['auto', 'low', 'medium', 'high', 'ultra'] as const).includes(g as LevelChoice) ? (g as LevelChoice) : 'auto';
+    const tod = Number(params.get('tod') ?? readPref(PREFS.tod) ?? 10.5);
+    const hour = Number.isFinite(tod) ? Math.min(20.5, Math.max(4.5, tod)) : 10.5;
+    this.graphicsSelect.value = choice;
+    this.todInput.value = String(hour);
+    this.todLabel.textContent = formatHour(hour);
+    this.photoreal.setTimeOfDay(hour);
+    this.photoreal.setLevel(choice);
+    // Satellite imagery is the default ground wherever the world has it.
+    const ground: GroundMode = (params.get('ground') ?? readPref(PREFS.ground)) === 'procedural' ? 'procedural' : 'satellite';
+    this.groundSelect.value = ground;
+    this.photoreal.setGround(ground);
+    this.setRenderMode(mode, false);
+  }
+
+  private setRenderMode(mode: RenderMode, remember = true): void {
+    if (remember) writePref(PREFS.render, mode);
+    this.renderSelect.value = mode;
+    const photo = mode === 'photo';
+    this.sections.classList.toggle('photo-mode', photo);
+    this.photoreal.setEnabled(photo);
+    this.fogCheck.disabled = photo;
+    this.shadowCheck.disabled = photo;
+    if (!photo) {
+      // Back to the standard look: the checkboxes' state applies again.
+      this.scene.fog = this.fogOn ? this.fog : null;
+      this.configureStandardSun();
+      this.setShadows(this.shadows);
+      this.photoNote.hidden = true;
+    } else {
+      this.photoNote.hidden = false;
+    }
+  }
+
+  private showPhotoStats(st: PhotorealStats): void {
+    const el = this.status.fps;
+    el.textContent = this.photoreal.statusText();
+    el.className = `sb-item sb-fps${st.degraded ? ' degraded' : ''}${st.fps < 45 ? ' slow' : ''}`;
+    const lines = [
+      `Photo-realistic · ${LEVEL_LABELS[st.choice]}${st.choice === 'auto' ? ` (${LEVEL_LABELS[st.level]})` : ''}`,
+      `Render scale ${st.scale.toFixed(2)}× of the level's resolution`,
+      st.gpuMs !== null ? `GPU ${st.gpuMs.toFixed(1)} ms per frame` : 'GPU timing unavailable in this browser',
+      st.shed.length ? `Lowered to hold 45 fps: ${st.shed.join(', ')}` : 'All effects of this level are on',
+      `Trees: ${st.trees.full} full · ${st.trees.canopy} canopy · ${st.trees.impostor} impostor · ${st.trees.hidden} beyond draw distance`,
+    ];
+    el.title = lines.join('\n');
   }
 
   // ------------------------------------------------------------ picking
@@ -965,6 +1162,7 @@ class App {
 
   private setShadows(on: boolean): void {
     this.shadows = on;
+    if (this.photoreal.enabled) return;
     this.renderer.shadowMap.enabled = on;
     this.sun.castShadow = on;
     applyShadows(this.world.root, on);
@@ -1130,6 +1328,12 @@ class App {
       this.updateToolHint();
     }
   }
+}
+
+function formatHour(h: number): string {
+  const hh = Math.floor(h);
+  const mm = Math.round((h - hh) * 60);
+  return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
 }
 
 function applyShadows(root: Object3D, on: boolean): void {

@@ -38,6 +38,8 @@ class SourceBundle:
     worldcover: GeoRaster | None = None
     canopy: GeoRaster | None = None
     overture_buildings: list[Building] = field(default_factory=list)
+    # Orthoimagery: RGB uint8, data shape (3, rows, cols), source CRS; all-zero pixels = nodata.
+    imagery: GeoRaster | None = None
     records: list[SourceRecord] = field(default_factory=list)
     dem_datum: str = "EGM2008"
 
@@ -69,6 +71,8 @@ class CanonicalWorld:
     waterway_profiles: dict[str, Any] = field(default_factory=dict)
     covered_waterways: set[str] = field(default_factory=set)
     vegetation_grid: Any = None
+    imagery: GeoRaster | None = None     # orthoimagery baked per tile by export/ortho.py
+    imagery_hash: str | None = None      # memoised content hash (export.ortho.imagery_hash)
     vegetation_regions: list[VegetationRegion] = field(default_factory=list)
     trees: TreeTable = field(default_factory=TreeTable)
     stage_issues: list[dict[str, Any]] = field(default_factory=list)
