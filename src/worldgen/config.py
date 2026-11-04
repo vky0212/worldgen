@@ -9,6 +9,7 @@ manifest together with its hash, so every output is traceable to its settings.
 from __future__ import annotations
 
 import calendar
+import copy
 import dataclasses
 import datetime as _dt
 import json
@@ -543,17 +544,18 @@ def validate_imagery(im: ImagerySourceConfig) -> None:
 # dict <-> dataclass plumbing
 
 
-def _coerce(tp: Any, value: Any, path: str) -> Any:
+def _coerce(tp: Any, value: Any, path: str, default: Any = None) -> Any:
+    """``default`` is the value the field would have had, used to fill a partial dataclass."""
     origin = typing.get_origin(tp)
     if dataclasses.is_dataclass(tp):
         if not isinstance(value, dict):
             raise ConfigError(f"{path}: expected a mapping, got {type(value).__name__}")
-        return from_dict(tp, value, path)
+        return from_dict(tp, value, path, default if isinstance(default, tp) else None)
     if origin in (typing.Union, types.UnionType):
         args = [a for a in typing.get_args(tp) if a is not type(None)]
         if value is None:
             return None
-        return _coerce(args[0], value, path)
+        return _coerce(args[0], value, path, default)
     if origin is dict:
         _, vt = typing.get_args(tp)
         if not isinstance(value, dict):
@@ -583,13 +585,36 @@ def _coerce(tp: Any, value: Any, path: str) -> Any:
     return value
 
 
-def from_dict(cls: type, data: dict[str, Any], path: str = "config") -> Any:
+def _field_default(f: dataclasses.Field) -> Any:
+    if f.default_factory is not dataclasses.MISSING:
+        return f.default_factory()
+    if f.default is not dataclasses.MISSING:
+        return f.default
+    return None
+
+
+def from_dict(cls: type, data: dict[str, Any], path: str = "config", default: Any = None) -> Any:
+    """Build ``cls`` from a (possibly partial) mapping.
+
+    Keys missing from ``data`` come from ``default`` -- the instance the enclosing field
+    would have had (e.g. ``vegetation.budget``'s ``default_factory``) -- or, without one,
+    from ``cls``'s own defaults. Nested dataclass sections are filled the same way, so
+    setting one key of a section never resets its siblings to the class defaults. Plain
+    dict and list values replace the default wholesale.
+    """
     hints = typing.get_type_hints(cls)
-    names = {f.name for f in dataclasses.fields(cls)}
-    unknown = set(data) - names
+    fields = {f.name: f for f in dataclasses.fields(cls)}
+    unknown = set(data) - set(fields)
     if unknown:
         raise ConfigError(f"{path}: unknown keys {sorted(unknown)}")
-    kwargs = {k: _coerce(hints[k], v, f"{path}.{k}") for k, v in data.items()}
+    kwargs: dict[str, Any] = {}
+    for k, v in data.items():
+        base = getattr(default, k) if default is not None else _field_default(fields[k])
+        kwargs[k] = _coerce(hints[k], v, f"{path}.{k}", base)
+    if default is not None:
+        for k, f in fields.items():
+            if k not in kwargs and f.init:
+                kwargs[k] = copy.deepcopy(getattr(default, k))
     return cls(**kwargs)
 
 
