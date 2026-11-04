@@ -135,9 +135,9 @@ class Corridor:
     mode: str = "set"    # "set": conform terrain; "max": only lower terrain to z
 
 
-def point_polyline_projection(px: np.ndarray, py: np.ndarray, xy: np.ndarray, z: np.ndarray
-                              ) -> tuple[np.ndarray, np.ndarray]:
-    """Distance from points to a polyline and the interpolated z at the closest point."""
+def _nearest_segment(px: np.ndarray, py: np.ndarray, xy: np.ndarray, z: np.ndarray
+                     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Squared distance to the nearest segment (first one on ties), its index and the z there."""
     a = xy[:-1]
     b = xy[1:]
     ab = b - a
@@ -151,7 +151,56 @@ def point_polyline_projection(px: np.ndarray, py: np.ndarray, xy: np.ndarray, z:
     k = np.argmin(d2, axis=1)
     rows = np.arange(len(px))
     tz = z[:-1][k] + t[rows, k] * (z[1:][k] - z[:-1][k])
-    return np.sqrt(d2[rows, k]), tz
+    return d2[rows, k], k, tz
+
+
+# Segments projected together in corridor_nodes; their bounding box bounds the work per piece.
+CORRIDOR_PIECE_SEGMENTS = 16
+
+
+def corridor_nodes(hf: Heightfield, xy: np.ndarray, z: np.ndarray, reach: float
+                   ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Grid nodes within ``reach`` of a polyline: (rows, cols, distance, z at the closest point).
+
+    The polyline is projected in short pieces, each against the nodes of its own bounding box. A
+    single box around a long diagonal way holds far more nodes than the corridor, and projecting
+    each of them onto every segment grows with the cube of the length. Per node the nearest
+    segment of the whole polyline wins (the first one on ties), so the result is the same as one
+    projection onto the whole polyline.
+    """
+    rows, cols = hf.z.shape
+    r = hf.resolution
+    n_seg = len(xy) - 1
+    parts: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+    for s0 in range(0, n_seg, CORRIDOR_PIECE_SEGMENTS):
+        s1 = min(s0 + CORRIDOR_PIECE_SEGMENTS, n_seg)
+        pxy = xy[s0:s1 + 1]
+        x0, y0 = pxy.min(axis=0) - reach
+        x1, y1 = pxy.max(axis=0) + reach
+        c0 = max(int(np.floor((x0 - hf.xmin) / r)), 0)
+        c1 = min(int(np.ceil((x1 - hf.xmin) / r)), cols - 1)
+        r0 = max(int(np.floor((y0 - hf.ymin) / r)), 0)
+        r1 = min(int(np.ceil((y1 - hf.ymin) / r)), rows - 1)
+        if c1 < c0 or r1 < r0:
+            continue
+        cc, rr = np.meshgrid(np.arange(c0, c1 + 1), np.arange(r0, r1 + 1))
+        cc, rr = cc.ravel(), rr.ravel()
+        d2, k, tz = _nearest_segment(hf.xmin + cc * r, hf.ymin + rr * r, pxy, z[s0:s1 + 1])
+        near = np.sqrt(d2) <= reach
+        if near.any():
+            parts.append((rr[near] * cols + cc[near], d2[near], k[near] + s0, tz[near]))
+    if not parts:
+        empty = np.zeros(0, dtype=np.int64)
+        return empty, empty, np.zeros(0), np.zeros(0)
+    flat, d2, seg, tz = (np.concatenate(p) for p in zip(*parts))
+    if len(parts) > 1:
+        # A node reached by several pieces keeps its nearest segment (lowest index on ties).
+        order = np.lexsort((seg, d2, flat))
+        flat, d2, tz = flat[order], d2[order], tz[order]
+        first = np.r_[True, flat[1:] != flat[:-1]]
+        flat, d2, tz = flat[first], d2[first], tz[first]
+    ri, ci = np.divmod(flat, cols)
+    return ri, ci, np.sqrt(d2), tz
 
 
 def apply_corridors(hf: Heightfield, corridors: list[Corridor]) -> int:
@@ -163,35 +212,19 @@ def apply_corridors(hf: Heightfield, corridors: list[Corridor]) -> int:
     blend weights, so the terrain never steps between neighbouring roads. "max" corridors
     only lower terrain; the most restrictive one wins.
     """
-    rows, cols = hf.z.shape
     z0 = hf.z.copy()
     acc_wt = np.zeros(hf.z.shape)
     acc_w = np.zeros(hf.z.shape)
     max_w = np.zeros(hf.z.shape)
     lowest = np.full(hf.z.shape, np.inf)
     touched = np.zeros(hf.z.shape, dtype=bool)
-    r = hf.resolution
     for cor in corridors:
         if len(cor.xy) < 2:
             continue
         ext = cor.half_width + cor.shoulder
-        x0, y0 = cor.xy.min(axis=0) - ext
-        x1, y1 = cor.xy.max(axis=0) + ext
-        c0 = max(int(np.floor((x0 - hf.xmin) / r)), 0)
-        c1 = min(int(np.ceil((x1 - hf.xmin) / r)), cols - 1)
-        r0 = max(int(np.floor((y0 - hf.ymin) / r)), 0)
-        r1 = min(int(np.ceil((y1 - hf.ymin) / r)), rows - 1)
-        if c1 < c0 or r1 < r0:
+        ri, ci, d, tz = corridor_nodes(hf, cor.xy, cor.z, ext)
+        if not len(ri):
             continue
-        cc, rr = np.meshgrid(np.arange(c0, c1 + 1), np.arange(r0, r1 + 1))
-        px = hf.xmin + cc.ravel() * r
-        py = hf.ymin + rr.ravel() * r
-        d, tz = point_polyline_projection(px, py, cor.xy, cor.z)
-        inside = d <= ext
-        if not inside.any():
-            continue
-        ri, ci = rr.ravel()[inside], cc.ravel()[inside]
-        d, tz = d[inside], tz[inside]
         hw = cor.half_width
         w = np.where(d <= hw, 1.0, np.clip((ext - d) / max(ext - hw, 1e-6), 0.0, 1.0))
         w = w * w * (3 - 2 * w)  # smoothstep blend
