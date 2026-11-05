@@ -99,7 +99,8 @@ compiler.
     wet bank colour. The vegetation grid is refined `vegetation_upsample` times
     with the same smoothing and noise (trees and ground colours agree) and tree
     coverage fades towards forest edges (`forest_edge_thinning`).
-11. **Validation** (`validation.checks`) on the in-memory world.
+11. **Validation** (`validation.checks`) on the in-memory world (the tree checks run
+    during the export, chunk by chunk).
 12. **Export** (`build.export_world`): tile hashes → only dirty tiles are
     regenerated → tile GLB/collision/meta, tile index, combined `world.glb`
     (binary merge of tile GLBs, only up to `export.combined_glb_max_tiles`),
@@ -110,6 +111,24 @@ compiler.
     anchored inside its entity's box), and terrain normals are computed per
     tile window, so memory follows the block rather than the world while the
     files stay identical to a whole-world pass.
+
+    **Trees are placed during the export, chunk by chunk.** `worldgen build` compiles
+    with `compile_world(..., place_trees=False)`: the vegetation stage prepares the
+    world-level inputs (regions, exclusions, the ground-cover density scale) but
+    places nothing. The export walks squares of `export.chunk_tiles` × `chunk_tiles`
+    tiles (default 8, 2 km): `pipeline.place_vegetation` places the chunk's trees and
+    ground cover (`place_trees` pulls in every candidate that can thin a tree inside the
+    window, so each window gets exactly the whole-world trees, in the same per-tile
+    order), the per-tile instance budget applies, the chunk's tile hashes decide what
+    to rebuild, its dirty tiles are written, and its trees go to the tree validation
+    checks (`IndependenceSample` keeps the two most wooded tiles across chunks),
+    `vectors/trees.parquet` (`TreesParquetWriter`), the vegetation field sums and the
+    statistics before the next chunk replaces them. Tree memory therefore follows the
+    chunk, not the world; every output file but `trees.parquet` (row order: by chunk)
+    is identical whatever the chunk size (`tests/integration/test_chunked_export.py`).
+    `vegetation.budget.max_total`, a world-wide cap, places the whole world at once.
+    `compile_world` called directly still places every tree, and
+    `BuildOptions(keep_trees=True)` keeps them in `BuildResult.world.trees`.
 
 ## Progress and browser builds
 

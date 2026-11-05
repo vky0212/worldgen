@@ -67,7 +67,7 @@ def trees_by_tile(world: CanonicalWorld) -> dict[str, np.ndarray]:
 
 
 # Configuration keys that never change a tile's files, kept out of the tile input hashes.
-NOT_TILE_INPUTS: dict[str, tuple[str, ...]] = {"export": ("combined_glb_max_tiles",)}
+NOT_TILE_INPUTS: dict[str, tuple[str, ...]] = {"export": ("combined_glb_max_tiles", "chunk_tiles")}
 # Keys added after format 1.0, hashed only when set away from their default, so worlds built
 # with the defaults keep their tile hashes (and incremental rebuilds) across the upgrade.
 LATER_KEY_DEFAULTS: dict[str, dict[str, Any]] = {"export": {"mode": "baked"}, "terrain": {"height_quantum_m": 0.0}}
@@ -143,14 +143,16 @@ def tile_input_hash(world: CanonicalWorld, tid: str, entity_tree: tuple[STRtree,
             item.append(round(float(getattr(e, "base_elevation", 0.0) or 0.0), 2))
         ent_parts.append(item)
     parts["entities"] = sha256_json(round_floats(ent_parts, 3))
+    # The tile's trees (an empty list for none; the export may hold only one chunk's trees).
     tr = world.trees
-    if len(tr):
-        if tree_index is not None:
-            idx = tree_index.get(tid, NO_TREES)
-        else:
-            idx = np.nonzero((tr.x >= x0) & (tr.x < x1) & (tr.y >= y0) & (tr.y < y1) & tr.rendered_mask())[0]
-        parts["trees"] = sha256_json([[tr.ids[i], round(float(tr.x[i]), 2), round(float(tr.y[i]), 2),
-                                       round(float(tr.height[i]), 2), tr.archetype[i]] for i in idx])
+    if not len(tr):
+        idx = NO_TREES
+    elif tree_index is not None:
+        idx = tree_index.get(tid, NO_TREES)
+    else:
+        idx = np.nonzero((tr.x >= x0) & (tr.x < x1) & (tr.y >= y0) & (tr.y < y1) & tr.rendered_mask())[0]
+    parts["trees"] = sha256_json([[tr.ids[i], round(float(tr.x[i]), 2), round(float(tr.y[i]), 2),
+                                   round(float(tr.height[i]), 2), tr.archetype[i]] for i in idx])
     # Orthophoto: imagery content + bake settings. World-level, because the colour levels are.
     im_hash = imagery_hash(world)
     if im_hash is not None:
@@ -286,6 +288,22 @@ def _boxes(geoms: list[Any]) -> np.ndarray:
 def _overlaps(boxes: np.ndarray, b: tuple[float, float, float, float], margin: float) -> np.ndarray:
     return ((boxes[:, 0] <= b[2] + margin) & (boxes[:, 2] >= b[0] - margin)
             & (boxes[:, 1] <= b[3] + margin) & (boxes[:, 3] >= b[1] - margin))
+
+
+def tile_chunks(tiles: list[str], chunk: int, tile_size: float
+                ) -> list[tuple[tuple[float, float, float, float] | None, list[str]]]:
+    """Tiles grouped into ``chunk`` x ``chunk`` squares of the tile lattice, with each square's
+    bounds, squares in (j, i) order and tiles in their given order (``chunk`` <= 0: one chunk
+    covering everything, bounds None)."""
+    if chunk <= 0:
+        return [(None, list(tiles))]
+    span = chunk * tile_size
+    groups: dict[tuple[int, int], list[str]] = {}
+    for t in tiles:
+        i, j = parse_tile_id(t)
+        groups.setdefault((i // chunk, j // chunk), []).append(t)
+    return [((ci * span, cj * span, (ci + 1) * span, (cj + 1) * span), groups[(ci, cj)])
+            for ci, cj in sorted(groups, key=lambda ij: (ij[1], ij[0]))]
 
 
 def tile_blocks(tiles: list[str], block: int) -> list[list[str]]:

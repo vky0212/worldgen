@@ -76,6 +76,11 @@ class CanonicalWorld:
     imagery_hash: str | None = None      # memoised content hash (export.ortho.imagery_hash)
     vegetation_regions: list[VegetationRegion] = field(default_factory=list)
     trees: TreeTable = field(default_factory=TreeTable)
+    # Set when compile_world was asked not to place trees: export places them chunk by chunk
+    # (pipeline.place_vegetation) with these world-level inputs.
+    trees_deferred: bool = False
+    vegetation_exclusions: Any = None
+    ground_cover_scale: float | None = None
     stage_issues: list[dict[str, Any]] = field(default_factory=list)
     stats: dict[str, Any] = field(default_factory=dict)
     timings: dict[str, float] = field(default_factory=dict)

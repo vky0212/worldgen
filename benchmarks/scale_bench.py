@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import inspect
 import json
 import os
 import platform
@@ -219,7 +220,10 @@ def measure(args: argparse.Namespace) -> dict[str, Any]:
     km2 = (x1 - x0) * (y1 - y0) / 1e6
 
     t = time.perf_counter()
-    world = compile_world(region, cfg, bundle)
+    # As `worldgen build` compiles: trees deferred to the chunked export where supported (a
+    # baseline checkout without chunked export places them during compile).
+    defer = "place_trees" in inspect.signature(compile_world).parameters
+    world = compile_world(region, cfg, bundle, place_trees=False) if defer else compile_world(region, cfg, bundle)
     t_compile = time.perf_counter() - t
 
     check_times: dict[str, float] = {}
