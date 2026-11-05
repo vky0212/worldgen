@@ -230,9 +230,11 @@ def building_vectors() -> dict[str, Any]:
     wgt = write_container(0, i, j, building_sections(buildings, plans, bounds))
     expected = []
     for b, plan in zip(buildings, plans):
-        inv = _mesh_invariants(building_mesh(b, bc), bounds[0], bounds[1])
+        # Rounded: these sums over mesh triangles may differ in the last bits between platforms.
+        inv = {k: round(v, 6) for k, v in _mesh_invariants(building_mesh(b, bc), bounds[0], bounds[1]).items()}
         expected.append({"id": b.id, "material": BUILDING_MATERIALS.index(building_material(b)),
-                         "roofs": [r.shape for r in plan.roofs], "footprint_area": float(b.geometry.area), **inv})
+                         "roofs": [r.shape for r in plan.roofs], "footprint_area": round(float(b.geometry.area), 6),
+                         **inv})
     return {"schema": "worldgen.conformance.building_tiles", "tile_size": size, "i": i, "j": j,
             "materials": tileset_entry()["materials"], "roof_shapes": ROOF_SHAPES,
             "wgt_base64": base64.b64encode(wgt).decode("ascii"), "expected": expected,

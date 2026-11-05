@@ -74,12 +74,12 @@
    "roofs": [
     "flat"
    ],
-   "footprint_area": 96.00151199999927,
-   "volume": 912.0143639999934,
-   "up_area": 96.00151199999925,
-   "down_area": 96.00151199999925,
+   "footprint_area": 96.001512,
+   "volume": 912.014364,
+   "up_area": 96.001512,
+   "down_area": 96.001512,
    "zmin": 30.77,
-   "zmax": 40.269999999999996
+   "zmax": 40.27
   },
   {
    "id": "building:test:flat_ell",
@@ -101,7 +101,7 @@
     "flat"
    ],
    "footprint_area": 580.0,
-   "volume": 10729.99999999999,
+   "volume": 10730.0,
    "up_area": 580.0,
    "down_area": 580.0,
    "zmin": 29.4,
@@ -127,10 +127,10 @@
    "roofs": [
     "gabled"
    ],
-   "footprint_area": 69.9969200000006,
-   "volume": 524.2530798498793,
-   "up_area": 69.9969200000006,
-   "down_area": 69.9969200000006,
+   "footprint_area": 69.99692,
+   "volume": 524.25308,
+   "up_area": 69.99692,
+   "down_area": 69.99692,
    "zmin": 31.6,
    "zmax": 40.1
   },
@@ -140,12 +140,12 @@
    "roofs": [
     "gabled"
    ],
-   "footprint_area": 239.99590599999956,
-   "volume": 1893.2952941137673,
-   "up_area": 239.99590600150117,
-   "down_area": 239.9959060015012,
+   "footprint_area": 239.995906,
+   "volume": 1893.295294,
+   "up_area": 239.995906,
+   "down_area": 239.995906,
    "zmin": 31.9,
-   "zmax": 42.39999999999999
+   "zmax": 42.4
   },
   {
    "id": "building:test:gabled_given_height",
@@ -154,11 +154,11 @@
     "gabled"
    ],
    "footprint_area": 142.0,
-   "volume": 1418.5115956461916,
-   "up_area": 141.99999999900007,
-   "down_area": 141.99999999900007,
+   "volume": 1418.511596,
+   "up_area": 142.0,
+   "down_area": 142.0,
    "zmin": 30.5,
-   "zmax": 41.99999999999999
+   "zmax": 42.0
   },
   {
    "id": "building:test:skillion_shed",
@@ -166,10 +166,10 @@
    "roofs": [
     "skillion"
    ],
-   "footprint_area": 40.00482000000051,
-   "volume": 171.15118183050876,
-   "up_area": 40.00482000000051,
-   "down_area": 40.00482000000051,
+   "footprint_area": 40.00482,
+   "volume": 171.151182,
+   "up_area": 40.00482,
+   "down_area": 40.00482,
    "zmin": 29.7,
    "zmax": 34.7
   },
@@ -179,10 +179,10 @@
    "roofs": [
     "pyramidal"
    ],
-   "footprint_area": 144.0081800000004,
-   "volume": 2763.593778193201,
-   "up_area": 144.0081800000004,
-   "down_area": 144.0081800000004,
+   "footprint_area": 144.00818,
+   "volume": 2763.593778,
+   "up_area": 144.00818,
+   "down_area": 144.00818,
    "zmin": 35.0,
    "zmax": 56.5
   },
@@ -193,7 +193,7 @@
     "pyramidal"
    ],
    "footprint_area": 112.0,
-   "volume": 891.5647196020363,
+   "volume": 891.56472,
    "up_area": 112.0,
    "down_area": 112.0,
    "zmin": 33.5,
@@ -244,12 +244,12 @@
    "roofs": [
     "gabled"
    ],
-   "footprint_area": 336.01169000000004,
-   "volume": 1680.0584500149046,
-   "up_area": 336.011689999999,
-   "down_area": 336.011689999999,
+   "footprint_area": 336.01169,
+   "volume": 1680.05845,
+   "up_area": 336.01169,
+   "down_area": 336.01169,
    "zmin": 30.1,
-   "zmax": 36.599999999999994
+   "zmax": 36.6
   }
  ],
  "note": "volume and areas: compare within 1e-4 relative; z range within 1e-3 m"

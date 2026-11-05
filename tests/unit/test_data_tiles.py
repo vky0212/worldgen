@@ -52,8 +52,46 @@ def test_grids_round_trip():
     assert np.array_equal(decode_grid(encode_grid(codes), 1), codes)
 
 
+# Vectors whose numbers come from floating-point reductions over meshes (summation order and
+# BLAS kernels differ between platforms): their numbers are compared within a tolerance.
+TOLERANT = {"building_tiles.json": 2e-6}
+
+
+def _differences(a, b, path: str, tol: float, out: list[str]) -> None:  # noqa: ANN001
+    number = (int, float)
+    if isinstance(a, dict) and isinstance(b, dict):
+        for k in sorted(set(a) | set(b)):
+            if k not in a or k not in b:
+                out.append(f"{path}/{k}: only on {'disk' if k in a else 'regeneration'}")
+            else:
+                _differences(a[k], b[k], f"{path}/{k}", tol, out)
+    elif isinstance(a, list) and isinstance(b, list):
+        if len(a) != len(b):
+            out.append(f"{path}: {len(a)} items on disk, {len(b)} regenerated")
+        for k, (x, y) in enumerate(zip(a, b)):
+            _differences(x, y, f"{path}[{k}]", tol, out)
+    elif tol and isinstance(a, number) and isinstance(b, number) and not isinstance(a, bool):
+        if abs(a - b) > tol + 1e-9 * abs(b):
+            out.append(f"{path}: {a!r} on disk, {b!r} regenerated")
+    elif a != b:
+        out.append(f"{path}: {str(a)[:60]!r} on disk, {str(b)[:60]!r} regenerated")
+
+
 def test_conformance_vectors_are_current():
     """tests/conformance is what `python -m worldgen.conformance` writes (the viewer tests read it)."""
     for name, doc in vectors().items():
         on_disk = json.loads((CONFORMANCE / name).read_text(encoding="utf-8"))
-        assert on_disk == json.loads(json.dumps(doc)), f"run: uv run python -m worldgen.conformance ({name})"
+        diffs: list[str] = []
+        _differences(on_disk, json.loads(json.dumps(doc)), "", TOLERANT.get(name, 0.0), diffs)
+        assert not diffs, f"run: uv run python -m worldgen.conformance ({name}): " + "; ".join(diffs[:8])
+
+
+def test_conformance_comparison_reports_differences():
+    diffs: list[str] = []
+    _differences({"a": [1.0, 2.0], "s": "x"}, {"a": [1.0, 2.000001], "s": "x"}, "", 2e-6, diffs)
+    assert diffs == []
+    _differences({"a": [1.0, 2.0], "s": "x"}, {"a": [1.0, 2.1], "s": "y", "n": 1}, "", 2e-6, diffs)
+    assert diffs == ["/a[1]: 2.0 on disk, 2.1 regenerated", "/n: only on regeneration", "/s: 'x' on disk, 'y' regenerated"]
+    exact: list[str] = []
+    _differences({"a": 1.0}, {"a": 1.0000001}, "", 0.0, exact)
+    assert exact == ["/a: '1.0' on disk, '1.0000001' regenerated"]
