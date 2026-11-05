@@ -15,7 +15,10 @@ import numpy as np
 from affine import Affine
 from scipy import ndimage
 
+from worldgen.spatial.windows import box_filter
+
 from worldgen.geometry.mesh import Mesh
+from worldgen.spatial.windows import box_filter
 
 
 @dataclass
@@ -191,7 +194,15 @@ def dsm_to_dtm(z: np.ndarray, mask: np.ndarray, window_cells: int) -> np.ndarray
         return z
     size = window_cells if window_cells % 2 else window_cells + 1
     opened = ndimage.grey_opening(z, size=(size, size))
-    opened = ndimage.uniform_filter(opened, size=max(3, size // 3))
-    weight = ndimage.uniform_filter(mask.astype(float), size=max(3, size // 2))
+    opened = box_filter(opened, max(3, size // 3))
+    weight = box_filter(mask.astype(float), max(3, size // 2))
     out = z * (1.0 - weight) + np.minimum(opened, z) * weight
     return out
+
+
+def dsm_reach(window_cells: int) -> int:
+    """Cells around a node that ``dsm_to_dtm`` reads."""
+    if window_cells < 3:
+        return 0
+    size = window_cells if window_cells % 2 else window_cells + 1
+    return 2 * (size // 2) + max(3, size // 3) // 2 + 1

@@ -44,6 +44,7 @@ from worldgen.config import SmoothingConfig
 from worldgen.landcover.landcover import CODE_COLORS
 from worldgen.noise import _lattice, value_noise, warp_offsets  # noqa: F401  (re-exported)
 from worldgen.terrain.build import carve_polygons, rasterize_mask
+from worldgen.spatial.windows import gauss_radius, grid_windows
 from worldgen.terrain.heightfield import Heightfield
 from worldgen.vegetation.classify import CAT, TREE_CATEGORIES, VegetationGrid, _rasterize
 
@@ -116,31 +117,11 @@ MAX_FILL_M = 64.0
 WINDOW_NODES = 512
 
 
-def _gauss_radius(sigma: float) -> int:
-    """Support radius (cells) of scipy's gaussian_filter (truncate 4)."""
-    return int(4.0 * sigma + 0.5) if sigma >= 0.3 else 0
-
-
 def _class_reach(res: float, sigma_m: float, cfg: SmoothingConfig) -> int:
     """Cells around a node that its smoothed class (and a changed cell's donor) depends on."""
     warp = int(np.ceil(cfg.warp_amplitude_m / res)) + 1 if cfg.warp_amplitude_m > 0 else 0
-    reach = _gauss_radius(sigma_m / res) + warp + 1
+    reach = gauss_radius(sigma_m / res) + warp + 1
     return max(int(np.ceil(reach * 1.5)), int(np.ceil(MAX_FILL_M / res))) + 1
-
-
-def _windows(shape: tuple[int, int], size: int, halo: int, align: int = 1):
-    """(window, core within the window, core) slices of square cores of ``size`` nodes with
-    ``halo`` nodes around them (clipped at the grid); window edges are multiples of ``align``."""
-    rows, cols = shape
-    size = max(align, size // align * align)
-    halo = -(-halo // align) * align
-    for r0 in range(0, rows, size):
-        for c0 in range(0, cols, size):
-            r1, c1 = min(r0 + size, rows), min(c0 + size, cols)
-            R0, C0 = max(r0 - halo, 0), max(c0 - halo, 0)
-            R1, C1 = min(r1 + halo, rows), min(c1 + halo, cols)
-            yield ((slice(R0, R1), slice(C0, C1)), (slice(r0 - R0, r1 - R0), slice(c0 - C0, c1 - C0)),
-                   (slice(r0, r1), slice(c0, c1)))
 
 
 def _nearest(mask: np.ndarray, sel: np.ndarray, max_cells: float | None = None) -> tuple[np.ndarray, ...]:
@@ -290,7 +271,7 @@ def smooth_landcover(codes: np.ndarray, hf: Heightfield, water_areas: list[BaseG
     land = ~water & ~fill
     target = land | fill
     new = codes.copy()
-    for win, core_w, core in _windows(codes.shape, window, _class_reach(res, cfg.border_radius_m, cfg)):
+    for win, core_w, core in grid_windows(codes.shape, window, _class_reach(res, cfg.border_radius_m, cfg)):
         warp = _grid_warp(hf.xmin, hf.ymin, res, codes.shape, False, cfg, seed, *win)
         out, _ = smooth_classes(codes[win], land[win], target[win], res, cfg.border_radius_m, warp)
         new[core] = out[core_w]
@@ -298,9 +279,9 @@ def smooth_landcover(codes: np.ndarray, hf: Heightfield, water_areas: list[BaseG
 
     sigma = cfg.blend_width_m / 4.0 / res
     # Bank colours blur the blended land colours: the two reaches add up.
-    halo = max(_gauss_radius(sigma) + _gauss_radius(max(2.0, sigma)), 4) + 1
+    halo = max(gauss_radius(sigma) + gauss_radius(max(2.0, sigma)), 4) + 1
     rgba = np.empty(codes.shape + (4,), dtype=np.float32)
-    for win, core_w, core in _windows(codes.shape, window, halo):
+    for win, core_w, core in grid_windows(codes.shape, window, halo):
         rgba[core] = _colors(new[win], res, sigma)[core_w]
     return SmoothedLandcover(new, rgba, stats)
 
@@ -365,7 +346,7 @@ def refine_vegetation(grid: VegetationGrid, water_areas: list[BaseGeometry], cfg
     for name in VEGETATION_CHANNELS:
         out[name] = np.empty(shape, dtype=getattr(grid, name).dtype)
     changed_total = 0
-    for win, core_w, core in _windows(shape, window, _class_reach(res, cfg.border_radius_m, cfg), align=f):
+    for win, core_w, core in grid_windows(shape, window, _class_reach(res, cfg.border_radius_m, cfg), align=f):
         cwin = (slice(win[0].start // f, -(-win[0].stop // f)), slice(win[1].start // f, -(-win[1].stop // f)))
         cat0 = up(grid.category[cwin])
         water_w = water[win]

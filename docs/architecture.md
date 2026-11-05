@@ -51,7 +51,12 @@ compiler.
 3. **Terrain** (`terrain.build`). The DEM is sampled at every node of a grid in
    the local frame, smoothed to the DEM's native scale, corrected from surface
    model to approximate bare earth in built-up/tree cells, and optionally
-   converted between vertical datums.
+   converted between vertical datums. DEM nodata is filled on the DEM's own grid
+   (nearest valid pixel) and sampling clamps at the raster edge, so every node
+   is computed from its neighbourhood alone; the grid is built in windows of
+   512 nodes plus the filters' halo (`spatial.windows`: exact stencils such as
+   `box_filter` instead of running-sum `uniform_filter`), with the same heights
+   for any window size (`tests/unit/test_terrain_windows.py`).
 4. **Topology** (`topology.graph`). Graph nodes are shared source node ids,
    endpoints, boundary cuts and restriction via nodes. Turn restrictions are
    resolved onto edges. `topology.crossings` finds 2D crossings without a
