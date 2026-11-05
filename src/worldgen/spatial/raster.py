@@ -30,14 +30,18 @@ class GeoRaster:
         return self.data.shape  # type: ignore[return-value]
 
     def valid_mask(self) -> np.ndarray:
+        return self._valid(self.data)
+
+    def _valid(self, v: np.ndarray) -> np.ndarray:
+        """Which of the values ``v`` (taken from ``data``) are valid data."""
         if np.issubdtype(self.data.dtype, np.floating):
-            m = np.isfinite(self.data)
+            m = np.isfinite(v)
             if self.nodata is not None and not np.isnan(self.nodata):
-                m &= self.data != self.nodata
+                m &= v != self.nodata
             return m
         if self.nodata is None:
-            return np.ones(self.data.shape, dtype=bool)
-        return self.data != self.nodata
+            return np.ones(v.shape, dtype=bool)
+        return v != self.nodata
 
     def _pixel_coords(self, xs: np.ndarray, ys: np.ndarray, src_crs: CRS | None) -> tuple[np.ndarray, np.ndarray]:
         if src_crs is not None and not CRS.from_user_input(src_crs).equals(self.crs):
@@ -58,9 +62,12 @@ class GeoRaster:
         cols = cols - 0.5
         rows = rows - 0.5
         h, w = self.data.shape
-        data = self.data.astype(np.float64)
-        valid = self.valid_mask()
-        data = np.where(valid, data, np.nan)
+
+        def at(r: np.ndarray, c: np.ndarray) -> np.ndarray:
+            # Only the pixels read are converted and checked (not the whole raster per call).
+            v = self.data[r, c]
+            return np.where(self._valid(v), v.astype(np.float64), np.nan)
+
         c0 = np.floor(cols).astype(np.int64)
         r0 = np.floor(rows).astype(np.int64)
         fc = cols - c0
@@ -69,10 +76,10 @@ class GeoRaster:
         c1c = np.clip(c0 + 1, 0, w - 1)
         r0c = np.clip(r0, 0, h - 1)
         r1c = np.clip(r0 + 1, 0, h - 1)
-        v00 = data[r0c, c0c]
-        v01 = data[r0c, c1c]
-        v10 = data[r1c, c0c]
-        v11 = data[r1c, c1c]
+        v00 = at(r0c, c0c)
+        v01 = at(r0c, c1c)
+        v10 = at(r1c, c0c)
+        v11 = at(r1c, c1c)
         out = (v00 * (1 - fc) * (1 - fr) + v01 * fc * (1 - fr) + v10 * (1 - fc) * fr + v11 * fc * fr)
         outside = (cols < -0.5) | (rows < -0.5) | (cols > w - 0.5) | (rows > h - 0.5)
         out = np.where(outside, np.nan, out)

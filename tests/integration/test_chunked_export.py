@@ -14,14 +14,14 @@ from worldgen.config import load_config
 
 pytestmark = pytest.mark.slow
 
-# (export.chunk_tiles, export.workers): the whole world in this process, one tile per chunk,
+# (export.chunk_tiles, parallel.workers): the whole world in this process, one tile per chunk,
 # squares straddling the fixture's tiles, and chunks spread over two worker processes.
 CASES = [(0, 1), (1, 1), (3, 1), (2, 2)]
 
 
 def _build(out: Path, mode: str, chunk: int, workers: int, cap: int):  # noqa: ANN202
     cfg = load_config("basic", overrides=[f"export.mode={mode}", f"export.chunk_tiles={chunk}",
-                                          f"export.workers={workers}", f"vegetation.budget.max_total={cap}"],
+                                          f"parallel.workers={workers}", f"vegetation.budget.max_total={cap}"],
                       region=fixture_region("demo_town"))
     return build(cfg, BuildOptions(out, fixture="demo_town"))
 

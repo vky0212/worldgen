@@ -16,11 +16,11 @@ from typing import Any
 import numpy as np
 from rasterio.transform import Affine
 
-from worldgen import SCHEMA_VERSION, __version__
+from worldgen import SCHEMA_VERSION, __version__, parallel
 from worldgen.config import WorldConfig
 from worldgen.errors import ValidationFailed
 from worldgen.budget import key_floor
-from worldgen.export.chunked import ChunkMerger, ChunkRunner, ExportPlan, _tob_ids, export_workers
+from worldgen.export.chunked import ChunkMerger, ChunkRunner, ExportPlan, _tob_ids
 from worldgen.export.container import read_container
 from worldgen.export.footprints import tileset_entry as buildings_tileset_entry
 from worldgen.export.graphcore import graph_files
@@ -86,6 +86,11 @@ def fixture_region(name: str) -> dict[str, Any]:
     return {"center_lat": ORIGIN.lat, "center_lon": ORIGIN.lon, "radius_m": fx.radius_m, "name": f"fixture:{name}"}
 
 
+def build_pool(cfg: WorldConfig, region: Region, output: Path) -> parallel.Pool:
+    """The worker pool of a build of ``region`` (``parallel.workers``; work folder in the output)."""
+    return parallel.Pool(parallel.pool_workers(cfg.parallel.workers, len(region.tiles())), output / ".work")
+
+
 def build(cfg: WorldConfig, opts: BuildOptions) -> BuildResult:
     t0 = time.perf_counter()
     region = Region.from_config(cfg)
@@ -93,25 +98,31 @@ def build(cfg: WorldConfig, opts: BuildOptions) -> BuildResult:
     progress = current()
     if progress.enabled:
         progress.plan(**plan_payload(region, cfg))
-    with stage("acquire", timings):
-        if opts.fixture:
-            fx = load_fixture(opts.fixture, region.center, cfg.projection.method)
-            bundle = bundle_from_fixture(fx)
-            if not any(r.name == "imagery" for r in bundle.records):
-                im = cfg.sources.imagery
-                bundle.records.append(SourceRecord(
-                    "imagery", "synthetic", "-", "-", status="missing" if im.enabled else "disabled",
-                    notes=["synthetic fixtures carry no imagery"] if im.enabled else []))
-            for rec in bundle.records:
-                progress.source(rec.name, rec.status, "synthetic fixture")
-        else:
-            bundle = acquire(region, cfg, opts.cache_dir, offline=opts.offline)
-    world = compile_world(region, cfg, bundle, place_trees=False)
-    world.timings = {**timings, **world.timings}
-    with stage("validate", world.timings):
-        report = validate_world(world) if cfg.validation.enabled else Report()
-    with stage("export", world.timings):
-        written, skipped = export_world(world, report, opts)
+    # One pool of worker processes for the whole build (parallel.py): the windowed compile
+    # stages and the export chunks run in it. It starts now, so the workers import their
+    # libraries while the sources load.
+    with build_pool(cfg, region, opts.output) as pool:
+        with stage("acquire", timings):
+            if opts.fixture:
+                fx = load_fixture(opts.fixture, region.center, cfg.projection.method)
+                bundle = bundle_from_fixture(fx)
+                if not any(r.name == "imagery" for r in bundle.records):
+                    im = cfg.sources.imagery
+                    bundle.records.append(SourceRecord(
+                        "imagery", "synthetic", "-", "-", status="missing" if im.enabled else "disabled",
+                        notes=["synthetic fixtures carry no imagery"] if im.enabled else []))
+                for rec in bundle.records:
+                    progress.source(rec.name, rec.status, "synthetic fixture")
+            else:
+                bundle = acquire(region, cfg, opts.cache_dir, offline=opts.offline)
+        world = compile_world(region, cfg, bundle, place_trees=False)
+        world.timings = {**timings, **world.timings}
+        with stage("validate", world.timings):
+            report = validate_world(world) if cfg.validation.enabled else Report()
+        with stage("export", world.timings):
+            written, skipped = export_world(world, report, opts)
+        if pool.workers > 1:
+            world.stats["workers"] = pool.stats()
     with stage("manifest", world.timings):
         manifest = write_manifest(world, report, opts, time.perf_counter() - t0)
     errors = manifest["validation"]["errors"]
@@ -167,8 +178,7 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
     plan = ExportPlan(out, mode, prev_tiles, opts.force, opts.only_tiles, opts.keep_trees)
     merger = ChunkMerger(world, report, plan, len(tiles))
     budget = cfg.vegetation.budget
-    workers = export_workers(cfg.export.workers, len(tiles), len(chunks))
-    with ChunkRunner(world, plan, workers, len(chunks)) as runner:
+    with ChunkRunner(world, plan, len(chunks)) as runner:
         # A world-wide tree budget over several chunks: a first pass gathers the keys of the
         # trees each chunk's per-tile budget keeps, and the export keeps those at or above the
         # max_total-th largest key (budget.key_floor) - the trees a whole-world pass keeps.
@@ -179,9 +189,6 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
             floor = key_floor(np.concatenate(keys) if keys else np.zeros(0), budget.max_total)
         for result in runner.export(chunks, floor, whole):
             merger.merge(result)
-    if runner.workers > 1:
-        world.stats["export_workers"] = {"processes": runner.workers, "chunks": len(chunks),
-                                         "worker_peak_mb": round(merger.worker_peak_mb or 0.0, 1)}
     if world.trees_deferred:
         world.trees = merger.finish()
     hashes, built, tile_entities = merger.hashes, merger.built, merger.tile_entities

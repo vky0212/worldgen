@@ -40,11 +40,12 @@ from scipy import ndimage
 from shapely.geometry.base import BaseGeometry
 from shapely.strtree import STRtree
 
+from worldgen import parallel
 from worldgen.config import SmoothingConfig
 from worldgen.landcover.landcover import CODE_COLORS
 from worldgen.noise import _lattice, value_noise, warp_offsets  # noqa: F401  (re-exported)
 from worldgen.terrain.build import carve_polygons, rasterize_mask
-from worldgen.spatial.windows import gauss_radius, grid_windows
+from worldgen.spatial.windows import Slices, gauss_radius, grid_windows, map_windows, window_nodes
 from worldgen.terrain.heightfield import Heightfield
 from worldgen.vegetation.classify import CAT, TREE_CATEGORIES, VegetationGrid, _rasterize
 
@@ -113,7 +114,7 @@ def _grid_warp(xmin: float, ymin: float, res: float, shape: tuple[int, int], cen
 # Nodes no participating node reaches (no smoothed membership) take the class of the nearest
 # participating node up to this far; farther ones keep their own class.
 MAX_FILL_M = 64.0
-# Nodes per side of the windows the smoothing works in (memory follows the window).
+# Nodes per side of the windows the shore blur works in (memory follows the window).
 WINDOW_NODES = 512
 
 
@@ -242,7 +243,7 @@ def _within(mask: np.ndarray, radius_cells: float) -> np.ndarray:
 
 def smooth_landcover(codes: np.ndarray, hf: Heightfield, water_areas: list[BaseGeometry],
                      waterways: list[BaseGeometry], cfg: SmoothingConfig, seed: int,
-                     window: int = WINDOW_NODES) -> SmoothedLandcover:
+                     window: int | None = None) -> SmoothedLandcover:
     """Smooth land-cover borders on the terrain grid and blend the terrain colours.
 
     ``water_areas`` are the mapped water polygons (they decide water exactly);
@@ -270,20 +271,50 @@ def smooth_landcover(codes: np.ndarray, hf: Heightfield, water_areas: list[BaseG
             water &= ~fill
     land = ~water & ~fill
     target = land | fill
-    new = codes.copy()
-    for win, core_w, core in grid_windows(codes.shape, window, _class_reach(res, cfg.border_radius_m, cfg)):
-        warp = _grid_warp(hf.xmin, hf.ymin, res, codes.shape, False, cfg, seed, *win)
-        out, _ = smooth_classes(codes[win], land[win], target[win], res, cfg.border_radius_m, warp)
-        new[core] = out[core_w]
+    window = window or window_nodes()
+    new = np.empty_like(codes)
+    ctx = _ClassWindows(codes, land, target, hf.xmin, hf.ymin, res, cfg, seed)
+    del land, target
+    for core, out in map_windows(_class_window, ctx, codes.shape, window,
+                                 _class_reach(res, cfg.border_radius_m, cfg)):
+        new[core] = out
+    del ctx
     stats = {"landcover_nodes_changed": int((new != codes).sum()), "water_mismatch_nodes": int(fill.sum())}
 
     sigma = cfg.blend_width_m / 4.0 / res
     # Bank colours blur the blended land colours: the two reaches add up.
     halo = max(gauss_radius(sigma) + gauss_radius(max(2.0, sigma)), 4) + 1
     rgba = np.empty(codes.shape + (4,), dtype=np.float32)
-    for win, core_w, core in grid_windows(codes.shape, window, halo):
-        rgba[core] = _colors(new[win], res, sigma)[core_w]
+    for core, out in map_windows(_color_window, (new, res, sigma), codes.shape, window, halo):
+        rgba[core] = out
     return SmoothedLandcover(new, rgba, stats)
+
+
+@dataclass
+class _ClassWindows:
+    """What every window of the land-cover class smoothing reads (picklable)."""
+
+    codes: np.ndarray
+    land: np.ndarray
+    target: np.ndarray
+    xmin: float
+    ymin: float
+    res: float
+    cfg: SmoothingConfig
+    seed: int
+
+
+def _class_window(ctx: _ClassWindows, item: tuple[Slices, Slices]) -> np.ndarray:
+    win, core_w = item
+    warp = _grid_warp(ctx.xmin, ctx.ymin, ctx.res, ctx.codes.shape, False, ctx.cfg, ctx.seed, *win)
+    out, _ = smooth_classes(ctx.codes[win], ctx.land[win], ctx.target[win], ctx.res, ctx.cfg.border_radius_m, warp)
+    return out[core_w]
+
+
+def _color_window(ctx: tuple[np.ndarray, float, float], item: tuple[Slices, Slices]) -> np.ndarray:
+    new, res, sigma = ctx
+    win, core_w = item
+    return _colors(new[win], res, sigma)[core_w]
 
 
 def _colors(new: np.ndarray, res: float, sigma: float) -> np.ndarray:
@@ -322,7 +353,7 @@ VEGETATION_CHANNELS = ("source", "canopy_height", "canopy_observed", "coverage",
 
 
 def refine_vegetation(grid: VegetationGrid, water_areas: list[BaseGeometry], cfg: SmoothingConfig, seed: int,
-                      window: int = WINDOW_NODES) -> VegetationGrid:
+                      window: int | None = None) -> VegetationGrid:
     """Refined vegetation grid with smooth, irregular category borders and thinned forest edges.
 
     Cells keep the channels (canopy height, coverage, source, ...) of their coarse cell; a
@@ -332,57 +363,87 @@ def refine_vegetation(grid: VegetationGrid, water_areas: list[BaseGeometry], cfg
     """
     f = max(1, int(cfg.vegetation_upsample))
     res = grid.resolution / f
-
-    def up(a: np.ndarray) -> np.ndarray:
-        return np.repeat(np.repeat(a, f, axis=0), f, axis=1) if f > 1 else a.copy()
-
     shape = (grid.shape[0] * f, grid.shape[1] * f)
     water = _rasterize(shape, Affine(res, 0.0, grid.xmin, 0.0, res, grid.ymin), water_areas)
     # Coarse cells cleared because their centre was in water: their fine cells off the water
     # take the vegetation around them.
     coarse_water = _rasterize(grid.shape, grid.transform(), water_areas)
-    tree_codes = {CAT[c] for c in TREE_CATEGORIES}
+    ctx = _VegetationWindows({name: getattr(grid, name) for name in ("category",) + VEGETATION_CHANNELS},
+                             water, coarse_water, f, grid.xmin, grid.ymin, res, cfg, seed)
     out = {"category": np.empty(shape, dtype=np.uint8)}
     for name in VEGETATION_CHANNELS:
         out[name] = np.empty(shape, dtype=getattr(grid, name).dtype)
     changed_total = 0
-    for win, core_w, core in grid_windows(shape, window, _class_reach(res, cfg.border_radius_m, cfg), align=f):
-        cwin = (slice(win[0].start // f, -(-win[0].stop // f)), slice(win[1].start // f, -(-win[1].stop // f)))
-        cat0 = up(grid.category[cwin])
-        water_w = water[win]
-        fill = up(coarse_water[cwin]) & ~water_w
-        participate = ~water_w & ~fill
-        warp = _grid_warp(grid.xmin, grid.ymin, res, shape, True, cfg, seed, *win)
-        cat, m_tree = smooth_classes(cat0, participate, participate | fill, res, cfg.border_radius_m, warp,
-                                     track=tree_codes)
-        chans = {name: up(getattr(grid, name)[cwin]) for name in VEGETATION_CHANNELS}
-        # Cells the smoothing moved to another category take that category's channels from its
-        # nearest cell (within the smoothing's reach); cells on water become "none" and keep
-        # their own channels.
-        moved = (cat != cat0) & ~water_w
-        pristine = {k: v.copy() for k, v in chans.items()} if moved.any() else chans
-        for c in np.unique(cat[moved]):
-            ir, ic, sr, sc = _nearest((cat0 == c) & participate, moved & (cat == c))
-            for k, a in chans.items():
-                a[sr, sc] = pristine[k][ir, ic]
-        cat[water_w] = 0
-        changed = cat != cat0
-        if changed.any():
-            none = changed & (cat == 0)
-            chans["canopy_height"][none] = 0.0
-            chans["coverage"][none] = 0.0
-        if m_tree is not None and cfg.forest_edge_thinning > 0:
-            trees = np.isin(cat, list(tree_codes))
-            keep = 1.0 - cfg.forest_edge_thinning * (1.0 - _smoothstep((m_tree - 0.5) / 0.4))
-            chans["coverage"] = np.where(trees, chans["coverage"] * keep, chans["coverage"]).astype(np.float32)
-        out["category"][core] = cat[core_w]
-        for name in VEGETATION_CHANNELS:
-            out[name][core] = chans[name][core_w]
-        changed_total += int(changed[core_w].sum())
+    for core, (chans, changed) in map_windows(_vegetation_window, ctx, shape, window or window_nodes(),
+                                              _class_reach(res, cfg.border_radius_m, cfg), align=f):
+        for name, a in chans.items():
+            out[name][core] = a
+        changed_total += changed
+    del ctx, water, coarse_water
     meta = dict(grid.meta)
     meta["smoothing"] = {"upsample": f, "source_resolution": grid.resolution,
                          "cells_changed": changed_total, "border_radius_m": cfg.border_radius_m}
     return replace(grid, resolution=res, meta=meta, **out)
+
+
+@dataclass
+class _VegetationWindows:
+    """What every window of ``refine_vegetation`` reads (picklable)."""
+
+    coarse: dict[str, np.ndarray]        # the coarse grid's category and channels
+    water: np.ndarray                    # fine cells on mapped water
+    coarse_water: np.ndarray             # coarse cells whose centre is on mapped water
+    f: int
+    xmin: float
+    ymin: float
+    res: float
+    cfg: SmoothingConfig
+    seed: int
+
+
+def _vegetation_window(ctx: _VegetationWindows, item: tuple[Slices, Slices]
+                       ) -> tuple[dict[str, np.ndarray], int]:
+    """The refined category and channels of a window's core, and its changed cells."""
+    win, core_w = item
+    f, cfg = ctx.f, ctx.cfg
+
+    def up(a: np.ndarray) -> np.ndarray:
+        return np.repeat(np.repeat(a, f, axis=0), f, axis=1) if f > 1 else a.copy()
+
+    tree_codes = {CAT[c] for c in TREE_CATEGORIES}
+    shape = ctx.water.shape
+    cwin = (slice(win[0].start // f, -(-win[0].stop // f)), slice(win[1].start // f, -(-win[1].stop // f)))
+    cat0 = up(ctx.coarse["category"][cwin])
+    water_w = ctx.water[win]
+    fill = up(ctx.coarse_water[cwin]) & ~water_w
+    participate = ~water_w & ~fill
+    warp = _grid_warp(ctx.xmin, ctx.ymin, ctx.res, shape, True, cfg, ctx.seed, *win)
+    cat, m_tree = smooth_classes(cat0, participate, participate | fill, ctx.res, cfg.border_radius_m, warp,
+                                 track=tree_codes)
+    chans = {name: up(ctx.coarse[name][cwin]) for name in VEGETATION_CHANNELS}
+    # Cells the smoothing moved to another category take that category's channels from its
+    # nearest cell (within the smoothing's reach); cells on water become "none" and keep
+    # their own channels.
+    moved = (cat != cat0) & ~water_w
+    pristine = {k: v.copy() for k, v in chans.items()} if moved.any() else chans
+    for c in np.unique(cat[moved]):
+        ir, ic, sr, sc = _nearest((cat0 == c) & participate, moved & (cat == c))
+        for k, a in chans.items():
+            a[sr, sc] = pristine[k][ir, ic]
+    cat[water_w] = 0
+    changed = cat != cat0
+    if changed.any():
+        none = changed & (cat == 0)
+        chans["canopy_height"][none] = 0.0
+        chans["coverage"][none] = 0.0
+    if m_tree is not None and cfg.forest_edge_thinning > 0:
+        trees = np.isin(cat, list(tree_codes))
+        keep = 1.0 - cfg.forest_edge_thinning * (1.0 - _smoothstep((m_tree - 0.5) / 0.4))
+        chans["coverage"] = np.where(trees, chans["coverage"] * keep, chans["coverage"]).astype(np.float32)
+    core = {"category": cat[core_w]}
+    for name in VEGETATION_CHANNELS:
+        core[name] = chans[name][core_w]
+    return core, int(changed[core_w].sum())
 
 
 # --------------------------------------------------------------------------------------
@@ -486,20 +547,22 @@ def shape_shorelines(hf: Heightfield, items: list[tuple[BaseGeometry, float, flo
         return int((hf.z != z0).sum())
     px = hf.xmin + cc * r
     py = hf.ymin + rr * r
-    pts = shapely.points(px, py)
-    (pi, si), dist = STRtree(shapely.linestrings(segs)).query_nearest(
-        pts, max_distance=reach + 2.0 * r, return_distance=True, all_matches=False)
+    # Distance to the outline and the nearest (containing) water area of every node, by the
+    # build's worker processes when there are any (each node's answer is its own).
     d = np.full(len(px), reach + r)
-    d[pi] = dist
+    k = np.zeros(len(px), dtype=np.int64)
+    near = parallel.tasks(_shore_nearest, (segs, geoms, reach + 2.0 * r),
+                          [(a, px[a:b], py[a:b]) for a, b in parallel.spans(len(px), SHORE_BATCH)],
+                          init=_shore_trees)
+    for pi, dist, qi, ai in near:
+        d[pi] = dist
+        k[qi] = ai
     d = np.minimum(d, reach + r)
     # Nodes on an outline count as water (the rasteriser keeps only some of them), so the
     # outer node row of a sea cut by the region edge is carved too.
     wet = shapely.intersects_xy(union, px, py)
     sd = np.where(wet, -d, d)
     # Surface and bed of the nearest (containing) water area.
-    (qi, ai) = STRtree(geoms).query_nearest(pts, all_matches=False)
-    k = np.zeros(len(px), dtype=np.int64)
-    k[qi] = ai
     surf = np.array([s for _, s, _ in items])[k]
     bed = np.array([b for _, _, b in items])[k]
 
@@ -525,3 +588,24 @@ def shape_shorelines(hf: Heightfield, items: list[tuple[BaseGeometry, float, flo
     out[m] = (lin * (1.0 - t) + zo * t)[m]
     hf.z[rr, cc] = out
     return int((hf.z != z0).sum())
+
+
+# Shore nodes per nearest-outline query batch, at least (batches spread over the workers).
+SHORE_BATCH = 4096
+
+
+def _shore_trees(ctx: tuple[np.ndarray, list[BaseGeometry], float]) -> tuple[STRtree, STRtree, float]:
+    segs, geoms, max_distance = ctx
+    return STRtree(shapely.linestrings(segs)), STRtree(geoms), max_distance
+
+
+def _shore_nearest(trees: tuple[STRtree, STRtree, float], item: tuple[int, np.ndarray, np.ndarray]
+                   ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """For the nodes of a batch: (node, distance) to the nearest outline segment within reach,
+    and (node, index) of the nearest water area."""
+    seg_tree, area_tree, max_distance = trees
+    start, px, py = item
+    pts = shapely.points(px, py)
+    (pi, _), dist = seg_tree.query_nearest(pts, max_distance=max_distance, return_distance=True, all_matches=False)
+    qi, ai = area_tree.query_nearest(pts, all_matches=False)
+    return pi + start, dist, qi + start, ai

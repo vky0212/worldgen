@@ -181,6 +181,11 @@ def _output_sizes(out: Path) -> dict[str, int]:
 def measure(args: argparse.Namespace) -> dict[str, Any]:
     from worldgen import pipeline
     from worldgen.build import BuildOptions, export_world, fixture_region
+
+    try:
+        from worldgen.build import build_pool
+    except ImportError:  # a checkout before the build-wide worker pool
+        build_pool = None
     from worldgen.config import WorldConfig, deep_merge, from_dict, load_config, parse_override
     from worldgen.pipeline import acquire, bundle_from_fixture, compile_world
     from worldgen.sources.synthetic import load_fixture
@@ -219,48 +224,56 @@ def measure(args: argparse.Namespace) -> dict[str, Any]:
     x0, y0, x1, y1 = region.extent
     km2 = (x1 - x0) * (y1 - y0) / 1e6
 
-    t = time.perf_counter()
-    # As `worldgen build` compiles: trees deferred to the chunked export where supported (a
-    # baseline checkout without chunked export places them during compile).
-    defer = "place_trees" in inspect.signature(compile_world).parameters
-    world = compile_world(region, cfg, bundle, place_trees=False) if defer else compile_world(region, cfg, bundle)
-    t_compile = time.perf_counter() - t
-
-    check_times: dict[str, float] = {}
-    run = checks.Report.run
-
-    def timed_run(self, name, fn, details=None):  # noqa: ANN001, ANN202
-        t0 = time.perf_counter()
-        run(self, name, fn, details)
-        check_times[name] = round(time.perf_counter() - t0, 3)
-
-    checks.Report.run = timed_run
-    peaks.enter("validate")
-    try:
-        t = time.perf_counter()
-        report = checks.validate_world(world)
-        t_validate = time.perf_counter() - t
-    finally:
-        checks.Report.run = run
-
-    peaks.enter("export")
+    if args.keep:
+        out = Path(args.keep)
+        if out.exists() and any(out.iterdir()):
+            raise SystemExit(f"--keep directory {out} is not empty; choose a new or empty directory")
+    else:
+        out = Path(tempfile.mkdtemp(prefix="scale_bench_"))
     t_export = None
     sizes: dict[str, int] = {}
-    if not args.no_export:
-        if args.keep:
-            out = Path(args.keep)
-            if out.exists() and any(out.iterdir()):
-                raise SystemExit(f"--keep directory {out} is not empty; choose a new or empty directory")
-        else:
-            out = Path(tempfile.mkdtemp(prefix="scale_bench_"))
-        try:
+    workers = None
+    check_times: dict[str, float] = {}
+    run = checks.Report.run
+    # As `worldgen build` runs: in the build's worker pool where supported (a baseline checkout
+    # without one runs in this process).
+    pool_cm = build_pool(cfg, region, out) if build_pool is not None else contextlib.nullcontext()
+    try:
+        with pool_cm as pool:
             t = time.perf_counter()
-            export_world(world, report, BuildOptions(output=out, force=True))
-            t_export = time.perf_counter() - t
-            sizes = _output_sizes(out)
-        finally:
-            if not args.keep:
-                shutil.rmtree(out, ignore_errors=True)
+            # As `worldgen build` compiles: trees deferred to the chunked export where supported (a
+            # baseline checkout without chunked export places them during compile).
+            defer = "place_trees" in inspect.signature(compile_world).parameters
+            world = compile_world(region, cfg, bundle, place_trees=False) if defer else compile_world(region, cfg, bundle)
+            t_compile = time.perf_counter() - t
+
+            def timed_run(self, name, fn, details=None):  # noqa: ANN001, ANN202
+                t0 = time.perf_counter()
+                run(self, name, fn, details)
+                check_times[name] = round(time.perf_counter() - t0, 3)
+
+            checks.Report.run = timed_run
+            peaks.enter("validate")
+            try:
+                t = time.perf_counter()
+                report = checks.validate_world(world)
+                t_validate = time.perf_counter() - t
+            finally:
+                checks.Report.run = run
+
+            peaks.enter("export")
+            if not args.no_export:
+                t = time.perf_counter()
+                export_world(world, report, BuildOptions(output=out, force=True))
+                t_export = time.perf_counter() - t
+            if pool is not None and pool.workers > 1:
+                workers = pool.stats()
+        if not args.no_export:
+            sizes = _output_sizes(out)      # after the pool removed its work folder
+    finally:
+        if not args.keep:
+            shutil.rmtree(out, ignore_errors=True)
+    workers = workers or world.stats.get("export_workers")
 
     stage_peaks = peaks.stop()
     tr = world.trees
@@ -278,7 +291,7 @@ def measure(args: argparse.Namespace) -> dict[str, Any]:
         "peak_mb": None if (p := peak_rss_mb()) is None else round(p, 1),
         # Working set sampled during each stage ("setup" = loading sources and config).
         "stage_peak_mb": stage_peaks,
-        "export_workers": world.stats.get("export_workers"),
+        "workers": workers,
         "output_bytes": sizes,
         "counts": {"trees": len(tr), "trees_rendered": int(tr.rendered_mask().sum()) if len(tr) else 0,
                    "buildings": len(world.buildings), "graph_edges": len(world.graph.edges),
@@ -319,8 +332,8 @@ def _row(r: dict[str, Any], base: dict[str, Any] | None) -> str:
     if r.get("stage_peak_mb"):
         stage, mb = max(r["stage_peak_mb"].items(), key=lambda kv: kv[1])
         line += f"   peak in {stage}"
-    if r.get("export_workers"):
-        ew = r["export_workers"]
+    ew = r.get("workers") or r.get("export_workers")
+    if ew:
         line += f"   + {ew['processes']} workers <= {ew['worker_peak_mb']:.0f} MB each"
     if base is not None:
         line += f"   [x{_work_s(base) / max(work, 1e-9):.2f} vs baseline]"

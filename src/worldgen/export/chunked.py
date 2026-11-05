@@ -1,35 +1,29 @@
-"""Tile export chunk by chunk, in this process or in worker processes.
+"""Tile export chunk by chunk, in this process or in the build's worker processes.
 
 The export walks squares of ``export.chunk_tiles`` tiles (``tiles.tile_chunks``). For each
 chunk, ``ChunkExporter.run`` places the chunk's deferred trees, hashes its tiles, writes the
 dirty ones and returns a ``ChunkResult``: tile states, locator ids and the chunk's tree
 outputs (validation issues, the trees.parquet rows, per-tree field contributions, counts).
 ``ChunkMerger`` applies results strictly in chunk order, so every output is the same
-whether chunks ran here or in ``export.workers`` processes, in whatever order they finished.
+whether chunks ran here or in ``parallel.workers`` processes, in whatever order they finished.
 
-Workers (spawned processes) get the compiled world through a snapshot written once to
-``<output>/.work``: one pickle in which every large numeric array is a separate ``.npy`` file
-that workers map read-only (``np.load(mmap_mode="r")``), so grids are shared through the OS
-page cache instead of being copied into every process. Tile files are written by the
-workers directly to their final paths.
+Workers (the build's ``parallel.Pool``) get the compiled world through one snapshot, in
+which large arrays are memory-mapped files shared through the OS page cache, and build the
+world-level indexes once each. Tile files are written by the workers directly to their
+final paths.
 """
 
 from __future__ import annotations
 
 import json
-import multiprocessing
-import os
-import pickle
-import shutil
 from collections.abc import Iterator
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-import shapely
 
+from worldgen import parallel
 from worldgen.buildings.buildings import building_plan
 from worldgen.export.container import write_container
 from worldgen.export.footprints import building_sections
@@ -53,7 +47,6 @@ from worldgen.export.tiles import (
 from worldgen.export.tileset import tile_paths
 from worldgen.export.vectors import TreesParquetWriter
 from worldgen.log import get_logger
-from worldgen.memory import peak_rss_mb
 from worldgen.pipeline import apply_tree_budget, place_vegetation, vegetation_exclusions
 from worldgen.progress import current
 from worldgen.tiling.grid import TileGrid, parse_tile_id
@@ -66,10 +59,6 @@ log = get_logger("export")
 
 # Dirty tiles are generated in blocks of this many tiles per side (memory follows the block).
 EXPORT_BLOCK_TILES = 8
-# Arrays at least this large go to their own memory-mapped file in a worker snapshot.
-SNAPSHOT_ARRAY_BYTES = 1 << 20
-# Thread pools of numeric libraries in workers: one thread each (the processes are the parallelism).
-WORKER_THREAD_ENV = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS")
 
 
 @dataclass
@@ -92,7 +81,6 @@ class ChunkResult:
     built: dict[str, dict[str, Any]] = field(default_factory=dict)       # tile -> build_state entry
     tile_entities: dict[str, list[str]] = field(default_factory=dict)    # data mode: the locator's ids
     trees: dict[str, Any] | None = None                                  # deferred trees' outputs
-    peak_mb: float | None = None                                         # worker process peak so far
 
 
 def _write_json(path: Path, data: Any) -> None:
@@ -246,15 +234,12 @@ class ChunkMerger:
         self.kept: list[Any] = []
         self.total = self.observed = self.rendered = self.dropped = 0
         self.over_budget: list[str] = []
-        self.worker_peak_mb: float | None = None
         current().step("export", 0, n_tiles, "generating geometry")
 
     def merge(self, r: ChunkResult) -> None:
         if r.index != self.next_index:
             raise RuntimeError(f"chunk {r.index} merged out of order (expected {self.next_index})")
         self.next_index += 1
-        if r.peak_mb is not None:
-            self.worker_peak_mb = max(self.worker_peak_mb or 0.0, r.peak_mb)
         progress = current()
         self.hashes.update(r.hashes)
         for t in r.tiles:
@@ -315,151 +300,54 @@ class ChunkMerger:
 # running chunks
 
 
-def export_workers(setting: int, n_tiles: int, n_chunks: int) -> int:
-    """Worker processes for an export: ``export.workers`` when set (> 0), else one process for
-    small worlds (spawning workers costs seconds) and otherwise up to the cores minus one."""
-    if setting > 0:
-        return max(1, min(setting, n_chunks))
-    if n_chunks < 4 or n_tiles < 256:
-        return 1
-    return max(1, min((os.cpu_count() or 2) - 1, n_chunks, 8))
-
-
 class ChunkRunner:
-    """Runs chunk tasks here (``workers`` <= 1) or in a pool of worker processes sharing one
+    """Runs chunk tasks here, or in the build's worker pool (``parallel.active()``) sharing one
     world snapshot; results come back in chunk order."""
 
-    def __init__(self, world: CanonicalWorld, plan: ExportPlan, workers: int, n_chunks: int) -> None:
+    def __init__(self, world: CanonicalWorld, plan: ExportPlan, n_chunks: int) -> None:
         self.world, self.plan = world, plan
-        self.workers = workers if n_chunks > 1 else 1
+        pool = parallel.active()
+        self.pool = pool if pool is not None and pool.workers > 1 and n_chunks > 1 else None
+        self.workers = self.pool.workers if self.pool is not None else 1
         self.exporter: ChunkExporter | None = None
-        self.pool: ProcessPoolExecutor | None = None
-        self.saved_env: dict[str, str | None] = {}
+        self.shared: str | None = None
 
     def __enter__(self) -> ChunkRunner:
-        if self.workers <= 1:
+        if self.pool is None:
             self.exporter = ChunkExporter(self.world, self.plan)
-            return self
-        snapshot = write_snapshot(self.world, self.plan.output / ".work")
-        self.saved_env = {k: os.environ.get(k) for k in WORKER_THREAD_ENV}
-        os.environ.update({k: "1" for k in WORKER_THREAD_ENV})
-        self.pool = ProcessPoolExecutor(max_workers=self.workers, mp_context=multiprocessing.get_context("spawn"),
-                                        initializer=_init_worker, initargs=(str(snapshot), self.plan))
-        log.info("exporting with %d worker processes", self.workers)
+        else:
+            self.shared = self.pool.share((self.world, self.plan), _exporter)
         return self
 
     def __exit__(self, *exc: Any) -> None:
-        if self.pool is not None:
-            self.pool.shutdown(wait=True, cancel_futures=True)
-            for k, v in self.saved_env.items():
-                if v is None:
-                    os.environ.pop(k, None)
-                else:
-                    os.environ[k] = v
-            shutil.rmtree(self.plan.output / ".work", ignore_errors=True)
+        if self.pool is not None and self.shared is not None:
+            self.pool.release(self.shared)
 
     def keys(self, chunks: list[tuple[Any, list[str]]]) -> list[np.ndarray]:
         bounds = [b for b, _ in chunks]
         if self.pool is None:
-            return [self.exporter.budget_keys(b) for b in bounds]  # type: ignore[union-attr]
-        return list(self.pool.map(_chunk_keys, bounds))
+            return [_chunk_keys(self.exporter, b) for b in bounds]
+        return list(self.pool.map(_chunk_keys, self.shared, bounds))  # type: ignore[arg-type]
 
     def export(self, chunks: list[tuple[Any, list[str]]], floor: float | None, whole_world: bool
                ) -> Iterator[ChunkResult]:
+        items = [(k, b, t, floor, whole_world) for k, (b, t) in enumerate(chunks)]
         if self.pool is None:
-            for k, (b, t) in enumerate(chunks):
-                yield self.exporter.run(k, b, t, floor, whole_world)  # type: ignore[union-attr]
+            for item in items:
+                yield _run_chunk(self.exporter, item)
             return
-        n = len(chunks)
-        yield from self.pool.map(_run_chunk, range(n), [b for b, _ in chunks], [t for _, t in chunks],
-                                 [floor] * n, [whole_world] * n)
+        yield from self.pool.map(_run_chunk, self.shared, items)  # type: ignore[arg-type]
 
 
-_EXPORTER: ChunkExporter | None = None
+def _exporter(ctx: tuple[CanonicalWorld, ExportPlan]) -> ChunkExporter:
+    return ChunkExporter(*ctx)
 
 
-def _init_worker(snapshot: str, plan: ExportPlan) -> None:
-    global _EXPORTER
-    _EXPORTER = ChunkExporter(read_snapshot(Path(snapshot)), plan)
+def _chunk_keys(exporter: ChunkExporter | None, bounds: tuple[float, float, float, float] | None) -> np.ndarray:
+    assert exporter is not None
+    return exporter.budget_keys(bounds)
 
 
-def _chunk_keys(bounds: tuple[float, float, float, float] | None) -> np.ndarray:
-    assert _EXPORTER is not None
-    return _EXPORTER.budget_keys(bounds)
-
-
-def _run_chunk(index: int, bounds: tuple[float, float, float, float] | None, tiles: list[str],
-               floor: float | None, whole_world: bool) -> ChunkResult:
-    assert _EXPORTER is not None
-    res = _EXPORTER.run(index, bounds, tiles, floor, whole_world)
-    res.peak_mb = peak_rss_mb()
-    return res
-
-
-# --------------------------------------------------------------------------------------
-# world snapshot
-
-
-def _gridded_geometry(wkb: bytes, grid: float) -> Any:
-    # Pointwise: the coordinates are already on the grid, so they stay as they are (ring order
-    # included); the geometry gets back the precision grid that GEOS operations depend on.
-    return shapely.set_precision(shapely.from_wkb(wkb), grid, mode="pointwise")
-
-
-class _SnapshotPickler(pickle.Pickler):
-    """Pickles with every large numeric array saved to its own ``.npy`` file, and geometries
-    with the precision grid they carry (plain pickling drops it, and GEOS results such as
-    ``set_precision`` or ``representative_point`` depend on it)."""
-
-    def __init__(self, file: Any, folder: Path) -> None:
-        super().__init__(file, protocol=pickle.HIGHEST_PROTOCOL)
-        self.folder = folder
-        self.names: dict[int, str] = {}
-        self.keep: list[np.ndarray] = []   # ids stay unique while pickling
-
-    def reducer_override(self, obj: Any) -> Any:
-        if isinstance(obj, shapely.Geometry):
-            grid = float(shapely.get_precision(obj))
-            if grid > 0:
-                return _gridded_geometry, (shapely.to_wkb(obj), grid)
-        return NotImplemented
-
-    def persistent_id(self, obj: Any) -> Any:
-        if (type(obj) is np.ndarray or isinstance(obj, np.memmap)) and not obj.dtype.hasobject \
-                and obj.nbytes >= SNAPSHOT_ARRAY_BYTES:
-            name = self.names.get(id(obj))
-            if name is None:
-                name = f"a{len(self.names)}.npy"
-                np.save(self.folder / name, np.asarray(obj), allow_pickle=False)
-                self.names[id(obj)] = name
-                self.keep.append(obj)
-            return ("npy", name)
-        return None
-
-
-class _SnapshotUnpickler(pickle.Unpickler):
-    def __init__(self, file: Any, folder: Path) -> None:
-        super().__init__(file)
-        self.folder = folder
-
-    def persistent_load(self, pid: Any) -> Any:
-        kind, name = pid
-        if kind != "npy":
-            raise pickle.UnpicklingError(f"unknown persistent id {pid!r}")
-        return np.load(self.folder / name, mmap_mode="r")
-
-
-def write_snapshot(world: CanonicalWorld, folder: Path) -> Path:
-    """Write ``world`` for worker processes; returns the pickle's path."""
-    if folder.exists():
-        shutil.rmtree(folder)
-    folder.mkdir(parents=True)
-    path = folder / "world.pkl"
-    with open(path, "wb") as f:
-        _SnapshotPickler(f, folder).dump(world)
-    return path
-
-
-def read_snapshot(path: Path) -> CanonicalWorld:
-    with open(path, "rb") as f:
-        return _SnapshotUnpickler(f, path.parent).load()
+def _run_chunk(exporter: ChunkExporter | None, item: tuple[Any, ...]) -> ChunkResult:
+    assert exporter is not None
+    return exporter.run(*item)

@@ -70,7 +70,7 @@ def trees_by_tile(world: CanonicalWorld) -> dict[str, np.ndarray]:
 
 
 # Configuration keys that never change a tile's files, kept out of the tile input hashes.
-NOT_TILE_INPUTS: dict[str, tuple[str, ...]] = {"export": ("combined_glb_max_tiles", "chunk_tiles", "workers")}
+NOT_TILE_INPUTS: dict[str, tuple[str, ...]] = {"export": ("combined_glb_max_tiles", "chunk_tiles")}
 # Keys added after format 1.0, hashed only when set away from their default, so worlds built
 # with the defaults keep their tile hashes (and incremental rebuilds) across the upgrade.
 LATER_KEY_DEFAULTS: dict[str, dict[str, Any]] = {"export": {"mode": "baked"}, "terrain": {"height_quantum_m": 0.0}}
