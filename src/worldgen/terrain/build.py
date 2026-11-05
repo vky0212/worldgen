@@ -12,19 +12,16 @@ from rasterio import features as rfeatures
 from scipy import ndimage
 from shapely.geometry.base import BaseGeometry
 
+from worldgen import parallel
 from worldgen.config import WorldConfig
 from worldgen.errors import SourceError
 from worldgen.log import get_logger
 from worldgen.spatial.raster import GeoRaster, rasterize_window
 from worldgen.spatial.region import Region
-from worldgen.spatial.windows import gauss_radius, grid_windows
+from worldgen.spatial.windows import Slices, gauss_radius, map_windows, window_nodes
 from worldgen.terrain.heightfield import Heightfield, dsm_reach, dsm_to_dtm, fill_nodata
 
 log = get_logger("terrain")
-
-
-# Nodes per side of the windows the terrain is built in (memory follows the window).
-WINDOW_NODES = 512
 
 
 class _DemSampler:
@@ -65,7 +62,7 @@ def build_heightfield(
     landcover: GeoRaster | None,
     dem_datum: str = "EGM2008",
     geoid_offset: Callable[[np.ndarray, np.ndarray], np.ndarray] | None = None,
-    window: int = WINDOW_NODES,
+    window: int | None = None,
 ) -> Heightfield:
     """The terrain heightfield from the DEM: bilinear heights, a light smoothing scaled to the
     DEM pixel, DSM-to-bare-earth correction and the vertical datum.
@@ -84,39 +81,29 @@ def build_heightfield(
         hf.meta["source"] = "none (flat terrain at datum zero)"
         log.warning("no DEM available: terrain is flat and marked as missing coverage")
         return hf
-    local_crs = region.frame.local_crs()
-    sampler = _DemSampler(dem, local_crs)
     # Pixel-centre bilinear sampling of a coarse DEM leaves visible facets at fine
     # resolutions; a light smoothing scaled to the DEM pixel size removes them.
     dem_px = abs(dem.transform.a)
     if dem.crs.is_geographic:
         dem_px *= 111_320.0
     sigma = 0.35 * dem_px / res
-    smooth = sigma > 0.5
     dc = cfg.terrain.dsm_correction
     dsm = dc.enabled and landcover is not None
-    dsm_cells = int(round(dc.window_m / res))
     target = cfg.terrain.output_vertical_datum
-    convert = target not in ("source", dem_datum)
-    halo = (gauss_radius(sigma) if smooth else 0) + (dsm_reach(dsm_cells) if dsm else 0)
+    local_crs = region.frame.local_crs()
+    ctx = _TerrainWindows(xmin, ymin, res, _DemSampler(dem, local_crs), landcover if dsm else None, local_crs,
+                          sigma, int(round(dc.window_m / res)), list(dc.worldcover_classes),
+                          target not in ("source", dem_datum), region, dem_datum, target, geoid_offset)
+    halo = (gauss_radius(sigma) if sigma > 0.5 else 0) + (dsm_reach(ctx.dsm_cells) if dsm else 0)
     z_out = np.empty((rows, cols))
     valid_out = np.empty((rows, cols), dtype=bool)
     masked = 0
-    for win, core_w, core in grid_windows((rows, cols), window, halo):
-        gx, gy = np.meshgrid(xmin + np.arange(win[1].start, win[1].stop) * res,
-                             ymin + np.arange(win[0].start, win[0].stop) * res)
-        z, valid = sampler.sample(gx, gy)
-        valid_out[core] = valid[core_w]
-        if smooth:
-            z = ndimage.gaussian_filter(z, sigma=sigma, mode="nearest")
-        if dsm:
-            lc = landcover.sample_nearest(gx.ravel(), gy.ravel(), src_crs=local_crs).reshape(gx.shape)
-            mask = np.isin(lc, dc.worldcover_classes)
-            masked += int(mask[core_w].sum())
-            z = dsm_to_dtm(z, mask, dsm_cells)
-        if convert:
-            z = convert_vertical_datum(z, gx, gy, region, dem_datum, target, geoid_offset)
-        z_out[core] = z[core_w]
+    # A geoid function of the caller may not survive pickling: those windows run here.
+    for core, (z, valid, m) in map_windows(_terrain_window, ctx, (rows, cols), window or window_nodes(), halo,
+                                           local=geoid_offset is not None):
+        z_out[core] = z
+        valid_out[core] = valid
+        masked += m
     hf.valid = valid_out
     hf.meta["source_coverage"] = float(valid_out.mean())
     if dsm:
@@ -124,10 +111,50 @@ def build_heightfield(
             "method": "morphological_opening", "window_m": dc.window_m,
             "classes": dc.worldcover_classes, "masked_fraction": round(masked / (rows * cols), 4),
         }
-    if convert:
+    if ctx.convert:
         hf.vertical_datum = target
     hf.z = z_out
     return hf
+
+
+@dataclass
+class _TerrainWindows:
+    """What every window of ``build_heightfield`` reads (picklable for worker processes)."""
+
+    xmin: float
+    ymin: float
+    res: float
+    sampler: _DemSampler
+    landcover: GeoRaster | None          # set when the DSM correction runs
+    local_crs: Any
+    sigma: float
+    dsm_cells: int
+    dsm_classes: list[int]
+    convert: bool
+    region: Region
+    dem_datum: str
+    target: str
+    geoid_offset: Callable[[np.ndarray, np.ndarray], np.ndarray] | None
+
+
+def _terrain_window(ctx: _TerrainWindows, item: tuple[Slices, Slices]) -> tuple[np.ndarray, np.ndarray, int]:
+    """Heights, coverage and DSM-masked node count of a window's core."""
+    win, core_w = item
+    res = ctx.res
+    gx, gy = np.meshgrid(ctx.xmin + np.arange(win[1].start, win[1].stop) * res,
+                         ctx.ymin + np.arange(win[0].start, win[0].stop) * res)
+    z, valid = ctx.sampler.sample(gx, gy)
+    if ctx.sigma > 0.5:
+        z = ndimage.gaussian_filter(z, sigma=ctx.sigma, mode="nearest")
+    masked = 0
+    if ctx.landcover is not None:
+        lc = ctx.landcover.sample_nearest(gx.ravel(), gy.ravel(), src_crs=ctx.local_crs).reshape(gx.shape)
+        mask = np.isin(lc, ctx.dsm_classes)
+        masked = int(mask[core_w].sum())
+        z = dsm_to_dtm(z, mask, ctx.dsm_cells)
+    if ctx.convert:
+        z = convert_vertical_datum(z, gx, gy, ctx.region, ctx.dem_datum, ctx.target, ctx.geoid_offset)
+    return z[core_w], valid[core_w], masked
 
 
 def convert_vertical_datum(
@@ -224,9 +251,25 @@ def _nearest_segment(px: np.ndarray, py: np.ndarray, xy: np.ndarray, z: np.ndarr
 
 # Segments projected together in corridor_nodes; their bounding box bounds the work per piece.
 CORRIDOR_PIECE_SEGMENTS = 16
+# Corridor vertices per batch of apply_corridors at most (the batch's nodes are held at once).
+CORRIDOR_BATCH_VERTICES = 4096
 
 
-def corridor_nodes(hf: Heightfield, xy: np.ndarray, z: np.ndarray, reach: float
+@dataclass(frozen=True)
+class GridFrame:
+    """Where a grid's nodes are: node (0, 0) at (xmin, ymin), ``resolution`` apart, ``shape``."""
+
+    xmin: float
+    ymin: float
+    resolution: float
+    shape: tuple[int, int]
+
+    @classmethod
+    def of(cls, hf: Heightfield) -> GridFrame:
+        return cls(hf.xmin, hf.ymin, hf.resolution, (int(hf.z.shape[0]), int(hf.z.shape[1])))
+
+
+def corridor_nodes(hf: Heightfield | GridFrame, xy: np.ndarray, z: np.ndarray, reach: float
                    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Grid nodes within ``reach`` of a polyline: (rows, cols, distance, z at the closest point).
 
@@ -236,8 +279,9 @@ def corridor_nodes(hf: Heightfield, xy: np.ndarray, z: np.ndarray, reach: float
     segment of the whole polyline wins (the first one on ties), so the result is the same as one
     projection onto the whole polyline.
     """
-    rows, cols = hf.z.shape
-    r = hf.resolution
+    frame = hf if isinstance(hf, GridFrame) else GridFrame.of(hf)
+    rows, cols = frame.shape
+    r = frame.resolution
     n_seg = len(xy) - 1
     parts: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
     for s0 in range(0, n_seg, CORRIDOR_PIECE_SEGMENTS):
@@ -245,15 +289,15 @@ def corridor_nodes(hf: Heightfield, xy: np.ndarray, z: np.ndarray, reach: float
         pxy = xy[s0:s1 + 1]
         x0, y0 = pxy.min(axis=0) - reach
         x1, y1 = pxy.max(axis=0) + reach
-        c0 = max(int(np.floor((x0 - hf.xmin) / r)), 0)
-        c1 = min(int(np.ceil((x1 - hf.xmin) / r)), cols - 1)
-        r0 = max(int(np.floor((y0 - hf.ymin) / r)), 0)
-        r1 = min(int(np.ceil((y1 - hf.ymin) / r)), rows - 1)
+        c0 = max(int(np.floor((x0 - frame.xmin) / r)), 0)
+        c1 = min(int(np.ceil((x1 - frame.xmin) / r)), cols - 1)
+        r0 = max(int(np.floor((y0 - frame.ymin) / r)), 0)
+        r1 = min(int(np.ceil((y1 - frame.ymin) / r)), rows - 1)
         if c1 < c0 or r1 < r0:
             continue
         cc, rr = np.meshgrid(np.arange(c0, c1 + 1), np.arange(r0, r1 + 1))
         cc, rr = cc.ravel(), rr.ravel()
-        d2, k, tz = _nearest_segment(hf.xmin + cc * r, hf.ymin + rr * r, pxy, z[s0:s1 + 1])
+        d2, k, tz = _nearest_segment(frame.xmin + cc * r, frame.ymin + rr * r, pxy, z[s0:s1 + 1])
         near = np.sqrt(d2) <= reach
         if near.any():
             parts.append((rr[near] * cols + cc[near], d2[near], k[near] + s0, tz[near]))
@@ -286,11 +330,14 @@ def apply_corridors(hf: Heightfield, corridors: list[Corridor]) -> int:
     max_w = np.zeros(hf.z.shape)
     lowest = np.full(hf.z.shape, np.inf)
     touched = np.zeros(hf.z.shape, dtype=bool)
-    for cor in corridors:
-        if len(cor.xy) < 2:
-            continue
+    corridors = [c for c in corridors if len(c.xy) >= 2]
+    # The nodes of each corridor are found by the build's worker processes when there are any;
+    # they are applied here, in corridor order (the sums do not depend on the batches).
+    work = parallel.batches([(c.xy, c.z, c.half_width + c.shoulder) for c in corridors],
+                            [len(c.xy) for c in corridors], max_weight=CORRIDOR_BATCH_VERTICES)
+    found = (nodes for batch in parallel.tasks(_corridor_batch, GridFrame.of(hf), work) for nodes in batch)
+    for cor, (ri, ci, d, tz) in zip(corridors, found):
         ext = cor.half_width + cor.shoulder
-        ri, ci, d, tz = corridor_nodes(hf, cor.xy, cor.z, ext)
         if not len(ri):
             continue
         hw = cor.half_width
@@ -314,6 +361,11 @@ def apply_corridors(hf: Heightfield, corridors: list[Corridor]) -> int:
     z = np.minimum(z, lowest)
     hf.z[:] = z
     return int(touched.sum())
+
+
+def _corridor_batch(frame: GridFrame, batch: list[tuple[np.ndarray, np.ndarray, float]]
+                    ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    return [corridor_nodes(frame, xy, z, reach) for xy, z, reach in batch]
 
 
 def carve_polygons(hf: Heightfield, items: list[tuple[BaseGeometry, float]]) -> int:

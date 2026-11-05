@@ -486,8 +486,13 @@ class ExportConfig:
     # placement needs memory for its area, and small chunks balance worker processes.
     # Outputs do not depend on it (0: one chunk).
     chunk_tiles: int = 4
-    # Worker processes exporting chunks in parallel (0: automatic - one for small worlds, else
-    # up to the cores minus one, at most 8). Outputs do not depend on it.
+
+
+@dataclass
+class ParallelConfig:
+    # Worker processes of a build: the windowed compile stages and the export chunks run in
+    # them (0: automatic - one process for small worlds, else up to the cores minus one, at
+    # most 8). Outputs do not depend on it.
     workers: int = 0
 
 
@@ -515,6 +520,7 @@ class WorldConfig:
     smoothing: SmoothingConfig = field(default_factory=SmoothingConfig)
     export: ExportConfig = field(default_factory=ExportConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
+    parallel: ParallelConfig = field(default_factory=ParallelConfig)
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -540,8 +546,8 @@ class WorldConfig:
         r = self.terrain.resolution
         if t <= 0 or r <= 0:
             raise ConfigError("tiling.tile_size and terrain.resolution must be positive")
-        if self.export.chunk_tiles < 0 or self.export.workers < 0:
-            raise ConfigError("export.chunk_tiles and export.workers must be >= 0")
+        if self.export.chunk_tiles < 0 or self.parallel.workers < 0:
+            raise ConfigError("export.chunk_tiles and parallel.workers must be >= 0")
         cells = t / r
         if abs(cells - round(cells)) > 1e-9:
             raise ConfigError(

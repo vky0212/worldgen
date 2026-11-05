@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 
+from worldgen import parallel
 from worldgen.spatial.raster import GeoRaster
 from worldgen.spatial.region import Region
 from worldgen.terrain.build import node_mask_window, rasterize_mask
+from worldgen.spatial.windows import row_block
 from worldgen.terrain.heightfield import Heightfield
 from worldgen.world.model import LandcoverArea, Waterbody
 
@@ -15,9 +19,6 @@ LANDCOVER_CODES: dict[int, str] = {
     0: "unknown", 1: "forest", 2: "shrub", 3: "grass", 4: "farmland", 5: "built", 6: "bare",
     7: "water", 8: "wetland", 9: "park", 10: "sand", 11: "snow_ice", 12: "mangrove",
 }
-
-# Rows per block when sampling sources onto a grid.
-ROW_BLOCK = 256
 
 WORLDCOVER_TO_CODE = {10: 1, 20: 2, 30: 3, 40: 4, 50: 5, 60: 6, 70: 11, 80: 7, 90: 8, 95: 12, 100: 3}
 
@@ -40,16 +41,14 @@ def classify_terrain(hf: Heightfield, region: Region, worldcover: GeoRaster | No
     """Per terrain node land-cover code. OSM polygons override WorldCover; water wins last."""
     codes = np.zeros(hf.z.shape, dtype=np.uint8)
     if worldcover is not None:
-        # Sampled in row blocks (each node on its own): no whole-grid coordinate arrays.
-        xs = hf.xmin + np.arange(hf.cols) * hf.resolution
-        crs = region.frame.local_crs()
-        for r0 in range(0, hf.rows, ROW_BLOCK):
-            r1 = min(r0 + ROW_BLOCK, hf.rows)
-            gx, gy = np.meshgrid(xs, hf.ymin + np.arange(r0, r1) * hf.resolution)
-            wc = worldcover.sample_nearest(gx.ravel(), gy.ravel(), src_crs=crs).reshape(gx.shape)
-            block = codes[r0:r1]
-            for k, v in WORLDCOVER_TO_CODE.items():
-                block[wc == k] = v
+        # Sampled in row blocks (each node on its own), by the build's worker processes when
+        # there are any: no whole-grid coordinate arrays.
+        step = row_block()
+        blocks = [(r0, min(r0 + step, hf.rows)) for r0 in range(0, hf.rows, step)]
+        ctx = (worldcover, hf.xmin + np.arange(hf.cols) * hf.resolution, hf.ymin, hf.resolution,
+               region.frame.local_crs())
+        for (r0, r1), block in zip(blocks, parallel.tasks(_worldcover_codes, ctx, blocks)):
+            codes[r0:r1] = block
     # Larger polygons first so nested small features (a park in a residential zone) win.
     for lc in sorted(landcover, key=lambda a: -a.geometry.area):
         code = OSM_CLASS_TO_CODE.get(str(lc.properties.get("class")))
@@ -63,6 +62,17 @@ def classify_terrain(hf: Heightfield, region: Region, worldcover: GeoRaster | No
     if areas:
         codes[rasterize_mask(hf, areas)] = 7
     return codes
+
+
+def _worldcover_codes(ctx: tuple[GeoRaster, np.ndarray, float, float, Any], rows: tuple[int, int]) -> np.ndarray:
+    """Land-cover codes from WorldCover for a row block of terrain nodes."""
+    worldcover, xs, ymin, res, crs = ctx
+    gx, gy = np.meshgrid(xs, ymin + np.arange(rows[0], rows[1]) * res)
+    wc = worldcover.sample_nearest(gx.ravel(), gy.ravel(), src_crs=crs).reshape(gx.shape)
+    block = np.zeros(gx.shape, dtype=np.uint8)
+    for k, v in WORLDCOVER_TO_CODE.items():
+        block[wc == k] = v
+    return block
 
 
 def terrain_colors(codes: np.ndarray) -> np.ndarray:

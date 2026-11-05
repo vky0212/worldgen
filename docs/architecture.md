@@ -113,10 +113,10 @@ compiler.
     coverage fades towards forest edges (`forest_edge_thinning`).
     Only the masks (mapped water, the water patches to snap) are made for the whole
     grid; the smoothing, colour blending and vegetation refinement run in windows of
-    512 nodes with the halo each needs (`_class_reach`: blur + warp + the 64 m fill
-    limit), and every node depends only on nodes within it - warp sampling takes its
-    weights from the displacement alone, and nearest-cell searches break ties by
-    offset - so any window size gives bit-identical grids
+    512 nodes (256 when worker processes compute them) with the halo each needs
+    (`_class_reach`: blur + warp + the 64 m fill limit), and every node depends only on
+    nodes within it - warp sampling takes its weights from the displacement alone, and
+    nearest-cell searches break ties by offset - so any window size gives bit-identical grids
     (`tests/unit/test_smoothing_windows.py`) and memory follows the window.
 11. **Validation** (`validation.checks`) on the in-memory world (the tree checks run
     during the export, chunk by chunk).
@@ -152,18 +152,28 @@ compiler.
     keeps the trees at or above the `max_total`-th largest key (`budget.key_floor`), the
     trees a whole-world selection keeps (ties at the floor are all kept).
 
-    **Worker processes** (`export/chunked.py`, `export.workers`, default automatic: one
-    process below 256 tiles or 4 chunks, else up to the cores minus one, at most 8): chunks
-    run in spawned processes that load a snapshot of the compiled world written once to
-    `<output>/.work` - a pickle in which every large numeric array is a `.npy` file the
-    workers map read-only (shared through the OS page cache) and geometries keep their
-    precision grid (GEOS results such as `representative_point` depend on it). A chunk's
-    work and outputs are the same in any process: `ChunkExporter.run` writes the chunk's tile
-    files and returns a `ChunkResult` (tile states, locator ids, tree issues, the
-    trees.parquet rows, per-tree field contributions - basal areas summed as integers, so
-    in any order), and `ChunkMerger` applies results strictly in chunk order. Output files
-    are byte-identical for any worker count (`tests/integration/test_chunked_export.py`;
-    n25_179: all 1,970 files, 1 vs 8 workers).
+    **Worker processes** (`parallel.py`, `parallel.workers`, default automatic: one process
+    below 256 tiles, else up to the cores minus one, at most 8). `worldgen build` opens one
+    pool of spawned processes for the whole build, before the sources load, so the workers
+    import their libraries meanwhile. A stage hands the pool independent tasks with
+    `parallel.tasks(fn, ctx, items)`: the context every task reads is written once to a
+    snapshot in `<output>/.work` - a pickle in which every large numeric array is a `.npy`
+    file the workers map read-only (shared through the OS page cache) and geometries keep
+    their precision grid (GEOS results such as `representative_point` depend on it) - and
+    the results come back in item order. Without a pool the same functions run in the
+    build's own process. Compile stages in the pool: the terrain windows, the WorldCover
+    and canopy row blocks of the land-cover and vegetation classification, the nodes of
+    each terrain corridor (applied in corridor order by the build's process), the
+    nearest-outline queries of the shoreline shaping, and the windows of the land-cover and
+    vegetation smoothing (256-node windows and 64-row blocks with a pool, 512 and 256
+    without; no result depends on them). Export chunks run there too: each worker builds the
+    world-level indexes once, `ChunkExporter.run` writes the chunk's tile files and returns
+    a `ChunkResult` (tile states, locator ids, tree issues, the trees.parquet rows, per-tree
+    field contributions - basal areas summed as integers, so in any order), and
+    `ChunkMerger` applies results strictly in chunk order. Output files are byte-identical
+    for any worker count (`tests/unit/test_parallel.py` for the compiled grids,
+    `tests/integration/test_chunked_export.py` for the files; n25_179: every file, 1 vs 8
+    workers).
     `compile_world` called directly still places every tree, and
     `BuildOptions(keep_trees=True)` keeps them in `BuildResult.world.trees`.
     The whole-grid rasters (`terrain/heightfield.tif|.f32`, `terrain/landcover.tif`,
