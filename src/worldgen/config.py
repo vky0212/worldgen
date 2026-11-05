@@ -49,15 +49,54 @@ class TilingConfig:
     tile_size: float = 256.0
 
 
+# Taiwan, Penghu, Kinmen, Matsu, Green Island and Orchid Island (south, west, north, east).
+TAIWAN_BBOX = [21.8, 118.1, 26.5, 122.2]
+
+
+@dataclass
+class OverpassEndpoint:
+    """One Overpass server in the priority list.
+
+    ``coverage_bbox`` (south, west, north, east) marks a server that only holds an extract:
+    it is used only when the whole query bbox lies inside it. ``None`` = planet-wide data.
+    In YAML an entry may also be a bare URL string (planet-wide).
+    """
+
+    url: str = ""
+    name: str | None = None
+    coverage_bbox: list[float] | None = None
+
+    @classmethod
+    def from_value(cls, value: Any) -> OverpassEndpoint | None:
+        return cls(url=value) if isinstance(value, str) else None
+
+    def covers(self, bbox_wsen: tuple[float, float, float, float]) -> bool:
+        """True if this server holds data for ``bbox_wsen`` = (west, south, east, north)."""
+        if self.coverage_bbox is None:
+            return True
+        s, w, n, e = self.coverage_bbox
+        bw, bs, be, bn = bbox_wsen
+        return w <= bw and s <= bs and be <= e and bn <= n
+
+
 @dataclass
 class OsmSourceConfig:
     enabled: bool = True
-    endpoints: list[str] = field(
+    # Priority order: endpoints are tried top to bottom, skipping any whose coverage_bbox
+    # does not contain the query; the first one that answers wins.
+    endpoints: list[OverpassEndpoint] = field(
         default_factory=lambda: [
-            "https://overpass-api.de/api/interpreter",
-            "https://overpass.private.coffee/api/interpreter",
+            OverpassEndpoint(
+                url="http://192.168.3.122/api/interpreter",
+                name="self-hosted (Taiwan extract)",
+                coverage_bbox=list(TAIWAN_BBOX),
+            ),
+            OverpassEndpoint(url="https://overpass-api.de/api/interpreter", name="overpass-api.de"),
+            OverpassEndpoint(url="https://overpass.private.coffee/api/interpreter", name="private.coffee"),
         ]
     )
+    # Seconds to wait for a TCP connection; an unreachable server is skipped without retries.
+    connect_timeout_s: float = 10.0
     timeout_s: int = 180
     # Extra margin fetched around the terrain extent so ways entering the region keep context.
     margin_m: float = 50.0
@@ -526,6 +565,21 @@ class WorldConfig:
         if reg.bbox is None and (reg.radius_m is None or reg.radius_m <= 0):
             raise ConfigError("region.radius_m must be positive")
         validate_imagery(self.sources.imagery)
+        validate_osm(self.sources.osm)
+
+
+def validate_osm(osm: OsmSourceConfig) -> None:
+    p = "sources.osm"
+    if osm.enabled and not osm.endpoints:
+        raise ConfigError(f"{p}.endpoints must list at least one Overpass server")
+    for i, ep in enumerate(osm.endpoints):
+        if not ep.url.startswith(("http://", "https://")):
+            raise ConfigError(f"{p}.endpoints[{i}].url must start with http:// or https://, got {ep.url!r}")
+        cb = ep.coverage_bbox
+        if cb is not None and (len(cb) != 4 or not (cb[0] < cb[2] and cb[1] < cb[3])):
+            raise ConfigError(f"{p}.endpoints[{i}].coverage_bbox must be [south, west, north, east]")
+    if osm.connect_timeout_s <= 0:
+        raise ConfigError(f"{p}.connect_timeout_s must be positive")
 
 
 def validate_imagery(im: ImagerySourceConfig) -> None:
@@ -575,6 +629,11 @@ def _coerce(tp: Any, value: Any, path: str, default: Any = None) -> Any:
     """``default`` is the value the field would have had, used to fill a partial dataclass."""
     origin = typing.get_origin(tp)
     if dataclasses.is_dataclass(tp):
+        shorthand = getattr(tp, "from_value", None)
+        if shorthand is not None and not isinstance(value, dict):
+            built = shorthand(value)
+            if built is not None:
+                return built
         if not isinstance(value, dict):
             raise ConfigError(f"{path}: expected a mapping, got {type(value).__name__}")
         return from_dict(tp, value, path, default if isinstance(default, tp) else None)

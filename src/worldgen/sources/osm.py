@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import requests
+from urllib3.exceptions import ConnectTimeoutError, NewConnectionError
 
 from worldgen import __version__
 from worldgen.config import OsmSourceConfig
@@ -140,6 +141,14 @@ out skel qt;
 """
 
 
+def _unreachable(exc: requests.ConnectionError) -> bool:
+    """True if no TCP connection could be made (refused, no route, DNS, connect timeout)."""
+    if isinstance(exc, requests.ConnectTimeout):
+        return True
+    reason = getattr(exc.args[0], "reason", None) if exc.args else None
+    return isinstance(reason, (NewConnectionError, ConnectTimeoutError))
+
+
 class OverpassClient:
     def __init__(self, cfg: OsmSourceConfig, cache: SourceCache) -> None:
         self.cfg = cfg
@@ -151,14 +160,21 @@ class OverpassClient:
 
         def do_fetch() -> tuple[bytes, dict[str, Any]]:
             last_err: Exception | None = None
-            for endpoint in self.cfg.endpoints:
+            candidates = [ep for ep in self.cfg.endpoints if ep.covers(bbox)]
+            for ep in self.cfg.endpoints:
+                if ep not in candidates:
+                    log.info("Overpass endpoint %s skipped: region outside its coverage", ep.name or ep.url)
+            if not candidates:
+                raise SourceError("no Overpass endpoint covers the region (check sources.osm.endpoints)")
+            for ep in candidates:
+                endpoint = ep.url
                 for attempt in range(3):
                     try:
                         log.info("Overpass query to %s (attempt %d)", endpoint, attempt + 1)
                         r = requests.post(
                             endpoint,
                             data={"data": query},
-                            timeout=self.cfg.timeout_s + 30,
+                            timeout=(self.cfg.connect_timeout_s, self.cfg.timeout_s + 30),
                             headers={"User-Agent": f"worldgen/{__version__} (geospatial world compiler)"},
                         )
                         if r.status_code in (429, 504):
@@ -169,10 +185,21 @@ class OverpassClient:
                             raise SourceError(f"Overpass runtime error: {doc['remark']}")
                         used_endpoint["url"] = endpoint
                         return r.content, {"endpoint": endpoint, "query": query}
+                    except requests.ConnectionError as exc:
+                        last_err = exc
+                        if not _unreachable(exc):
+                            log.warning("Overpass request failed: %s", exc)
+                            if attempt < 2:
+                                time.sleep(2.0 * (attempt + 1))
+                            continue
+                        # Unreachable (e.g. the LAN server from off-site): next endpoint at once.
+                        log.warning("Overpass endpoint %s unreachable: %s", endpoint, exc)
+                        break
                     except (requests.RequestException, ValueError, SourceError) as exc:
                         last_err = exc
                         log.warning("Overpass request failed: %s", exc)
-                        time.sleep(2.0 * (attempt + 1))
+                        if attempt < 2:
+                            time.sleep(2.0 * (attempt + 1))
             raise SourceError(f"all Overpass endpoints failed: {last_err}")
 
         raw, meta = self.cache.get_bytes("osm", ["overpass", query], do_fetch, suffix=".json")
