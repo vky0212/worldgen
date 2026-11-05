@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
-from rasterio import features as rfeatures
 from affine import Affine
+from rasterio import features as rfeatures
+from scipy import ndimage
 from shapely.geometry.base import BaseGeometry
 
 from worldgen.config import WorldConfig
@@ -15,9 +17,45 @@ from worldgen.errors import SourceError
 from worldgen.log import get_logger
 from worldgen.spatial.raster import GeoRaster, rasterize_window
 from worldgen.spatial.region import Region
-from worldgen.terrain.heightfield import Heightfield, dsm_to_dtm, fill_nodata
+from worldgen.spatial.windows import gauss_radius, grid_windows
+from worldgen.terrain.heightfield import Heightfield, dsm_reach, dsm_to_dtm, fill_nodata
 
 log = get_logger("terrain")
+
+
+# Nodes per side of the windows the terrain is built in (memory follows the window).
+WINDOW_NODES = 512
+
+
+class _DemSampler:
+    """Bilinear DEM heights at pixel centres, like ``GeoRaster.sample_bilinear``, from a copy
+    of the DEM whose nodata pixels hold the nearest valid pixel's height and whose edge
+    pixels extend outwards, so every node gets a height. ``valid`` marks the nodes all four
+    of whose source pixels are valid data inside the raster (the source coverage)."""
+
+    def __init__(self, dem: GeoRaster, src_crs: Any) -> None:
+        self.dem = dem
+        self.src_crs = src_crs
+        ok = dem.valid_mask()
+        data = dem.data.astype(np.float64)
+        self.data = fill_nodata(np.where(ok, data, 0.0), ok, default=0.0)
+        self.ok = ok
+
+    def sample(self, x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        cols, rows = self.dem._pixel_coords(x.ravel(), y.ravel(), self.src_crs)
+        cols, rows = cols - 0.5, rows - 0.5
+        h, w = self.data.shape
+        c0, r0 = np.floor(cols).astype(np.int64), np.floor(rows).astype(np.int64)
+        fc, fr = cols - c0, rows - r0
+        c0c, c1c = np.clip(c0, 0, w - 1), np.clip(c0 + 1, 0, w - 1)
+        r0c, r1c = np.clip(r0, 0, h - 1), np.clip(r0 + 1, 0, h - 1)
+        d = self.data
+        z = (d[r0c, c0c] * (1 - fc) * (1 - fr) + d[r0c, c1c] * fc * (1 - fr) + d[r1c, c0c] * (1 - fc) * fr
+             + d[r1c, c1c] * fc * fr)
+        ok = self.ok
+        valid = ok[r0c, c0c] & ok[r0c, c1c] & ok[r1c, c0c] & ok[r1c, c1c]
+        valid &= ~((cols < -0.5) | (rows < -0.5) | (cols > w - 0.5) | (rows > h - 0.5))
+        return z.reshape(x.shape), valid.reshape(x.shape)
 
 
 def build_heightfield(
@@ -27,48 +65,68 @@ def build_heightfield(
     landcover: GeoRaster | None,
     dem_datum: str = "EGM2008",
     geoid_offset: Callable[[np.ndarray, np.ndarray], np.ndarray] | None = None,
+    window: int = WINDOW_NODES,
 ) -> Heightfield:
+    """The terrain heightfield from the DEM: bilinear heights, a light smoothing scaled to the
+    DEM pixel, DSM-to-bare-earth correction and the vertical datum.
+
+    Built window by window (``window`` nodes per side plus the halo the filters read); each
+    node depends only on nodes within that halo, so any window size gives the same heights.
+    DEM nodata is filled on the DEM's own grid, with the nearest valid pixel.
+    """
     xmin, ymin, xmax, ymax = region.extent
     res = cfg.terrain.resolution
     cols = int(round((xmax - xmin) / res)) + 1
     rows = int(round((ymax - ymin) / res)) + 1
     hf = Heightfield(xmin, ymin, res, np.zeros((rows, cols)), vertical_datum=dem_datum)
-    gx, gy = hf.node_coords()
-    local_crs = region.frame.local_crs()
     if dem is None:
         hf.valid = np.zeros((rows, cols), dtype=bool)
         hf.meta["source"] = "none (flat terrain at datum zero)"
         log.warning("no DEM available: terrain is flat and marked as missing coverage")
         return hf
-    z = dem.sample_bilinear(gx.ravel(), gy.ravel(), src_crs=local_crs).reshape(rows, cols)
-    valid = np.isfinite(z)
-    hf.valid = valid
-    hf.meta["source_coverage"] = float(valid.mean())
-    z = fill_nodata(np.where(valid, z, 0.0), valid, default=0.0)
+    local_crs = region.frame.local_crs()
+    sampler = _DemSampler(dem, local_crs)
     # Pixel-centre bilinear sampling of a coarse DEM leaves visible facets at fine
     # resolutions; a light smoothing scaled to the DEM pixel size removes them.
     dem_px = abs(dem.transform.a)
     if dem.crs.is_geographic:
         dem_px *= 111_320.0
     sigma = 0.35 * dem_px / res
-    if sigma > 0.5:
-        from scipy import ndimage
-
-        z = ndimage.gaussian_filter(z, sigma=sigma, mode="nearest")
+    smooth = sigma > 0.5
     dc = cfg.terrain.dsm_correction
-    if dc.enabled and landcover is not None:
-        lc = landcover.sample_nearest(gx.ravel(), gy.ravel(), src_crs=local_crs).reshape(rows, cols)
-        mask = np.isin(lc, dc.worldcover_classes)
-        z = dsm_to_dtm(z, mask, int(round(dc.window_m / res)))
+    dsm = dc.enabled and landcover is not None
+    dsm_cells = int(round(dc.window_m / res))
+    target = cfg.terrain.output_vertical_datum
+    convert = target not in ("source", dem_datum)
+    halo = (gauss_radius(sigma) if smooth else 0) + (dsm_reach(dsm_cells) if dsm else 0)
+    z_out = np.empty((rows, cols))
+    valid_out = np.empty((rows, cols), dtype=bool)
+    masked = 0
+    for win, core_w, core in grid_windows((rows, cols), window, halo):
+        gx, gy = np.meshgrid(xmin + np.arange(win[1].start, win[1].stop) * res,
+                             ymin + np.arange(win[0].start, win[0].stop) * res)
+        z, valid = sampler.sample(gx, gy)
+        valid_out[core] = valid[core_w]
+        if smooth:
+            z = ndimage.gaussian_filter(z, sigma=sigma, mode="nearest")
+        if dsm:
+            lc = landcover.sample_nearest(gx.ravel(), gy.ravel(), src_crs=local_crs).reshape(gx.shape)
+            mask = np.isin(lc, dc.worldcover_classes)
+            masked += int(mask[core_w].sum())
+            z = dsm_to_dtm(z, mask, dsm_cells)
+        if convert:
+            z = convert_vertical_datum(z, gx, gy, region, dem_datum, target, geoid_offset)
+        z_out[core] = z[core_w]
+    hf.valid = valid_out
+    hf.meta["source_coverage"] = float(valid_out.mean())
+    if dsm:
         hf.meta["dsm_correction"] = {
             "method": "morphological_opening", "window_m": dc.window_m,
-            "classes": dc.worldcover_classes, "masked_fraction": round(float(mask.mean()), 4),
+            "classes": dc.worldcover_classes, "masked_fraction": round(masked / (rows * cols), 4),
         }
-    target = cfg.terrain.output_vertical_datum
-    if target not in ("source", dem_datum):
-        z = convert_vertical_datum(z, gx, gy, region, dem_datum, target, geoid_offset)
+    if convert:
         hf.vertical_datum = target
-    hf.z = z.astype(np.float64)
+    hf.z = z_out
     return hf
 
 
