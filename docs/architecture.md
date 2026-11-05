@@ -76,7 +76,13 @@ compiler.
    outline, `g` = bank gradient estimated from the original terrain and smoothed
    along the shore), so the terrain triangles cross the water surface on the
    outline instead of zig-zagging along grid nodes; further out it blends back
-   to the original terrain. The region edge is never treated as a shore.
+   to the original terrain. The region edge is never treated as a shore. The
+   shore band is found from disks around the outline's boundary nodes and the
+   bank gradient is blurred in windows around it, so the work and memory follow
+   the shoreline, not the grid (same nodes and values as whole-grid distance
+   transforms and blurs). Land-cover and vegetation classification sample their
+   sources in row blocks (every cell on its own; the built-up context is an
+   exact 5 × 5 `box_filter`).
 8. **Junctions** (`transportation.junctions`): two ends of similar width that
    continue each other get a mitred joint (both ribbons end on the same mitre
    line). Three or more ends get a corner polygon: neighbouring road edge lines
