@@ -14,7 +14,11 @@ export interface GraphStrings {
   roads: string[];
   names: string[];
   structures: string[];
-  restrictions: { id: string; restriction: string; from_way: string; to_way: string; source_id: string }[];
+  /** Per restriction; `from_edge`, `via_node`, `to_edge`, `via_edges`: ids the graph does not contain. */
+  restrictions: {
+    id: string; restriction: string; from_way: string; to_way: string; source_id: string;
+    from_edge?: string; via_node?: string; to_edge?: string; via_edges?: string[];
+  }[];
 }
 
 interface GraphTables {
@@ -143,10 +147,10 @@ export async function decodeGraphCore(buffer: ArrayBuffer, strings: GraphStrings
     const s = strings.restrictions[k];
     restrictions[k] = {
       id: s.id, restriction: s.restriction, kind: tab.restriction_kinds[rkind[k]],
-      from_edge: (fromEdge[k] >= 0 ? edgeIds[fromEdge[k]] : null) as string,
-      via_node: (viaNode[k] >= 0 ? nodeIds[viaNode[k]] : null) as string,
-      to_edge: (toEdge[k] >= 0 ? edgeIds[toEdge[k]] : null) as string,
-      via_edges: via.slice(viaStart[k], viaStart[k + 1]).map((e) => edgeIds[e]),
+      from_edge: (fromEdge[k] >= 0 ? edgeIds[fromEdge[k]] : s.from_edge ?? null) as string,
+      via_node: (viaNode[k] >= 0 ? nodeIds[viaNode[k]] : s.via_node ?? null) as string,
+      to_edge: (toEdge[k] >= 0 ? edgeIds[toEdge[k]] : s.to_edge ?? null) as string,
+      via_edges: s.via_edges ?? via.slice(viaStart[k], viaStart[k + 1]).map((e) => edgeIds[e]),
       from_way: s.from_way, to_way: s.to_way, source_id: s.source_id, enforced: enforced[k] !== 0,
     };
   }

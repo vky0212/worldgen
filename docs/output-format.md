@@ -406,7 +406,10 @@ j = 0); every section but `TAB ` is a `u32` count followed by columnar arrays, e
 
 Rows are in `road_graph.json` order (sorted by id). `strings.json` (`worldgen.graph_strings`)
 holds `nodes` and `edges` (the id of each row), the tables `roads`, `names` and `structures`,
-and per restriction `id`, `restriction`, `from_way`, `to_way`, `source_id`. Decoding gives
+and per restriction `id`, `restriction`, `from_way`, `to_way`, `source_id`, plus the id of
+any reference the graph does not contain (`from_edge`, `via_node`, `to_edge`, or the whole
+`via_edges` list; e.g. a via node that is not a graph node), whose `RST ` row is then −1
+(no `via_edges` entries). Decoding gives
 `road_graph.json` exactly, except that nodes carry no `lon`/`lat` (convert `x`, `y` with
 `crs.local`) and `osm_id` is read from `n:osm:<id>` node ids.
 
