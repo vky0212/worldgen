@@ -12,6 +12,9 @@
   seeds a runtime derives from them.
 * ``building_tiles.json``: a tile with building footprint records (BLD, IDS) and the volume,
   roof / floor areas and height range of each building's baked mesh.
+* ``graph_core.json``: a small road graph's ``core.wgt`` (base64) and ``strings.json`` with the
+  ``road_graph.json`` document they decode to.
+* ``locate.json``: FNV-1a 32 hashes and buckets of entity ids (the locator), bucket counts.
 
 Python (tests/unit/test_data_tiles.py) checks the files are current; the viewer
 (viewer/test/conformance.test.ts) checks its decoders and meshers against them.
@@ -241,9 +244,81 @@ def building_vectors() -> dict[str, Any]:
             "note": "volume and areas: compare within 1e-4 relative; z range within 1e-3 m"}
 
 
+def _graph_doc() -> dict[str, Any]:
+    """A small road graph exercising every stored field: one-way, footway, bridge deck with a
+    profile, unnamed and non-ASCII names, a fractional speed limit, both restriction forms."""
+    def edge(eid: str, u: str, v: str, geom: list[list[float]], **kw: Any) -> dict[str, Any]:
+        e = {"id": eid, "road_id": "road:" + eid.split(":", 1)[1].rsplit(":", 1)[0], "from": u, "to": v,
+             "direction": "both", "class": "residential", "name": None, "bridge": False, "tunnel": False,
+             "structure_implied": False, "layer": 0, "structure_id": None,
+             "modes": {"motor_vehicle": True, "bicycle": True, "foot": True}, "maxspeed_kmh": None,
+             "width_m": 6.5, "geometry": geom, "tiles": ["0_0"]}
+        e.update(kw)
+        return e
+
+    nodes = [{"id": "n:osm:101", "x": 0.0, "y": 0.0, "z": 12.345}, {"id": "n:osm:102", "x": 120.5, "y": -3.25, "z": 13.0},
+             {"id": "n:osm:103", "x": 240.125, "y": 60.0, "z": 14.5}, {"id": "n:bnd:104-105", "x": 256.0, "y": 61.75, "z": 14.6},
+             {"id": "n:osm:106", "x": 120.5, "y": 90.0, "z": 9.875}]
+    edges = [
+        edge("e:osm:way/1:0", "n:osm:101", "n:osm:102", [[0, 0, 12.345], [60.25, -1.5, 12.7], [120.5, -3.25, 13.0]],
+             name="中山路", maxspeed_kmh=48.28032),
+        edge("e:osm:way/1:1", "n:osm:102", "n:osm:103", [[120.5, -3.25, 13.0], [240.125, 60.0, 14.5]],
+             name="中山路", maxspeed_kmh=48.28032, direction="forward", tiles=["0_0", "1_0"]),
+        edge("e:osm:way/2:0", "n:osm:103", "n:bnd:104-105", [[240.125, 60.0, 14.5], [256.0, 61.75, 14.6]],
+             **{"class": "primary"}, maxspeed_kmh=60, width_m=10.25, tiles=["1_0"]),
+        edge("e:osm:way/3:0", "n:osm:102", "n:osm:106",
+             [[120.5, -3.25, 13.0], [120.5, 20.0, 15.25], [120.5, 70.0, 15.25], [120.5, 90.0, 9.875]],
+             bridge=True, layer=1, structure_id="bridge:osm:way/3", **{"class": "tertiary"}),
+        edge("e:osm:way/4:0", "n:osm:106", "n:osm:101", [[120.5, 90.0, 9.875], [0, 0, 12.345]],
+             **{"class": "footway"}, modes={"motor_vehicle": False, "bicycle": False, "foot": True}, layer=-1,
+             tunnel=True, structure_implied=True, width_m=2.0),
+    ]
+    restrictions = [
+        {"id": "r:osm:relation/7", "restriction": "no_left_turn", "from_edge": "e:osm:way/1:0",
+         "via_node": "n:osm:102", "to_edge": "e:osm:way/3:0", "via_edges": [], "from_way": "way/1",
+         "to_way": "way/3", "source_id": "relation/7", "enforced": True},
+        {"id": "r:osm:relation/8", "restriction": "only_straight_on", "from_edge": None, "via_node": None,
+         "to_edge": "e:osm:way/2:0", "via_edges": ["e:osm:way/1:1"], "from_way": "way/9", "to_way": "way/2",
+         "source_id": "relation/8", "enforced": False},
+    ]
+    return {"schema": "worldgen.road_graph", "schema_version": "1.1.0", "nodes": nodes, "edges": edges,
+            "restrictions": restrictions}
+
+
+def graph_vectors() -> dict[str, Any]:
+    """``graph/core.wgt`` + ``strings.json`` of a small graph and the road graph document they decode to."""
+    from worldgen.export.graphcore import decode_graph, graph_files
+    from worldgen.export.tileset import DATA_SCHEMA_VERSION
+    from worldgen.topology.graph import RoadGraph
+
+    g = RoadGraph.from_dict(_graph_doc())
+    origin = {"lat": 25.0, "lon": 121.5, "height": 0.0}
+    core, strings = graph_files(g, origin, "+proj=tmerc +lat_0=25 +lon_0=121.5", DATA_SCHEMA_VERSION)
+    expected = decode_graph(core, strings)
+    ref = g.to_dict(None, origin)
+    ref["crs"] = expected["crs"]
+    if json.loads(json.dumps(expected)) != json.loads(json.dumps(ref)):
+        raise AssertionError("graph core does not round-trip the road graph document")
+    return {"schema": "worldgen.conformance.graph_core", "core_base64": base64.b64encode(core).decode("ascii"),
+            "strings": strings, "expected": expected}
+
+
+LOCATE_IDS = ["", "a", "building:osm:way/1", "road:osm:way/1005161805", "bridge:osm:way/107", "water:osm:relation/9",
+              "tree:osm:node/42", "建物:äöü"]
+
+
+def locate_vectors() -> dict[str, Any]:
+    from worldgen.export.locate import bucket_count, fnv1a32
+
+    return {"schema": "worldgen.conformance.locate", "hash": "fnv1a32 over UTF-8 bytes",
+            "cases": [{"id": i, "fnv1a32": f"0x{fnv1a32(i):08x}", "bucket_64": fnv1a32(i) & 63} for i in LOCATE_IDS],
+            "bucket_counts": [[n, bucket_count(n)] for n in (0, 1, 4096, 4097, 100_000, 10**9)]}
+
+
 def vectors() -> dict[str, dict[str, Any]]:
     return {"hash64.json": hash_vectors(), "terrain_tiles.json": terrain_vectors(), "tree_tiles.json": tree_vectors(),
-            "building_tiles.json": building_vectors()}
+            "building_tiles.json": building_vectors(), "graph_core.json": graph_vectors(),
+            "locate.json": locate_vectors()}
 
 
 def write(out_dir: Path) -> list[Path]:

@@ -19,9 +19,11 @@ from worldgen import SCHEMA_VERSION, __version__
 from worldgen.buildings.buildings import building_plan
 from worldgen.config import WorldConfig
 from worldgen.errors import ValidationFailed
-from worldgen.export.container import write_container
+from worldgen.export.container import read_container, write_container
 from worldgen.export.footprints import building_sections
 from worldgen.export.footprints import tileset_entry as buildings_tileset_entry
+from worldgen.export.graphcore import graph_files
+from worldgen.export.locate import locate_files
 from worldgen.export.heightmap import tile_terrain_sections
 from worldgen.export.instances import archetypes_glb, tree_sections
 from worldgen.export.merge import merge_glbs
@@ -192,6 +194,7 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
     built: dict[str, dict[str, Any]] = {}
     data = mode == "data"
     bindex = buildings_by_tile(world) if data else {}
+    tile_entities: dict[str, list[str]] = {}       # data mode: ids recorded per tile (the locator)
     for block in tile_blocks(dirty, EXPORT_BLOCK_TILES):
         pieces = generate_pieces(world, set(block), selector, building_meshes=not data)
         for t in block:
@@ -212,6 +215,7 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
                     sections += building_sections(bl, plans, grid.bounds(t))
                 sections.append(("GLB", assets["glb"], False))
                 content.write_bytes(write_container(0, i, j, sections))
+                tile_entities[t] = list(assets["meta"]["entities"]) + _tob_ids(dict((s[0], s[1]) for s in sections))
             else:
                 content.write_bytes(assets["glb"])
             col = out / paths[t]["collision"]
@@ -248,6 +252,17 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
                             "cell_size": cfg.vegetation.cell_size, "archetypes": ARCHETYPES,
                             "categories": CATEGORIES, "seed_salts": {"tree": 3, "ground": 6}}
         tileset["buildings"] = buildings_tileset_entry()
+        for t in tiles:
+            if t not in tile_entities:  # unchanged tile: its ids from the files on disk
+                meta = json.loads((out / paths[t]["meta"]).read_text(encoding="utf-8"))
+                tile_entities[t] = list(meta["entities"]) + _tob_ids(
+                    read_container((out / paths[t]["content"]).read_bytes()).sections)
+        tileset["locate"], locate_docs = locate_files(tile_entities, DATA_SCHEMA_VERSION)
+        if (out / "tiles" / "locate").exists():
+            shutil.rmtree(out / "tiles" / "locate")
+        (out / "tiles" / "locate").mkdir(parents=True)
+        for rel, doc in locate_docs.items():
+            _write_json(out / rel, doc, indent=None)
         (out / "tiles" / "archetypes.glb").write_bytes(archetypes_glb(cfg.vegetation.quality))
         for rel, doc in subtrees.items():
             _write_json(out / rel, doc, indent=None)
@@ -283,6 +298,10 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
             combined.unlink()  # a world.glb from an earlier build no longer matches the tiles
 
     _write_json(out / "graph" / "road_graph.json", world.graph.to_dict(world.region.frame, _origin(world)))
+    if data:
+        core, strings = graph_files(world.graph, _origin(world), world.region.frame.proj_string, DATA_SCHEMA_VERSION)
+        (out / "graph" / "core.wgt").write_bytes(core)
+        _write_json(out / "graph" / "strings.json", strings, indent=None)
     if cfg.export.geoparquet:
         write_geoparquet(world, out / "vectors")
     if cfg.export.heightfield:
@@ -294,20 +313,30 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
     return dirty, skipped
 
 
+def _tob_ids(sections: dict[str, bytes]) -> list[str]:
+    """Ids of the mapped trees of a data tile (``TOB `` section; stored or deflated payload)."""
+    tob = sections.get("TOB")
+    return [r["id"] for r in json.loads(tob)] if tob else []
+
+
 def _remove_other_layout(out: Path, mode: str) -> None:
-    """Delete tile files of the other export mode left by an earlier build into ``out``."""
+    """Delete files of the other export mode left by an earlier build into ``out``."""
     tiles = out / "tiles"
     if mode == "data" and (tiles / "index.json").exists():
         for p in tiles.iterdir():
             if p.is_file():
                 p.unlink()
-    elif mode == "baked" and (tiles / "tileset.json").exists():
-        for p in tiles.iterdir():
-            if p.is_dir() and (p.name == "sub" or p.name.isdigit()):
-                shutil.rmtree(p)
-        for name in ("tileset.json", "archetypes.glb"):
-            if (tiles / name).exists():
-                (tiles / name).unlink()
+    elif mode == "baked":
+        if (tiles / "tileset.json").exists():
+            for p in tiles.iterdir():
+                if p.is_dir() and (p.name in ("sub", "locate") or p.name.isdigit()):
+                    shutil.rmtree(p)
+            for name in ("tileset.json", "archetypes.glb"):
+                if (tiles / name).exists():
+                    (tiles / name).unlink()
+        for name in ("core.wgt", "strings.json"):
+            if (out / "graph" / name).exists():
+                (out / "graph" / name).unlink()
 
 
 def _combined_glb_wanted(cfg: WorldConfig, n_tiles: int) -> bool:
@@ -461,5 +490,8 @@ def write_manifest(world: CanonicalWorld, report: Report, opts: BuildOptions, du
                   "heightfield": "terrain/heightfield.json", "fields": "fields/fields.json",
                   "vectors": "vectors/", "attribution": "ATTRIBUTION.txt"},
     }
+    if data:
+        manifest["files"]["graph_core"] = "graph/core.wgt"
+        manifest["files"]["graph_strings"] = "graph/strings.json"
     _write_json(out / "manifest.json", manifest, indent=1)
     return manifest

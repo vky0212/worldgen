@@ -145,6 +145,8 @@ def test_incremental_and_mode_switch(tmp_path):
     assert len(baked.tiles_written) == len(first.tiles_written)
     assert (out / "tiles" / "index.json").is_file() and not (out / "tiles" / "tileset.json").exists()
     assert not (out / "tiles" / "0").exists() and not (out / "tiles" / "archetypes.glb").exists()
+    assert not (out / "tiles" / "locate").exists() and not (out / "graph" / "core.wgt").exists()
+    assert not (out / "graph" / "strings.json").exists() and (out / "graph" / "road_graph.json").is_file()
     again = _build(out)
     assert len(again.tiles_written) == len(first.tiles_written)
     assert not (out / "tiles" / "index.json").exists()
@@ -189,3 +191,44 @@ def test_building_records_replace_meshes(data_world):
                 assert p.symmetric_difference(orient(r.poly, 1.0)).area < 1e-6    # exact footprint (1 mm grid)
         seen += ids
     assert sorted(seen) == sorted(b.id for b in world.buildings if is_rendered(b)) and seen
+
+
+def test_binary_graph_equals_the_json_graph(data_world):
+    from worldgen.export.graphcore import decode_graph
+
+    out, res = data_world
+    files = res.manifest["files"]
+    assert files["graph_core"] == "graph/core.wgt" and files["graph_strings"] == "graph/strings.json"
+    ref = json.loads((out / files["graph"]).read_text(encoding="utf-8"))
+    for n in ref["nodes"]:
+        n.pop("lon", None), n.pop("lat", None)
+    got = decode_graph((out / files["graph_core"]).read_bytes(),
+                       json.loads((out / files["graph_strings"]).read_text(encoding="utf-8")))
+    assert json.loads(json.dumps(got)) == ref
+    assert (out / files["graph_core"]).stat().st_size < (out / files["graph"]).stat().st_size / 4
+
+
+def test_locator_lists_every_recorded_entity(data_world):
+    from worldgen.export.locate import fnv1a32, located
+
+    out, _ = data_world
+    ts = json.loads((out / "tiles" / "tileset.json").read_text(encoding="utf-8"))
+    loc = ts["locate"]
+    expected: dict[str, list[str]] = {}
+    for content, meta_path in _tiles(out):
+        tid = meta_path.name.split(".")[0]
+        ids = list(json.loads(meta_path.read_text(encoding="utf-8"))["entities"])
+        c = read_container(content.read_bytes())
+        ids += [r["id"] for r in json.loads(c.sections["TOB"])] if "TOB" in c.sections else []
+        for i in ids:
+            if located(i):
+                expected.setdefault(i, []).append(tid)
+    got: dict[str, list[str]] = {}
+    for b in range(loc["buckets"]):
+        p = out / loc["uri"].format(bucket=b)
+        if p.is_file():
+            ents = json.loads(p.read_text(encoding="utf-8"))["entities"]
+            assert all(fnv1a32(i) & (loc["buckets"] - 1) == b for i in ents)
+            got.update(ents)
+    assert {k: sorted(v) for k, v in got.items()} == {k: sorted(v) for k, v in expected.items()}
+    assert loc["ids"] == len(expected) > 0 and any(k.startswith("tree:") for k in got)

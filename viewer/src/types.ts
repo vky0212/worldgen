@@ -117,6 +117,8 @@ export interface TilesetDoc extends SchemaDoc {
   trees?: { seed: number; cell_size: number; archetypes: string[]; categories: string[] };
   /** Building footprint tables (BLD sections, format 2.2) and their material palette. */
   buildings?: { sections?: string[]; materials: BuildingMaterialDoc[]; roof_shapes?: string[]; uv_scale?: number };
+  /** Entity locator (format 2.3): bucket files mapping entity ids to tiles. */
+  locate?: { uri: string; buckets: number; hash?: string; ids?: number };
 }
 
 /** A building material of a data-first world: glTF PBR factors (linear base colour). */
@@ -221,6 +223,8 @@ export interface GraphEdge {
   maxspeed_kmh?: number | null;
   geometry?: Vec3[];
   tiles?: string[];
+  structure_implied?: boolean;
+  width_m?: number;
 }
 
 export interface TurnRestriction {
@@ -232,6 +236,9 @@ export interface TurnRestriction {
   to_edge: string;
   via_edges?: string[] | null;
   enforced?: boolean;
+  from_way?: string;
+  to_way?: string;
+  source_id?: string;
 }
 
 export interface RoadGraph extends SchemaDoc {
