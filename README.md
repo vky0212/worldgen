@@ -143,7 +143,8 @@ Highlights:
   archetype meshes);
 * `--set export.mode=data` writes **data-first tiles** (format 2.x): one `.wgt`
   container per tile with the terrain as a 1 cm heightmap that viewers and engines
-  mesh themselves, the other layers as an embedded GLB, and a `tiles/tileset.json`
+  mesh themselves, trees as 16-byte instance records, buildings as footprint tables
+  with compiler-resolved roofs, the other layers as an embedded GLB, and a `tiles/tileset.json`
   + per-4 km subtree index instead of one flat `tiles/index.json`. The bundled
   viewer reads both; `baked` (the default) is unchanged.
 

@@ -8,6 +8,10 @@
   one interior and one world-edge tile, with the exact vertex arrays the baked GLB terrain of
   that tile would have (glTF axes, relative to the tile corner, as float32): positions,
   normals, texture coordinates, colours (u8) and triangle indices.
+* ``tree_tiles.json``: a tile with tree records (TRE, TOB) and the ids, instance transforms and
+  seeds a runtime derives from them.
+* ``building_tiles.json``: a tile with building footprint records (BLD, IDS) and the volume,
+  roof / floor areas and height range of each building's baked mesh.
 
 Python (tests/unit/test_data_tiles.py) checks the files are current; the viewer
 (viewer/test/conformance.test.ts) checks its decoders and meshers against them.
@@ -148,8 +152,98 @@ def tree_vectors() -> dict[str, Any]:
             "note": "translation: compare within 1e-4 (float32 of a float64 height lookup)"}
 
 
+BUILDING_TILE = (3, -2, 256.0)
+
+
+def _building_cases() -> list[Any]:
+    """Footprints covering every roof the compiler resolves, its fallbacks, holes, multipolygons,
+    raised parts and a footprint reaching past the tile."""
+    from shapely import affinity
+    from shapely.geometry import MultiPolygon, Polygon, box
+
+    from worldgen.world.model import Building
+
+    i, j, size = BUILDING_TILE
+    x0, y0 = i * size, j * size
+
+    def at(g: Any, dx: float, dy: float, rot: float = 0.0) -> Any:
+        g = affinity.rotate(g, rot, origin=(0, 0)) if rot else g
+        return shapely_round(affinity.translate(g, x0 + dx, y0 + dy))
+
+    def shapely_round(g: Any) -> Any:
+        import shapely
+        return shapely.set_precision(g, 0.001)
+
+    ell = Polygon([(0, 0), (20, 0), (20, 8), (8, 8), (8, 18), (0, 18)])
+    cases = [
+        ("flat_rotated", at(box(-6, -4, 6, 4), 30, 30, 20), {"height": 9.0, "class": "apartments"}, 31.27),
+        ("flat_ell", at(ell, 60, 20), {"height": 14.5, "class": "retail"}, 30.5),
+        ("flat_courtyard", at(Polygon(box(0, 0, 30, 24).exterior.coords, [box(8, 7, 22, 17).exterior.coords]), 100, 10),
+         {"height": 18.0, "class": "school"}, 29.9),
+        ("multipolygon", at(MultiPolygon([box(0, 0, 10, 6), box(14, 0, 22, 9)]), 150, 60), {"height": 7.0, "class": "warehouse"},
+         33.0),
+        ("gabled_house", at(box(-5, -3.5, 5, 3.5), 40, 90, 30), {"height": 8.0, "roof_shape": "gabled", "class": "house"},
+         32.1),
+        ("gabled_ell", at(ell, 70, 90, -15), {"height": 10.0, "roof_shape": "gabled", "class": "house"}, 32.4),
+        ("gabled_given_height", at(Polygon([(0, 0), (12, -1), (14, 7), (6, 12), (-1, 8)]), 120, 110),
+         {"height": 11.0, "roof_shape": "gabled", "roof_height": 3.5}, 31.0),
+        ("skillion_shed", at(box(-4, -2.5, 4, 2.5), 160, 120, 75), {"height": 4.5, "roof_shape": "skillion", "class": "shed"},
+         30.2),
+        ("pyramidal_square", at(box(-6, -6, 6, 6), 200, 30, 10), {"height": 21.0, "roof_shape": "pyramidal"}, 35.5),
+        ("hipped_rect", at(box(-7, -4, 7, 4), 210, 90), {"height": 9.0, "roof_shape": "hipped", "class": "detached"}, 34.0),
+        ("pyramidal_nonconvex_flat", at(ell, 20, 150), {"height": 12.0, "roof_shape": "pyramidal"}, 30.0),
+        ("gabled_hole_flat", at(Polygon(box(0, 0, 16, 12).exterior.coords, [box(5, 4, 11, 8).exterior.coords]), 60, 160),
+         {"height": 9.0, "roof_shape": "gabled"}, 30.0),
+        ("raised_part", at(box(0, 0, 12, 9), 120, 190), {"height": 20.0, "min_height": 6.0, "class": "office"}, 31.0),
+        ("past_tile_edge", at(box(-14, -6, 14, 6), 250, 230, 35), {"height": 6.0, "roof_shape": "gabled"}, 30.6),
+    ]
+    out = []
+    for name, geom, props, base in cases:
+        b = Building(id=f"building:test:{name}", geometry=geom, properties=dict(props), source="test", source_id=name)
+        b.base_elevation = base
+        out.append(b)
+    return out
+
+
+def _mesh_invariants(m: Any, x0: float, y0: float) -> dict[str, float]:
+    """Volume (closed, outward triangles), up- and down-facing projected areas, z range."""
+    p = m.positions - (x0, y0, 0.0)
+    a, b, c = p[m.indices[:, 0]], p[m.indices[:, 1]], p[m.indices[:, 2]]
+    vol = float(np.einsum("ij,ij->i", a, np.cross(b, c)).sum() / 6.0)
+    cz = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+    return {"volume": vol, "up_area": float(cz[cz > 0].sum() / 2), "down_area": float(-cz[cz < 0].sum() / 2),
+            "zmin": float(p[:, 2].min()), "zmax": float(p[:, 2].max())}
+
+
+def building_vectors() -> dict[str, Any]:
+    """A tile's ``BLD `` / ``IDS `` sections over synthetic buildings and the invariants of the
+    baked meshes a runtime mesher must reproduce: volume, roof and floor areas, height range."""
+    from worldgen.buildings.buildings import building_material, building_mesh, building_plan
+    from worldgen.config import BuildingsConfig
+    from worldgen.export.footprints import BUILDING_MATERIALS, ROOF_SHAPES, building_sections, tileset_entry
+
+    bc = BuildingsConfig()
+    i, j, size = BUILDING_TILE
+    bounds = (i * size, j * size, (i + 1) * size, (j + 1) * size)
+    buildings = _building_cases()
+    plans = [building_plan(b, bc) for b in buildings]
+    wgt = write_container(0, i, j, building_sections(buildings, plans, bounds))
+    expected = []
+    for b, plan in zip(buildings, plans):
+        # Rounded: these sums over mesh triangles may differ in the last bits between platforms.
+        inv = {k: round(v, 6) for k, v in _mesh_invariants(building_mesh(b, bc), bounds[0], bounds[1]).items()}
+        expected.append({"id": b.id, "material": BUILDING_MATERIALS.index(building_material(b)),
+                         "roofs": [r.shape for r in plan.roofs], "footprint_area": round(float(b.geometry.area), 6),
+                         **inv})
+    return {"schema": "worldgen.conformance.building_tiles", "tile_size": size, "i": i, "j": j,
+            "materials": tileset_entry()["materials"], "roof_shapes": ROOF_SHAPES,
+            "wgt_base64": base64.b64encode(wgt).decode("ascii"), "expected": expected,
+            "note": "volume and areas: compare within 1e-4 relative; z range within 1e-3 m"}
+
+
 def vectors() -> dict[str, dict[str, Any]]:
-    return {"hash64.json": hash_vectors(), "terrain_tiles.json": terrain_vectors(), "tree_tiles.json": tree_vectors()}
+    return {"hash64.json": hash_vectors(), "terrain_tiles.json": terrain_vectors(), "tree_tiles.json": tree_vectors(),
+            "building_tiles.json": building_vectors()}
 
 
 def write(out_dir: Path) -> list[Path]:

@@ -10,7 +10,7 @@ import shapely
 from shapely.strtree import STRtree
 
 from worldgen import SCHEMA_VERSION, __version__
-from worldgen.buildings.buildings import build_building_collision, build_building_pieces
+from worldgen.buildings.buildings import build_building_collision, build_building_pieces, building_extent, is_rendered
 from worldgen.export.gltf import GltfBuilder
 from worldgen.export.ortho import imagery_hash
 from worldgen.geometry.mesh import LayerBuilder
@@ -73,6 +73,18 @@ NOT_TILE_INPUTS: dict[str, tuple[str, ...]] = {"export": ("combined_glb_max_tile
 LATER_KEY_DEFAULTS: dict[str, dict[str, Any]] = {"export": {"mode": "baked"}, "terrain": {"height_quantum_m": 0.0}}
 
 
+def buildings_by_tile(world: CanonicalWorld) -> dict[str, list[Any]]:
+    """Rendered buildings per owning tile (that of the footprint's representative point), in
+    world order: the buildings ``build_building_pieces`` meshes for each tile."""
+    grid = TileGrid(world.config.tiling.tile_size)
+    out: dict[str, list[Any]] = {}
+    for b in world.buildings:
+        if is_rendered(b):
+            rp = b.geometry.representative_point()
+            out.setdefault(grid.tile_of(rp.x, rp.y), []).append(b)
+    return out
+
+
 def tile_config_hash(cfg: Any) -> str:
     """Hash of the configuration sections that can change a tile's files."""
     exclude = {s: list(keys) for s, keys in NOT_TILE_INPUTS.items()}
@@ -99,6 +111,10 @@ def tile_input_hash(world: CanonicalWorld, tid: str, entity_tree: tuple[STRtree,
         "config": config_hash if config_hash is not None else tile_config_hash(cfg),
         "tile": tid,
     }
+    if cfg.export.mode == "data":
+        # Data-first tiles change with their format version too (baked tiles keep their hashes).
+        from worldgen.export.tileset import DATA_SCHEMA_VERSION
+        parts["format"] = DATA_SCHEMA_VERSION
     if hf is not None:
         r = hf.resolution
         c0 = max(int(round((x0 - hf.xmin) / r)) - 1, 0)
@@ -148,12 +164,14 @@ def entity_strtree(world: CanonicalWorld) -> tuple[STRtree, list[Any]]:
     return STRtree([e.geometry for e in ents]), ents
 
 
-def generate_pieces(world: CanonicalWorld, wanted: set[str], selector: PieceSelector | None = None
-                    ) -> dict[str, list[Piece]]:
+def generate_pieces(world: CanonicalWorld, wanted: set[str], selector: PieceSelector | None = None,
+                    building_meshes: bool = True) -> dict[str, list[Piece]]:
     """Mesh pieces of the ``wanted`` tiles, grouped by tile.
 
     With a ``selector`` the builders only see the entities that can own a piece in those tiles
     (export calls this per block of tiles); every tile gets the same pieces, in the same order.
+    Without ``building_meshes`` (data-first tiles: buildings ship as footprint tables) there are
+    no building pieces; building collision is still generated.
     """
     cfg = world.config
     grid = TileGrid(cfg.tiling.tile_size)
@@ -174,7 +192,8 @@ def generate_pieces(world: CanonicalWorld, wanted: set[str], selector: PieceSele
     pieces += build_road_pieces(graph, world.profiles, world.junctions, cfg, grid, wanted, drape)
     pieces += build_bridge_pieces(bridges, graph, world.profiles, world.terrain.sample, cfg, grid, wanted)
     pieces += build_tunnel_pieces(tunnels, graph, world.profiles, cfg, grid, wanted)
-    pieces += build_building_pieces(buildings, cfg.buildings, grid, wanted)
+    if building_meshes:
+        pieces += build_building_pieces(buildings, cfg.buildings, grid, wanted)
     pieces += build_water_pieces(water, world.water_levels, world.waterway_profiles, world.covered_waterways,
                                  cfg, grid, wanted)
     pieces += region_outline_pieces(regions, world.terrain, grid, wanted)
@@ -282,7 +301,7 @@ def build_tile_assets(world: CanonicalWorld, tid: str, pieces: list[Piece], terr
                       terrain_rgba: np.ndarray, arche: dict[str, dict[str, Any]], *,
                       trees_in_tile: np.ndarray | None = None,
                       entity_index: dict[str, Any] | None = None, terrain_mesh: bool = True,
-                      trees_as_data: bool = False) -> dict[str, Any]:
+                      trees_as_data: bool = False, buildings_as_data: list[Any] | None = None) -> dict[str, Any]:
     """Return {"glb": bytes, "collision": bytes|None, "meta": dict, "counts": dict, "zrange": [..]}.
 
     ``terrain_normals`` may be None: the terrain meshes then compute normals for the tile's own
@@ -293,6 +312,9 @@ def build_tile_assets(world: CanonicalWorld, tid: str, pieces: list[Piece], terr
     terrain layer; the terrain record and height range are still produced. With
     ``trees_as_data`` the GLB has no tree instances and meta.json no tree records: the trees
     ship as a ``TRE `` section built from ``tree_idx`` (rendered trees, in TRE order).
+    ``buildings_as_data`` (the tile's ``buildings_by_tile`` entry) are buildings shipped as a
+    ``BLD `` section instead of meshes (``pieces`` then hold none): their records stay in
+    meta.json, their counts and height range in the tile's index entry.
     """
     cfg = world.config
     grid = TileGrid(cfg.tiling.tile_size)
@@ -312,6 +334,11 @@ def build_tile_assets(world: CanonicalWorld, tid: str, pieces: list[Piece], terr
         zmin, zmax = float(win.min()), float(win.max())
     if cfg.export.collision:
         collision.add(hf.tile_mesh(x0, y0, x1, y1, stride=2, normals=terrain_normals), "collision", terrain_id)
+    if buildings_as_data:
+        for b in buildings_as_data:
+            layers["buildings"].feature_index(b.id)
+            bottom, top = building_extent(b, cfg.buildings)
+            zmin, zmax = min(zmin, bottom), max(zmax, top)
     for p in pieces:
         if p.layer == "collision":
             collision.add(p.mesh, p.material, p.feature_id)

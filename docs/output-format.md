@@ -18,6 +18,10 @@ Major version 2 is the **data-first** layout (`export.mode: data`, see
 [Data-first tiles](#data-first-tiles-format-2x)): terrain ships as heightmaps that
 consumers mesh themselves. `export.mode: baked` (the default) keeps writing 1.x.
 
+* **2.2.0** — buildings as data: `BLD `/`IDS ` footprint tables with the compiler's
+  resolved roofs replace the GLB `buildings` layer; `tileset.buildings` carries the
+  material palette. Building records stay in `meta.json`. Readers of 2.2 still accept 2.0
+  and 2.1 tiles (buildings as GLB meshes).
 * **2.1.0** — trees as data: `TRE `/`TOB ` sections and `tiles/archetypes.glb`
   replace the GLB `trees` layer and the tree records of `meta.json`. Readers of 2.1
   still accept 2.0 tiles (trees as GLB instances).
@@ -242,8 +246,10 @@ appears only in `inferred` is an estimate, a key in `missing` is unknown.
 With `export.mode: data` the tiles carry **data** where a consumer can generate geometry
 cheaply: the terrain is a heightmap (about 2.3× smaller than the mesh in practice) that
 viewers and engines mesh — and later level — themselves; Unreal Landscape, Unity
-Terrain and Godot heightmap terrains take it natively. Every other layer is still a
-mesh, in an embedded GLB with the same nodes, extras and feature ids as a baked tile.
+Terrain and Godot heightmap terrains take it natively. Trees are instance records and
+buildings footprint tables with resolved roofs. Every other layer (roads, bridges,
+tunnels, water, vegetation outlines) is still a mesh, in an embedded GLB with the same
+nodes, extras and feature ids as a baked tile.
 `manifest.tiling` is `{"mode": "data", "tileset": "tiles/tileset.json", …}`.
 
 ```text
@@ -260,7 +266,7 @@ tiles/
 
 ```jsonc
 {
-  "schema": "worldgen.tileset", "schema_version": "2.0.0",
+  "schema": "worldgen.tileset", "schema_version": "2.2.0",
   "tile_size": 256, "subtree_tiles": 16,
   "levels": [{"level": 0, "size": 256, "spacing": 4.0, "geometric_error": 0.0}],
   "uri": {"content": "tiles/{level}/{si}_{sj}/{i}_{j}.wgt", "meta": "…", "collision": "…",
@@ -269,7 +275,16 @@ tiles/
               "triangulation": "quad (i,j)-(i+1,j+1) diagonal"},
   "layers": [...], "landcover_codes": {"1": "forest", ...}, "ortho": {...} | null,
   "bounds": [xmin, ymin, xmax, ymax],
-  "subtrees": [{"si": 0, "sj": 0, "bounds": [0, 0, 4096, 4096], "zrange": [2.2, 39.9], "tiles": 8}]
+  "subtrees": [{"si": 0, "sj": 0, "bounds": [0, 0, 4096, 4096], "zrange": [2.2, 39.9], "tiles": 8}],
+  // 2.1: tree records
+  "archetypes": "tiles/archetypes.glb",
+  "trees": {"sections": ["TRE", "TOB"], "seed": 1337, "cell_size": 16.0,
+            "archetypes": ["broadleaf", ...], "categories": ["none", ...], "seed_salts": {"tree": 3, "ground": 6}},
+  // 2.2: building footprint tables; materials indexed by the BLD material code
+  "buildings": {"sections": ["BLD", "IDS"], "uv_scale": 4.0,
+                "roof_shapes": ["flat", "gabled", "skillion", "pyramidal"],
+                "materials": [{"name": "building_residential", "color": [0.84, 0.79, 0.70, 1.0],
+                               "roughness": 0.85, "metallic": 0.0}, ...]}
 }
 ```
 
@@ -295,7 +310,9 @@ Readers ignore unknown tags. Sections:
 | `LCC ` | `u16 nx, u16 ny`, then the `u8` land-cover code per tile node (`landcover_codes`). |
 | `TRE ` | (2.1) The tile's rendered trees, shrubs and grass clusters: `u32 count`, `u32 record size (16)`, then per tree `u16 x, u16 y` (position in the tile × 65535 / T), `u16 height (cm)`, `u16 k`, `u8 crown radius (dm)`, `u8 trunk radius (cm)`, `u8 yaw (× 256 / 2π)`, `u8 archetype | category << 4` (indices into `tileset.trees.archetypes` / `categories`), `u8 confidence (× 255)`, `u8 flags` (bit 0 observed, bit 1 record in `TOB `, bit 2 ground-cover id), `u8 dx, u8 dy`. Grouped by archetype in `archetypes` order. |
 | `TOB ` | (2.1) JSON `[{"id", "record"}]`: full records of the trees whose id cannot be derived (mapped trees), referenced by `k` from `TRE `. |
-| `GLB ` | The tile's other layers as a GLB, exactly like a baked tile minus its `terrain` layer node (and, from 2.1, minus its `trees` layer). |
+| `BLD ` | (2.2) The tile's rendered buildings (those whose footprint's representative point lies in the tile, so footprints may extend past it), in id order: `u32 B, u32 P, u32 R, u32 V` (buildings, polygons, rings, vertices), then these arrays, each starting 4-byte aligned: `f32 bottom[B]`, `f32 top[B]`, `u16 polygons[B]`, `u8 material[B]`, `u8 shape[P]` (0 flat, 1 gabled, 2 skillion, 3 pyramidal), `u16 rings[P]`, `f32 eave[P]`, `f32 cx[P]`, `f32 cy[P]`, `f32 ux[P]`, `f32 uy[P]`, `f32 half[P]`, `u32 vertices[R]`, `i32 xy[2V]` (millimetres from the tile's south-west corner; exterior rings counter-clockwise, holes clockwise, closing vertex not repeated). See *Buildings* below. |
+| `IDS ` | (2.2) UTF-8 JSON `{"BLD": [id, ...]}`: the entity id of each `BLD ` building. |
+| `GLB ` | The tile's other layers as a GLB, exactly like a baked tile minus its `terrain` layer node (and, from 2.1, minus its `trees` layer; from 2.2, minus its `buildings` layer). |
 
 **Trees** (2.1). A tree's entity id is derived: `tree:gen:<cx + dx>_<cy + dy>_<k>` (ground
 cover: `…_g<k>`) with `(cx, cy) = (floor(xmin / cell_size), floor(ymin / cell_size))`
@@ -310,6 +327,29 @@ seed:<tileset.trees.seed>`, the published per-tree `seed` =
 (`docs/vegetation.md`), `height`, `crown_radius`, `trunk_radius` inferred (method
 `procedural`, confidence 0.3), `species` missing. `meta.json` holds no tree records.
 
+**Buildings** (2.2). The compiler resolves every roof; consumers only build geometry
+(`buildings.building_mesh` is the reference, `viewer/src/gen/buildingMesh.ts` a port). Each
+footprint polygon is a solid from `bottom` (below the base by the foundation depth, or the
+raised floor of a part with `min_height`) up to its roof:
+
+* **flat** — a prism to `top`: walls along every ring, a top cap and a floor cap (holes kept).
+* **gabled / skillion** — the roof rises across the ridge line through `(cx, cy)` along
+  `(ux, uy)`. With `d = (p − c) · (−uy, ux)` and `h = top − eave`: gabled
+  `z = eave + h · clamp(1 − |d| / half, 0, 1)`, skillion
+  `z = eave + h · clamp((d + half) / (2 half), 0, 1)`. Walls run from `bottom` up to the roof
+  surface at each ring vertex; for gabled roofs insert a ring vertex wherever the ring
+  crosses the ridge line so wall tops meet the roof, and split roof triangles at the ridge.
+  The floor is a cap at `bottom`.
+* **pyramidal** (also OSM `hipped`) — walls from `bottom` to `eave`, one roof triangle per
+  exterior edge up to the apex `(cx, cy, top)`, a floor cap.
+
+Pitched shapes only ever appear on single-ring polygons; a pitched OSM roof the compiler
+could not build (holes, too low, non-convex pyramid, ridge narrower than 2 m) is already
+`flat` in the table. Baked tiles' attribute conventions: walls `uv = (run / 4, z / 4)`,
+caps and roofs `uv = (x / 4, y / 4)` in world metres (glTF `v' = 1 − v`), materials from
+`tileset.buildings.materials` (glTF PBR factors, linear colour), feature id = the building's
+`IDS ` entry. The building's semantic record stays in the tile's `meta.json`.
+
 The shaped terrain is rounded to `quantum` (1 cm) **before** roads are draped, trees placed
 and buildings founded, so decoding a heightmap gives bit for bit the surface everything was
 fitted to.
@@ -323,8 +363,10 @@ and its record is in the tile's `meta.json`.
 
 **Conformance:** `tests/conformance/` (written by `python -m worldgen.conformance`)
 holds `hash64.json`, `terrain_tiles.json` — containers with the exact vertex arrays of
-their baked terrain — and `tree_tiles.json` — a tile's tree records with their ids,
-instance transforms and seeds — that every implementation can test against.
+their baked terrain — `tree_tiles.json` — a tile's tree records with their ids,
+instance transforms and seeds — and `building_tiles.json` — footprint records of every
+roof type and fallback with the volume, roof and floor areas and height range of their
+baked meshes — that every implementation can test against.
 
 ## graph/road_graph.json
 

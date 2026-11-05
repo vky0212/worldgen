@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass, field
 
 import numpy as np
 import shapely
@@ -184,27 +185,78 @@ def _roof_height(b: Building, poly: Polygon, bc: BuildingsConfig, total: float) 
     return min(math.tan(math.radians(bc.max_roof_pitch_deg)) * short / 2.0, total * 0.5)
 
 
-def building_mesh(b: Building, bc: BuildingsConfig) -> Mesh:
+@dataclass
+class RoofPlan:
+    """How one footprint polygon of a building is roofed: the compiler's resolved decision.
+
+    ``shape`` is the geometry actually built: ``flat`` (a prism), ``gabled``, ``skillion`` or
+    ``pyramidal`` (hipped roofs are built as pyramids). A pitched roof that cannot be built on
+    the polygon (holes, too low, non-convex pyramid, too narrow, ridge split failed) is ``flat``.
+    Gabled and skillion roofs rise across the ridge line through ``centre`` along ``u``:
+    ``d = (p - centre) . (-u_y, u_x)``, gabled ``z = eave + roof_h * clip(1 - |d| / half, 0, 1)``,
+    skillion ``z = eave + roof_h * clip((d + half) / (2 half), 0, 1)``. Pyramids rise from the
+    eaves to ``top`` at ``centre`` (the polygon centroid).
+    """
+
+    shape: str
+    poly: Polygon
+    eave: float
+    top: float
+    roof_h: float = 0.0
+    centre: np.ndarray = field(default_factory=lambda: np.zeros(2))
+    u: np.ndarray = field(default_factory=lambda: np.zeros(2))
+    half: float = 0.0
+    outline: Polygon | None = None          # gabled: the ring with its ridge crossings inserted
+    halves: list[Polygon] | None = None     # gabled: the polygon split at the ridge
+
+
+@dataclass
+class BuildingPlan:
+    bottom: float                           # floor z (the foundation's bottom, or the part's min height)
+    top: float
+    roofs: list[RoofPlan]
+
+
+def _extent(b: Building, bc: BuildingsConfig) -> tuple[float, float, float, float]:
     base = (b.base_elevation or 0.0)
     total = float(b.get("height", bc.default_height))
     min_h = float(b.get("min_height", 0.0) or 0.0)
     if min_h >= total - 0.5:
         min_h = 0.0
     bottom = base + min_h - (bc.foundation_depth if min_h == 0 else 0.0)
-    top = base + total
+    return bottom, base + total, total, min_h
+
+
+def building_extent(b: Building, bc: BuildingsConfig) -> tuple[float, float]:
+    """(floor z, top z) of the building's mesh."""
+    bottom, top, _, _ = _extent(b, bc)
+    return bottom, top
+
+
+def is_rendered(b: Building) -> bool:
+    """Whether the building gets geometry (outlines drawn by their parts and dropped ones do not)."""
+    return not (b.rendered_by_parts or b.budget_dropped)
+
+
+def building_plan(b: Building, bc: BuildingsConfig) -> BuildingPlan:
+    """Vertical extent and per-polygon roofs of a building (what ``building_mesh`` builds)."""
+    bottom, top, total, min_h = _extent(b, bc)
     shape = str(b.get("roof_shape") or "flat")
-    parts: list[Mesh] = []
+    roofs: list[RoofPlan] = []
     for poly in polygons_of(b.geometry):
+        plan = None
         if bc.roofs and shape in ("gabled", "pyramidal", "hipped", "skillion") and not poly.interiors:
-            m = _pitched(poly, bottom, top, shape, _roof_height(b, poly, bc, total - min_h))
-            if m is not None:
-                parts.append(m)
-                continue
-        parts.append(extrude_polygon(poly, bottom, top))
-    return merge_meshes(parts)
+            plan = _roof_plan(poly, bottom, top, shape, _roof_height(b, poly, bc, total - min_h))
+        roofs.append(plan if plan is not None else RoofPlan("flat", poly, top, top))
+    return BuildingPlan(bottom, top, roofs)
 
 
-def _pitched(poly: Polygon, bottom: float, top: float, shape: str, roof_h: float) -> Mesh | None:
+def building_mesh(b: Building, bc: BuildingsConfig) -> Mesh:
+    plan = building_plan(b, bc)
+    return merge_meshes([_roof_mesh(r, plan.bottom) for r in plan.roofs])
+
+
+def _roof_plan(poly: Polygon, bottom: float, top: float, shape: str, roof_h: float) -> RoofPlan | None:
     eave = top - roof_h
     if roof_h < 0.3 or eave <= bottom + 1.0:
         return None
@@ -213,18 +265,7 @@ def _pitched(poly: Polygon, bottom: float, top: float, shape: str, roof_h: float
         if not poly.equals(poly.convex_hull.buffer(0)) and poly.area / poly.convex_hull.area < 0.98:
             return None
         c = poly.centroid
-        ring = np.asarray(poly.exterior.coords)[:-1, :2]
-        walls = walls_to_roof(poly, bottom, lambda x, y: np.full(len(x), eave))
-        pos, idx = [], []
-        for i in range(len(ring)):
-            a, bb = ring[i], ring[(i + 1) % len(ring)]
-            k = len(pos)
-            pos += [(a[0], a[1], eave), (bb[0], bb[1], eave), (c.x, c.y, top)]
-            idx.append((k, k + 1, k + 2))
-        roof = Mesh(np.array(pos), np.array(idx, dtype=np.int64))
-        roof.ensure_normals()
-        floor = _cap(poly, bottom, down=True)
-        return merge_meshes([walls, roof, floor])
+        return RoofPlan("pyramidal", poly, eave, top, roof_h, np.array([c.x, c.y]))
     # Gabled / skillion: ridge along the long axis of the minimum rotated rectangle.
     mrr = poly.minimum_rotated_rectangle
     c = np.asarray(mrr.exterior.coords)[:4]
@@ -235,15 +276,7 @@ def _pitched(poly: Polygon, bottom: float, top: float, shape: str, roof_h: float
     if half < 1.0:
         return None
     u = axis / np.hypot(*axis)
-    v = np.array([-u[1], u[0]])
     centre = c.mean(axis=0)
-
-    def roof_z(x: np.ndarray, y: np.ndarray) -> np.ndarray:
-        d = (np.column_stack([x, y]) - centre) @ v
-        if shape == "skillion":
-            return eave + roof_h * np.clip((d + half) / (2 * half), 0, 1)
-        return eave + roof_h * np.clip(1.0 - np.abs(d) / half, 0, 1)
-
     if shape == "gabled":
         far = 4.0 * max(np.hypot(*axis), 1.0)
         ridge = LineString([centre - u * far, centre + u * far])
@@ -255,12 +288,42 @@ def _pitched(poly: Polygon, bottom: float, top: float, shape: str, roof_h: float
             return None
         if len(halves) < 2:
             return None
-    else:
-        halves = [poly]
-        outline = poly
+        return RoofPlan("gabled", poly, eave, top, roof_h, centre, u, half, outline, halves)
+    return RoofPlan("skillion", poly, eave, top, roof_h, centre, u, half, poly, [poly])
+
+
+def _roof_mesh(r: RoofPlan, bottom: float) -> Mesh:
+    if r.shape == "flat":
+        return extrude_polygon(r.poly, bottom, r.top)
+    eave, top, roof_h = r.eave, r.top, r.roof_h
+    if r.shape == "pyramidal":
+        poly = r.poly
+        cx, cy = r.centre
+        ring = np.asarray(poly.exterior.coords)[:-1, :2]
+        walls = walls_to_roof(poly, bottom, lambda x, y: np.full(len(x), eave))
+        pos, idx = [], []
+        for i in range(len(ring)):
+            a, bb = ring[i], ring[(i + 1) % len(ring)]
+            k = len(pos)
+            pos += [(a[0], a[1], eave), (bb[0], bb[1], eave), (cx, cy, top)]
+            idx.append((k, k + 1, k + 2))
+        roof = Mesh(np.array(pos), np.array(idx, dtype=np.int64))
+        roof.ensure_normals()
+        floor = _cap(poly, bottom, down=True)
+        return merge_meshes([walls, roof, floor])
+    u, centre, half, shape = r.u, r.centre, r.half, r.shape
+    v = np.array([-u[1], u[0]])
+
+    def roof_z(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        d = (np.column_stack([x, y]) - centre) @ v
+        if shape == "skillion":
+            return eave + roof_h * np.clip((d + half) / (2 * half), 0, 1)
+        return eave + roof_h * np.clip(1.0 - np.abs(d) / half, 0, 1)
+
+    outline = r.outline
     walls = walls_to_roof(outline, bottom, roof_z)
     roofs = []
-    for h in halves:
+    for h in r.halves:
         h = orient(h, 1.0)
         v2, tri = triangulate_polygon(h)
         if len(tri) == 0:

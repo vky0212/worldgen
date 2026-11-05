@@ -11,6 +11,7 @@ import numpy as np
 import trimesh
 
 from worldgen.export.container import decode_heights, read_container
+from worldgen.export.footprints import decode_buildings
 from worldgen.export.gltf import read_glb_json
 from worldgen.hashing import sha256_file
 from worldgen.topology.graph import RoadGraph
@@ -54,10 +55,11 @@ def validate_outputs(world: Path) -> dict[str, Any]:
     # 3. Tile meshes (baked GLBs, or the GLB section and heightmaps of data-first tiles).
     tiles = _tile_files(world, m)
     degenerate = bad_normals = 0
-    feature_errors = 0
+    feature_errors = bad_buildings = n_buildings = 0
     heights: dict[tuple[int, int], np.ndarray] = {}
     for t in tiles:
         data = (world / t["content"]).read_bytes()
+        record_ids: list[str] = []
         if t["data"]:
             c = read_container(data)
             data = c.sections.get("GLB", b"")
@@ -65,7 +67,15 @@ def validate_outputs(world: Path) -> dict[str, Any]:
             if not np.isfinite(heights[(c.i, c.j)]).all():
                 errors += 1
                 lines.append(f"ERROR non-finite terrain heights in {t['content']}")
+            if "BLD" in c.sections:
+                rec = decode_buildings(c.sections["BLD"])
+                record_ids = json.loads(c.sections.get("IDS", b"{}")).get("BLD", [])
+                n_buildings += len(rec)
+                bad_buildings += int(len(record_ids) != len(rec)) + int((rec["bottom"] >= rec["top"]).sum())
+                bad_buildings += int((rec["vertices"] < 3).sum()) + int((rec["eave"] > rec["top"][
+                    np.repeat(np.arange(len(rec)), rec["polygons"])] + 1e-3).sum())
         meta = json.loads((world / t["meta"]).read_text(encoding="utf-8"))
+        feature_errors += sum(1 for fid in record_ids if fid not in meta["entities"])
         if not data:
             continue
         doc = read_glb_json(data)
@@ -86,6 +96,12 @@ def validate_outputs(world: Path) -> dict[str, Any]:
         lines.append(f"ERROR {feature_errors} feature ids without metadata")
     else:
         lines.append(f"ok    {len(tiles)} tiles: every feature id has metadata")
+    if n_buildings or bad_buildings:
+        if bad_buildings:
+            errors += 1
+            lines.append(f"ERROR {bad_buildings} malformed building records (BLD / IDS)")
+        else:
+            lines.append(f"ok    {n_buildings} building records")
     if heights:
         seams = sum(1 for (i, j), z in heights.items() for (di, dj) in ((1, 0), (0, 1))
                     if (i + di, j + dj) in heights and not np.array_equal(

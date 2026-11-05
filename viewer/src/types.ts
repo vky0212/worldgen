@@ -115,6 +115,16 @@ export interface TilesetDoc extends SchemaDoc {
   /** Unit tree archetype meshes instanced by every tile (TRE sections). */
   archetypes?: string;
   trees?: { seed: number; cell_size: number; archetypes: string[]; categories: string[] };
+  /** Building footprint tables (BLD sections, format 2.2) and their material palette. */
+  buildings?: { sections?: string[]; materials: BuildingMaterialDoc[]; roof_shapes?: string[]; uv_scale?: number };
+}
+
+/** A building material of a data-first world: glTF PBR factors (linear base colour). */
+export interface BuildingMaterialDoc {
+  name: string;
+  color: [number, number, number, number];
+  roughness: number;
+  metallic: number;
 }
 
 /** tiles/sub/<si>_<sj>.json: the subtree's tiles per level, columnar. */

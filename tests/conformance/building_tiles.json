@@ -1,0 +1,256 @@
+{
+ "schema": "worldgen.conformance.building_tiles",
+ "tile_size": 256.0,
+ "i": 3,
+ "j": -2,
+ "materials": [
+  {
+   "name": "building_residential",
+   "color": [
+    0.84,
+    0.79,
+    0.7,
+    1.0
+   ],
+   "roughness": 0.85,
+   "metallic": 0.0
+  },
+  {
+   "name": "building_commercial",
+   "color": [
+    0.66,
+    0.72,
+    0.78,
+    1.0
+   ],
+   "roughness": 0.6,
+   "metallic": 0.0
+  },
+  {
+   "name": "building_industrial",
+   "color": [
+    0.64,
+    0.62,
+    0.6,
+    1.0
+   ],
+   "roughness": 0.8,
+   "metallic": 0.0
+  },
+  {
+   "name": "building_civic",
+   "color": [
+    0.8,
+    0.7,
+    0.62,
+    1.0
+   ],
+   "roughness": 0.8,
+   "metallic": 0.0
+  },
+  {
+   "name": "building_default",
+   "color": [
+    0.78,
+    0.76,
+    0.72,
+    1.0
+   ],
+   "roughness": 0.85,
+   "metallic": 0.0
+  }
+ ],
+ "roof_shapes": [
+  "flat",
+  "gabled",
+  "skillion",
+  "pyramidal"
+ ],
+ "wgt_base64": "V0dUMQEAAgAAAAAAAwAAAP7///8AAAAAQkxEIDgAAACaAgAAAQAAAElEUyDYAgAApAAAAAEAAAB1k21IFFEUht9zZ5S0MjUFi4K1D9rIaME+7IfuziyRYiSKkUW2ZoslYdmPtJRqCTUhkCUi8AMUliIDKWkLgsIFf2SgtYg/gqKMQCONligJU+vcGXRTphlenjPvvnfuvefuJABYxUpi5bOm7FMaENEyMyeYQh8anOH6D9c/tLbWr8wVOhDLmtRMpXAmotWnpLO3U29rdTJtekWFjeutXNv593hmOSvDeAbWsQ5wJlknyFuALG6QIgBVqFBVUmFeRCQURRb/HWl6wNI1Se0tTOPnVK7X6g9iY/TuTcV6Rv+GJeuS+7O6bHrWdEBPDc7Id7mBXFaRe3Gmzm09Nqgn7A7pc9XjPDYipUlvcabCcmzVo1Lnof21fZ3rr/YlXGrIscr0BAudVv5TwPna15ATWn0/25Nba5l5P5Js6T+f87iGkKhtLnjheiZsLqvMAEIueTSxLNVC0o+x8JbmrnmBy8eBFj/QeJbX1Ah8ugEMHwHe1gNlX4DqWyZtBwFfFi2wrAroiotS5rqaCIlbgPDvKMMNpi/pf0e4WGnyNJ/C6J0opR/JE8ZcOB9lmMjwJbt8pj/aGWXzStOXzLgJ/Mzjf2GQ91VKKL4LbLtA8PHcgROEwEZCfYDXmkTwewjjxwgl+YRZL+F6JeHJHkI354c1gred8CbMcw8SQiOEhz08D38aA908frnAspcExyQZe/HWCKT3E+quCBR+JHScEfCMEZpOCuwYIGRPC8QdBU7ZFWwvB9w2BYe552u+C2Q2A7/SFEQKCPcKonScI8OXlD13+YVB2QtXR5SOSmGcwTxlbr53o3Za4L89K0klIycpe/d5FguUvtyvY0wY+51nSZxi+JK7ehV84DW+ilfR3qJg4psCeqyg6LaCfTUK/gIAAAAAAAB1kEEOwjAMBP+SMy/oEXHkBwhFbmMSCzcJjlNRIf5OkZA4JD3PrkfrlzmeT2a4mLESO4p+UCw63BjUSlJQdObQg8jcB1OqoitI25srK+XEq0+xgR5GRmdDqgX3YM/5Q54WjDYg+aBNptyJmVK0JXTm5FVgJgdsy6OCtPZAOW8Kwak9/S/HFKcUF3za7xv29zH2AwJUtkAG6VigqFXaqug8muv7Aw==",
+ "expected": [
+  {
+   "id": "building:test:flat_rotated",
+   "material": 0,
+   "roofs": [
+    "flat"
+   ],
+   "footprint_area": 96.001512,
+   "volume": 912.014364,
+   "up_area": 96.001512,
+   "down_area": 96.001512,
+   "zmin": 30.77,
+   "zmax": 40.27
+  },
+  {
+   "id": "building:test:flat_ell",
+   "material": 1,
+   "roofs": [
+    "flat"
+   ],
+   "footprint_area": 240.0,
+   "volume": 3600.0,
+   "up_area": 240.0,
+   "down_area": 240.0,
+   "zmin": 30.0,
+   "zmax": 45.0
+  },
+  {
+   "id": "building:test:flat_courtyard",
+   "material": 3,
+   "roofs": [
+    "flat"
+   ],
+   "footprint_area": 580.0,
+   "volume": 10730.0,
+   "up_area": 580.0,
+   "down_area": 580.0,
+   "zmin": 29.4,
+   "zmax": 47.9
+  },
+  {
+   "id": "building:test:multipolygon",
+   "material": 2,
+   "roofs": [
+    "flat",
+    "flat"
+   ],
+   "footprint_area": 132.0,
+   "volume": 990.0,
+   "up_area": 132.0,
+   "down_area": 132.0,
+   "zmin": 32.5,
+   "zmax": 40.0
+  },
+  {
+   "id": "building:test:gabled_house",
+   "material": 0,
+   "roofs": [
+    "gabled"
+   ],
+   "footprint_area": 69.99692,
+   "volume": 524.25308,
+   "up_area": 69.99692,
+   "down_area": 69.99692,
+   "zmin": 31.6,
+   "zmax": 40.1
+  },
+  {
+   "id": "building:test:gabled_ell",
+   "material": 0,
+   "roofs": [
+    "gabled"
+   ],
+   "footprint_area": 239.995906,
+   "volume": 1893.295294,
+   "up_area": 239.995906,
+   "down_area": 239.995906,
+   "zmin": 31.9,
+   "zmax": 42.4
+  },
+  {
+   "id": "building:test:gabled_given_height",
+   "material": 4,
+   "roofs": [
+    "gabled"
+   ],
+   "footprint_area": 142.0,
+   "volume": 1418.511596,
+   "up_area": 142.0,
+   "down_area": 142.0,
+   "zmin": 30.5,
+   "zmax": 42.0
+  },
+  {
+   "id": "building:test:skillion_shed",
+   "material": 2,
+   "roofs": [
+    "skillion"
+   ],
+   "footprint_area": 40.00482,
+   "volume": 171.151182,
+   "up_area": 40.00482,
+   "down_area": 40.00482,
+   "zmin": 29.7,
+   "zmax": 34.7
+  },
+  {
+   "id": "building:test:pyramidal_square",
+   "material": 4,
+   "roofs": [
+    "pyramidal"
+   ],
+   "footprint_area": 144.00818,
+   "volume": 2763.593778,
+   "up_area": 144.00818,
+   "down_area": 144.00818,
+   "zmin": 35.0,
+   "zmax": 56.5
+  },
+  {
+   "id": "building:test:hipped_rect",
+   "material": 0,
+   "roofs": [
+    "pyramidal"
+   ],
+   "footprint_area": 112.0,
+   "volume": 891.56472,
+   "up_area": 112.0,
+   "down_area": 112.0,
+   "zmin": 33.5,
+   "zmax": 43.0
+  },
+  {
+   "id": "building:test:pyramidal_nonconvex_flat",
+   "material": 4,
+   "roofs": [
+    "flat"
+   ],
+   "footprint_area": 240.0,
+   "volume": 3000.0,
+   "up_area": 240.0,
+   "down_area": 240.0,
+   "zmin": 29.5,
+   "zmax": 42.0
+  },
+  {
+   "id": "building:test:gabled_hole_flat",
+   "material": 4,
+   "roofs": [
+    "flat"
+   ],
+   "footprint_area": 168.0,
+   "volume": 1596.0,
+   "up_area": 168.0,
+   "down_area": 168.0,
+   "zmin": 29.5,
+   "zmax": 39.0
+  },
+  {
+   "id": "building:test:raised_part",
+   "material": 1,
+   "roofs": [
+    "flat"
+   ],
+   "footprint_area": 108.0,
+   "volume": 1512.0,
+   "up_area": 108.0,
+   "down_area": 108.0,
+   "zmin": 37.0,
+   "zmax": 51.0
+  },
+  {
+   "id": "building:test:past_tile_edge",
+   "material": 4,
+   "roofs": [
+    "gabled"
+   ],
+   "footprint_area": 336.01169,
+   "volume": 1680.05845,
+   "up_area": 336.01169,
+   "down_area": 336.01169,
+   "zmin": 30.1,
+   "zmax": 36.6
+  }
+ ],
+ "note": "volume and areas: compare within 1e-4 relative; z range within 1e-3 m"
+}

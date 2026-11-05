@@ -150,3 +150,42 @@ def test_incremental_and_mode_switch(tmp_path):
     assert not (out / "tiles" / "index.json").exists()
     assert not [p for p in (out / "tiles").glob("*_*.glb")]                  # no baked tile files left
     assert validate_outputs(out)["errors"] == 0
+
+
+def test_building_records_replace_meshes(data_world):
+    from shapely.geometry.polygon import orient
+
+    from worldgen.buildings.buildings import building_extent, building_plan, is_rendered
+    from worldgen.export.footprints import ROOF_SHAPES, decode_buildings
+
+    out, res = data_world
+    world = res.world
+    bc = world.config.buildings
+    T = world.config.tiling.tile_size
+    by_id = {b.id: b for b in world.buildings}
+    ts = json.loads((out / "tiles" / "tileset.json").read_text(encoding="utf-8"))
+    assert ts["buildings"]["roof_shapes"] == ROOF_SHAPES and len(ts["buildings"]["materials"]) == 5
+    seen: list[str] = []
+    for content, meta_path in _tiles(out):
+        c = read_container(content.read_bytes())
+        doc = read_glb_json(c.sections["GLB"])
+        assert all(n.get("name") != "buildings" for n in doc["nodes"])
+        if "BLD" not in c.sections:
+            continue
+        rec = decode_buildings(c.sections["BLD"])
+        ids = json.loads(c.sections["IDS"])["BLD"]
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        assert all(meta["entities"][i]["kind"] == "building" for i in ids)       # records stay in meta.json
+        x0, y0 = c.i * T, c.j * T
+        for k, bid in enumerate(ids):
+            b = by_id[bid]
+            bottom, top = building_extent(b, bc)
+            assert rec["bottom"][k] == np.float32(bottom) and rec["top"][k] == np.float32(top)
+            plan = building_plan(b, bc)
+            polys = rec.polygons(k, x0, y0)
+            assert len(polys) == len(plan.roofs)
+            for p, r, code in zip(polys, plan.roofs, rec["shape"][rec.poly_start[k]:rec.poly_start[k + 1]]):
+                assert ROOF_SHAPES[code] == r.shape
+                assert p.symmetric_difference(orient(r.poly, 1.0)).area < 1e-6    # exact footprint (1 mm grid)
+        seen += ids
+    assert sorted(seen) == sorted(b.id for b in world.buildings if is_rendered(b)) and seen
