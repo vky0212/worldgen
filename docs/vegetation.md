@@ -54,8 +54,9 @@ refines the grid by `smoothing.vegetation_upsample` (default 2: 8 m → 4 m),
 smooths the category borders (Gaussian class memberships, `border_radius_m`)
 and displaces them with the same world-space noise as the terrain colours, so
 trees and ground agree. Cells keep the canopy height, coverage, source and
-confidence of their source cell; a cell whose category changed takes them from
-the nearest cell of its new category. Coverage in tree categories fades
+confidence of their source cell; a cell the smoothing moved to another category
+takes them from the nearest cell of that category (ties: smallest row, then
+column offset), and cells on mapped water become "none". Coverage in tree categories fades
 towards the edge (`forest_edge_thinning`, the fraction removed right at the
 edge), giving open, irregular forest margins. Exported fields and region
 statistics are computed on the refined grid (`fields.json` has its resolution);

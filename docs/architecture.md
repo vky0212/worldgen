@@ -94,11 +94,19 @@ compiler.
     so source-pixel staircases become smooth, natural borders and specks vanish.
     Mapped water is kept exactly; a WorldCover water patch outside it that
     reaches within `water_snap_m` of mapped water takes the surrounding land
-    class (whole patch; unmapped ponds farther away are kept). Terrain
+    class (whole patch; unmapped ponds farther away are kept) up to 64 m from
+    land (`MAX_FILL_M`); farther out it stays water. Terrain
     vertex colours are blended over `blend_width_m`; submerged nodes take the
     wet bank colour. The vegetation grid is refined `vegetation_upsample` times
     with the same smoothing and noise (trees and ground colours agree) and tree
     coverage fades towards forest edges (`forest_edge_thinning`).
+    Only the masks (mapped water, the water patches to snap) are made for the whole
+    grid; the smoothing, colour blending and vegetation refinement run in windows of
+    512 nodes with the halo each needs (`_class_reach`: blur + warp + the 64 m fill
+    limit), and every node depends only on nodes within it - warp sampling takes its
+    weights from the displacement alone, and nearest-cell searches break ties by
+    offset - so any window size gives bit-identical grids
+    (`tests/unit/test_smoothing_windows.py`) and memory follows the window.
 11. **Validation** (`validation.checks`) on the in-memory world (the tree checks run
     during the export, chunk by chunk).
 12. **Export** (`build.export_world`): tile hashes → only dirty tiles are

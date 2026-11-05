@@ -62,7 +62,11 @@ WET_FACTOR = 0.72
 
 @dataclass
 class _Warp:
-    """Sampling positions (fractional row, col) of a warped grid; None = identity."""
+    """Displacement (rows, cols) of each node's sampling position, in cells; None = identity.
+
+    Sampling is bilinear with the weights taken from the displacement alone (its fractional
+    part), so a node gets bit-identical values in any window of the grid that holds the
+    nodes around its sampling position."""
 
     rows: np.ndarray | None
     cols: np.ndarray | None
@@ -70,28 +74,109 @@ class _Warp:
     def apply(self, f: np.ndarray) -> np.ndarray:
         if self.rows is None:
             return f
-        return ndimage.map_coordinates(f, [self.rows, self.cols], order=1, mode="nearest").astype(f.dtype)
+        nr, nc = f.shape
+        fr, fc = np.floor(self.rows), np.floor(self.cols)
+        tr, tc = (self.rows - fr).astype(f.dtype), (self.cols - fc).astype(f.dtype)
+        r0 = np.arange(nr)[:, None] + fr.astype(np.int64)
+        c0 = np.arange(nc)[None, :] + fc.astype(np.int64)
+        r1, c1 = np.clip(r0 + 1, 0, nr - 1), np.clip(c0 + 1, 0, nc - 1)
+        r0, c0 = np.clip(r0, 0, nr - 1), np.clip(c0, 0, nc - 1)
+        one = f.dtype.type(1)
+        top = f[r0, c0] * (one - tc) + f[r0, c1] * tc
+        bottom = f[r1, c0] * (one - tc) + f[r1, c1] * tc
+        return (top * (one - tr) + bottom * tr).astype(f.dtype)
 
 
 def _grid_warp(xmin: float, ymin: float, res: float, shape: tuple[int, int], centred: bool,
-               cfg: SmoothingConfig, seed: int) -> _Warp:
-    """Warped sampling positions of a grid whose nodes (or cell centres) are world points."""
+               cfg: SmoothingConfig, seed: int, rows: slice | None = None, cols: slice | None = None) -> _Warp:
+    """Warp of a grid whose nodes (or cell centres) are world points, for the nodes
+    ``[rows, cols]`` (default: all): world-space noise, so any window gets the same values."""
     if cfg.warp_amplitude_m <= 0:
         return _Warp(None, None)
-    rows, cols = shape
+    rows = rows or slice(0, shape[0])
+    cols = cols or slice(0, shape[1])
     off = 0.5 if centred else 0.0
-    ci = np.arange(cols, dtype=float)
-    xs = xmin + (ci + off) * res
-    R = np.empty(shape, dtype=np.float32)
-    C = np.empty(shape, dtype=np.float32)
-    step = 256  # row blocks keep the noise temporaries small on large grids
-    for r0 in range(0, rows, step):
-        ri = np.arange(r0, min(r0 + step, rows), dtype=float)
+    xs = xmin + (np.arange(cols.start, cols.stop, dtype=float) + off) * res
+    R = np.empty((rows.stop - rows.start, len(xs)), dtype=np.float32)
+    C = np.empty_like(R)
+    step = 256  # row blocks keep the noise temporaries small
+    for r0 in range(rows.start, rows.stop, step):
+        ri = np.arange(r0, min(r0 + step, rows.stop), dtype=float)
         X, Y = np.meshgrid(xs, ymin + (ri + off) * res)
         dx, dy = warp_offsets(X, Y, cfg.warp_amplitude_m, cfg.warp_wavelength_m, seed)
-        R[r0:r0 + len(ri)] = ri[:, None] + dy / res
-        C[r0:r0 + len(ri)] = ci[None, :] + dx / res
+        R[r0 - rows.start:r0 - rows.start + len(ri)] = dy / res
+        C[r0 - rows.start:r0 - rows.start + len(ri)] = dx / res
     return _Warp(R, C)
+
+
+# Nodes no participating node reaches (no smoothed membership) take the class of the nearest
+# participating node up to this far; farther ones keep their own class.
+MAX_FILL_M = 64.0
+# Nodes per side of the windows the smoothing works in (memory follows the window).
+WINDOW_NODES = 512
+
+
+def _gauss_radius(sigma: float) -> int:
+    """Support radius (cells) of scipy's gaussian_filter (truncate 4)."""
+    return int(4.0 * sigma + 0.5) if sigma >= 0.3 else 0
+
+
+def _class_reach(res: float, sigma_m: float, cfg: SmoothingConfig) -> int:
+    """Cells around a node that its smoothed class (and a changed cell's donor) depends on."""
+    warp = int(np.ceil(cfg.warp_amplitude_m / res)) + 1 if cfg.warp_amplitude_m > 0 else 0
+    reach = _gauss_radius(sigma_m / res) + warp + 1
+    return max(int(np.ceil(reach * 1.5)), int(np.ceil(MAX_FILL_M / res))) + 1
+
+
+def _windows(shape: tuple[int, int], size: int, halo: int, align: int = 1):
+    """(window, core within the window, core) slices of square cores of ``size`` nodes with
+    ``halo`` nodes around them (clipped at the grid); window edges are multiples of ``align``."""
+    rows, cols = shape
+    size = max(align, size // align * align)
+    halo = -(-halo // align) * align
+    for r0 in range(0, rows, size):
+        for c0 in range(0, cols, size):
+            r1, c1 = min(r0 + size, rows), min(c0 + size, cols)
+            R0, C0 = max(r0 - halo, 0), max(c0 - halo, 0)
+            R1, C1 = min(r1 + halo, rows), min(c1 + halo, cols)
+            yield ((slice(R0, R1), slice(C0, C1)), (slice(r0 - R0, r1 - R0), slice(c0 - C0, c1 - C0)),
+                   (slice(r0, r1), slice(c0, c1)))
+
+
+def _nearest(mask: np.ndarray, sel: np.ndarray, max_cells: float | None = None) -> tuple[np.ndarray, ...]:
+    """For each True cell of ``sel``: (rows, cols, sel rows, sel cols) of the nearest True cell
+    of ``mask`` (Euclidean), ties broken by the smallest row offset, then column offset, so any
+    window holding both cells finds the same one. Cells with none within ``max_cells`` are
+    left out."""
+    rs, cs = np.nonzero(sel)
+    empty = np.zeros(0, dtype=np.int64)
+    if not len(rs) or not mask.any():
+        return empty, empty, empty, empty
+    d2 = np.rint(ndimage.distance_transform_edt(~mask)[rs, cs] ** 2).astype(np.int64)
+    nr, nc = mask.shape
+    found = np.zeros(len(rs), dtype=bool)
+    out_r = np.zeros(len(rs), dtype=np.int64)
+    out_c = np.zeros(len(rs), dtype=np.int64)
+    for D in np.unique(d2):
+        if max_cells is not None and D > max_cells * max_cells:
+            continue
+        todo = np.nonzero(d2 == D)[0]
+        r = int(np.sqrt(D)) + 1
+        for dy in range(-r, r + 1):
+            rest = D - dy * dy
+            if rest < 0:
+                continue
+            dx0 = int(round(np.sqrt(rest)))
+            for dx in sorted({-dx0, dx0}):
+                if dx * dx != rest or not len(todo):
+                    continue
+                rr, cc = rs[todo] + dy, cs[todo] + dx
+                hit = (rr >= 0) & (rr < nr) & (cc >= 0) & (cc < nc)
+                hit[hit] = mask[rr[hit], cc[hit]]
+                k = todo[hit]
+                out_r[k], out_c[k], found[k] = rr[hit], cc[hit], True
+                todo = todo[~hit]
+    return out_r[found], out_c[found], rs[found], cs[found]
 
 
 def smooth_classes(codes: np.ndarray, participate: np.ndarray, target: np.ndarray, res: float,
@@ -101,8 +186,10 @@ def smooth_classes(codes: np.ndarray, participate: np.ndarray, target: np.ndarra
 
     ``participate`` marks the nodes whose class counts; ``target`` the nodes that receive a
     new class (everything else keeps its code). Target nodes that do not participate (fixed
-    classes elsewhere, or holes to fill) take the classes around them. When ``track`` is
-    given, the summed membership of those classes is returned as well (0..1).
+    classes elsewhere, or holes to fill) take the classes around them; beyond the smoothing's
+    reach, the class of the nearest participating node within ``MAX_FILL_M``, else their own.
+    When ``track`` is given, the summed membership of those classes is returned as well (0..1).
+    Each node depends only on the nodes within ``_class_reach`` cells.
     """
     out = codes.copy()
     warp = warp or _Warp(None, None)
@@ -128,11 +215,11 @@ def smooth_classes(codes: np.ndarray, participate: np.ndarray, target: np.ndarra
         best_code = np.where(better, c, best_code)
         if tracked is not None and int(c) in track:
             tracked += m
-    # Nodes beyond the reach of every participating node: nearest participating class.
     lost = target & ~ok
     if lost.any():
-        _, (ir, ic) = ndimage.distance_transform_edt(~participate, return_indices=True)
-        best_code[lost] = codes[ir[lost], ic[lost]]
+        best_code[lost] = codes[lost]
+        ir, ic, lr, lc = _nearest(participate, lost, MAX_FILL_M / res)
+        best_code[lr, lc] = codes[ir, ic]
     out[target] = best_code[target]
     if tracked is not None:
         tracked = np.clip(tracked, 0.0, 1.0)
@@ -163,12 +250,25 @@ def code_lut() -> np.ndarray:
     return lut
 
 
+def _within(mask: np.ndarray, radius_cells: float) -> np.ndarray:
+    """Nodes within ``radius_cells`` (Euclidean) of a True node of ``mask``."""
+    r = int(np.floor(radius_cells))
+    if r <= 0:
+        return mask.copy()
+    yy, xx = np.mgrid[-r:r + 1, -r:r + 1]
+    return ndimage.binary_dilation(mask, structure=(yy * yy + xx * xx) <= radius_cells * radius_cells)
+
+
 def smooth_landcover(codes: np.ndarray, hf: Heightfield, water_areas: list[BaseGeometry],
-                     waterways: list[BaseGeometry], cfg: SmoothingConfig, seed: int) -> SmoothedLandcover:
+                     waterways: list[BaseGeometry], cfg: SmoothingConfig, seed: int,
+                     window: int = WINDOW_NODES) -> SmoothedLandcover:
     """Smooth land-cover borders on the terrain grid and blend the terrain colours.
 
     ``water_areas`` are the mapped water polygons (they decide water exactly);
-    ``waterways`` are mapped water lines already buffered to their width.
+    ``waterways`` are mapped water lines already buffered to their width. Masks are made
+    for the whole grid; the smoothing and the colours are computed window by window
+    (``window`` nodes per side, with the halo each needs), which gives the same values as
+    one whole-grid window.
     """
     res = hf.resolution
     codes = codes.astype(np.uint8)
@@ -182,20 +282,34 @@ def smooth_landcover(codes: np.ndarray, hf: Heightfield, water_areas: list[BaseG
             # A WorldCover water patch that reaches this close to mapped water is the same water
             # body seen differently (registration, tide): the whole patch is reassigned, so no
             # strip of it is left behind. Patches far from mapped water are kept.
-            dist = ndimage.distance_transform_edt(~mapped) * res
             labels, _ = ndimage.label(stray, structure=np.ones((3, 3), dtype=bool))
-            hit = np.unique(labels[stray & (dist <= cfg.water_snap_m)])
+            hit = np.unique(labels[stray & _within(mapped, cfg.water_snap_m / res)])
             fill = np.isin(labels, hit[hit > 0])
+            del labels
             water &= ~fill
     land = ~water & ~fill
-    warp = _grid_warp(hf.xmin, hf.ymin, res, codes.shape, False, cfg, seed)
-    new, _ = smooth_classes(codes, land, land | fill, res, cfg.border_radius_m, warp)
+    target = land | fill
+    new = codes.copy()
+    for win, core_w, core in _windows(codes.shape, window, _class_reach(res, cfg.border_radius_m, cfg)):
+        warp = _grid_warp(hf.xmin, hf.ymin, res, codes.shape, False, cfg, seed, *win)
+        out, _ = smooth_classes(codes[win], land[win], target[win], res, cfg.border_radius_m, warp)
+        new[core] = out[core_w]
     stats = {"landcover_nodes_changed": int((new != codes).sum()), "water_mismatch_nodes": int(fill.sum())}
 
+    sigma = cfg.blend_width_m / 4.0 / res
+    # Bank colours blur the blended land colours: the two reaches add up.
+    halo = max(_gauss_radius(sigma) + _gauss_radius(max(2.0, sigma)), 4) + 1
+    rgba = np.empty(codes.shape + (4,), dtype=np.float32)
+    for win, core_w, core in _windows(codes.shape, window, halo):
+        rgba[core] = _colors(new[win], res, sigma)[core_w]
+    return SmoothedLandcover(new, rgba, stats)
+
+
+def _colors(new: np.ndarray, res: float, sigma: float) -> np.ndarray:
+    """RGBA of a window of smoothed codes (exact from the colour halo inwards)."""
     lut = code_lut()
     colors = lut[new]
     land = new != WATER_CODE
-    sigma = cfg.blend_width_m / 4.0 / res
     if sigma >= 0.3:
         wl = land.astype(np.float32)
         den = ndimage.gaussian_filter(wl, sigma, mode="nearest")
@@ -204,7 +318,8 @@ def smooth_landcover(codes: np.ndarray, hf: Heightfield, water_areas: list[BaseG
         colors = np.where(land[..., None], blended / np.maximum(den, 1e-6)[..., None], colors)
     sub = ~land
     if sub.any() and land.any():
-        # Submerged nodes: the wet bank colour near the shore, the bed colour further out.
+        # Submerged nodes: the wet bank colour near the shore, the bed colour further out (it
+        # no longer changes beyond three cells from the shore).
         s2 = max(2.0, sigma)
         wl = land.astype(np.float32)
         den = ndimage.gaussian_filter(wl, s2, mode="nearest")
@@ -215,20 +330,24 @@ def smooth_landcover(codes: np.ndarray, hf: Heightfield, water_areas: list[BaseG
         t = np.where((den > 1e-3)[..., None], t, 1.0)
         wet = bank * WET_FACTOR * (1.0 - t) + lut[WATER_CODE] * t
         colors = np.where(sub[..., None], wet, colors)
-    rgba = np.concatenate([colors, np.ones(codes.shape + (1,), dtype=np.float32)], axis=-1).astype(np.float32)
-    return SmoothedLandcover(new, rgba, stats)
+    return np.concatenate([colors, np.ones(new.shape + (1,), dtype=np.float32)], axis=-1).astype(np.float32)
 
 
 # --------------------------------------------------------------------------------------
 # vegetation grid
 
+VEGETATION_CHANNELS = ("source", "canopy_height", "canopy_observed", "coverage", "confidence", "tree_fraction_wc",
+                       "leaf_type")
 
-def refine_vegetation(grid: VegetationGrid, water_areas: list[BaseGeometry], cfg: SmoothingConfig, seed: int
-                      ) -> VegetationGrid:
+
+def refine_vegetation(grid: VegetationGrid, water_areas: list[BaseGeometry], cfg: SmoothingConfig, seed: int,
+                      window: int = WINDOW_NODES) -> VegetationGrid:
     """Refined vegetation grid with smooth, irregular category borders and thinned forest edges.
 
     Cells keep the channels (canopy height, coverage, source, ...) of their coarse cell; a
-    cell whose category changed takes them from the nearest cell of its new category.
+    cell the smoothing moved to another category takes them from the nearest cell of that
+    category (one always lies within the smoothing's reach); cells on water become "none". Computed window by window like
+    ``smooth_landcover``, with the same result as one whole-grid window.
     """
     f = max(1, int(cfg.vegetation_upsample))
     res = grid.resolution / f
@@ -236,45 +355,53 @@ def refine_vegetation(grid: VegetationGrid, water_areas: list[BaseGeometry], cfg
     def up(a: np.ndarray) -> np.ndarray:
         return np.repeat(np.repeat(a, f, axis=0), f, axis=1) if f > 1 else a.copy()
 
-    cat0 = up(grid.category)
-    shape = cat0.shape
+    shape = (grid.shape[0] * f, grid.shape[1] * f)
     water = _rasterize(shape, Affine(res, 0.0, grid.xmin, 0.0, res, grid.ymin), water_areas)
     # Coarse cells cleared because their centre was in water: their fine cells off the water
     # take the vegetation around them.
-    coarse_water = up(_rasterize(grid.shape, grid.transform(), water_areas))
-    fill = coarse_water & ~water
-    participate = ~water & ~fill
-    warp = _grid_warp(grid.xmin, grid.ymin, res, shape, True, cfg, seed)
+    coarse_water = _rasterize(grid.shape, grid.transform(), water_areas)
     tree_codes = {CAT[c] for c in TREE_CATEGORIES}
-    cat, m_tree = smooth_classes(cat0, participate, participate | fill, res, cfg.border_radius_m, warp,
-                                 track=tree_codes)
-    cat[water] = 0
-
-    chans = {name: up(getattr(grid, name)) for name in
-             ("source", "canopy_height", "canopy_observed", "coverage", "confidence", "tree_fraction_wc",
-              "leaf_type")}
-    changed = cat != cat0
-    pristine = {k: v.copy() for k, v in chans.items()} if changed.any() else chans
-    for c in np.unique(cat[changed]):
-        sel = changed & (cat == c)
-        donors = (cat0 == c) & participate
-        if not donors.any():
-            continue
-        _, (ir, ic) = ndimage.distance_transform_edt(~donors, return_indices=True)
-        for k, a in chans.items():
-            a[sel] = pristine[k][ir[sel], ic[sel]]
-    if changed.any():
-        none = changed & (cat == 0)
-        chans["canopy_height"][none] = 0.0
-        chans["coverage"][none] = 0.0
-    trees = np.isin(cat, list(tree_codes))
-    if m_tree is not None and cfg.forest_edge_thinning > 0:
-        keep = 1.0 - cfg.forest_edge_thinning * (1.0 - _smoothstep((m_tree - 0.5) / 0.4))
-        chans["coverage"] = np.where(trees, chans["coverage"] * keep, chans["coverage"]).astype(np.float32)
+    out = {"category": np.empty(shape, dtype=np.uint8)}
+    for name in VEGETATION_CHANNELS:
+        out[name] = np.empty(shape, dtype=getattr(grid, name).dtype)
+    changed_total = 0
+    for win, core_w, core in _windows(shape, window, _class_reach(res, cfg.border_radius_m, cfg), align=f):
+        cwin = (slice(win[0].start // f, -(-win[0].stop // f)), slice(win[1].start // f, -(-win[1].stop // f)))
+        cat0 = up(grid.category[cwin])
+        water_w = water[win]
+        fill = up(coarse_water[cwin]) & ~water_w
+        participate = ~water_w & ~fill
+        warp = _grid_warp(grid.xmin, grid.ymin, res, shape, True, cfg, seed, *win)
+        cat, m_tree = smooth_classes(cat0, participate, participate | fill, res, cfg.border_radius_m, warp,
+                                     track=tree_codes)
+        chans = {name: up(getattr(grid, name)[cwin]) for name in VEGETATION_CHANNELS}
+        # Cells the smoothing moved to another category take that category's channels from its
+        # nearest cell (within the smoothing's reach); cells on water become "none" and keep
+        # their own channels.
+        moved = (cat != cat0) & ~water_w
+        pristine = {k: v.copy() for k, v in chans.items()} if moved.any() else chans
+        for c in np.unique(cat[moved]):
+            ir, ic, sr, sc = _nearest((cat0 == c) & participate, moved & (cat == c))
+            for k, a in chans.items():
+                a[sr, sc] = pristine[k][ir, ic]
+        cat[water_w] = 0
+        changed = cat != cat0
+        if changed.any():
+            none = changed & (cat == 0)
+            chans["canopy_height"][none] = 0.0
+            chans["coverage"][none] = 0.0
+        if m_tree is not None and cfg.forest_edge_thinning > 0:
+            trees = np.isin(cat, list(tree_codes))
+            keep = 1.0 - cfg.forest_edge_thinning * (1.0 - _smoothstep((m_tree - 0.5) / 0.4))
+            chans["coverage"] = np.where(trees, chans["coverage"] * keep, chans["coverage"]).astype(np.float32)
+        out["category"][core] = cat[core_w]
+        for name in VEGETATION_CHANNELS:
+            out[name][core] = chans[name][core_w]
+        changed_total += int(changed[core_w].sum())
     meta = dict(grid.meta)
     meta["smoothing"] = {"upsample": f, "source_resolution": grid.resolution,
-                         "cells_changed": int(changed.sum()), "border_radius_m": cfg.border_radius_m}
-    return replace(grid, resolution=res, category=cat.astype(np.uint8), meta=meta, **chans)
+                         "cells_changed": changed_total, "border_radius_m": cfg.border_radius_m}
+    return replace(grid, resolution=res, meta=meta, **out)
 
 
 # --------------------------------------------------------------------------------------
