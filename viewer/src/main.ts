@@ -424,6 +424,7 @@ class App {
         trees: ts.trees
           ? { cellSize: ts.trees.cell_size, seed: ts.trees.seed, archetypes: ts.trees.archetypes, categories: ts.trees.categories }
           : undefined,
+        buildingMaterials: ts.buildings?.materials,
       } : undefined,
       camera: this.camera,
       viewportHeight: () => this.renderer.domElement.clientHeight,

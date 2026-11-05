@@ -5,7 +5,7 @@
  * `userData.layer`, terrain feature id `terrain:<i>_<j>`), so the world model,
  * picking, colour modes and photoreal mode treat both formats alike.
  */
-import { BufferAttribute, BufferGeometry, Group, InstancedMesh, Matrix4, Mesh, MeshStandardMaterial, Quaternion, Vector3 } from 'three';
+import { BufferAttribute, BufferGeometry, Group, InstancedMesh, LinearSRGBColorSpace, Matrix4, Mesh, MeshStandardMaterial, Quaternion, Vector3 } from 'three';
 import type { Object3D } from 'three';
 import type { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { decodeGrid, decodeHeights, readWgt } from './wgt.ts';
@@ -14,7 +14,10 @@ import { terrainArrays } from '../gen/terrainMesh.ts';
 import { decodeTrees, treeIdAt, treeInstances, treeRecordAt } from './trees.ts';
 import type { TreeContext } from './trees.ts';
 import type { ArchetypeLibrary } from './archetypes.ts';
-import type { EntityRecord } from '../types';
+import { decodeBuildings } from './buildings.ts';
+import { buildingMeshes } from '../gen/buildingMesh.ts';
+import { LAYER_NAMES } from '../types';
+import type { BuildingMaterialDoc, EntityRecord } from '../types';
 
 /** World-level inputs of data tiles (tileset.json). */
 export interface WgtWorld {
@@ -22,6 +25,8 @@ export interface WgtWorld {
   /** Tree archetype meshes (tiles/archetypes.glb), shared by every tile. */
   archetypes?: Promise<ArchetypeLibrary | null>;
   trees?: { cellSize: number; seed: number; archetypes: readonly string[]; categories: readonly string[] };
+  /** Building material palette (tileset.json `buildings.materials`), indexed by BLD material code. */
+  buildingMaterials?: readonly BuildingMaterialDoc[];
 }
 
 /** userData key of a data tile's scene: lazily synthesises records of its trees by entity id. */
@@ -79,6 +84,9 @@ export async function buildWgtScene(buffer: ArrayBuffer, loader: GLTFLoader, bas
   root.children.splice(root.children.indexOf(mesh), 1);
   root.children.unshift(mesh);
 
+  const bld = c.sections.get('BLD');
+  if (bld) addBuildings(root, bld, c.sections.get('IDS'), c.i * tileSize, c.j * tileSize, world.buildingMaterials ?? []);
+
   const tre = c.sections.get('TRE');
   const library = world.archetypes ? await world.archetypes : null;
   if (tre && world.trees && library) {
@@ -86,6 +94,49 @@ export async function buildWgtScene(buffer: ArrayBuffer, loader: GLTFLoader, bas
     addTrees(root, scene, decodeTrees(tre, c.sections.get('TOB')), heights, ctx, library);
   }
   return scene;
+}
+
+/**
+ * The `buildings` layer of a data tile, generated from its footprint records and structured
+ * like GLTFLoader's output for a baked tile: a `buildings` group (userData `layer`,
+ * `feature_ids`) holding one mesh per material whose `_feature_id_0` indexes those ids.
+ */
+function addBuildings(root: Object3D, bld: Uint8Array, ids: Uint8Array | undefined, x0: number, y0: number,
+  palette: readonly BuildingMaterialDoc[]): void {
+  const rec = decodeBuildings(bld, ids);
+  if (!rec.count) return;
+  const featureIds = rec.ids;
+  const layer = new Group();
+  layer.name = 'buildings';
+  layer.userData = { layer: 'buildings', feature_ids: featureIds };
+  for (const [code, a] of buildingMeshes(rec, x0, y0)) {
+    const doc = palette[code] ?? { name: 'building_default', color: [0.78, 0.76, 0.72, 1], roughness: 0.85, metallic: 0 };
+    const geo = new BufferGeometry();
+    geo.setAttribute('position', new BufferAttribute(a.positions, 3));
+    geo.setAttribute('normal', new BufferAttribute(a.normals, 3));
+    geo.setAttribute('uv', new BufferAttribute(a.uvs, 2));
+    geo.setAttribute('_feature_id_0', new BufferAttribute(a.features, 1));
+    geo.setIndex(new BufferAttribute(a.indices, 1));
+    geo.computeBoundingBox();
+    geo.computeBoundingSphere();
+    geo.userData = { layer: 'buildings', feature_ids: featureIds };
+    // As GLTFLoader builds it from the glTF material: linear base colour factor.
+    const material = new MeshStandardMaterial({ name: doc.name, roughness: doc.roughness, metalness: doc.metallic });
+    material.color.setRGB(doc.color[0], doc.color[1], doc.color[2], LinearSRGBColorSpace);
+    material.opacity = doc.color[3];
+    const mesh = new Mesh(geo, material);
+    mesh.name = 'buildings';
+    mesh.userData = { layer: 'buildings', feature_ids: featureIds };
+    layer.add(mesh);
+  }
+  // Keep the baked layer order (terrain, roads, bridges, tunnels, buildings, water, ...).
+  const rank = (o: Object3D) => LAYER_NAMES.indexOf((o.userData as { layer?: string }).layer as (typeof LAYER_NAMES)[number]);
+  const at = root.children.findIndex((o) => rank(o) > LAYER_NAMES.indexOf('buildings'));
+  root.add(layer);
+  if (at >= 0) {
+    root.children.splice(root.children.indexOf(layer), 1);
+    root.children.splice(at, 0, layer);
+  }
 }
 
 /**

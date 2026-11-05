@@ -16,9 +16,12 @@ import numpy as np
 from rasterio.transform import Affine
 
 from worldgen import SCHEMA_VERSION, __version__
+from worldgen.buildings.buildings import building_plan
 from worldgen.config import WorldConfig
 from worldgen.errors import ValidationFailed
 from worldgen.export.container import write_container
+from worldgen.export.footprints import building_sections
+from worldgen.export.footprints import tileset_entry as buildings_tileset_entry
 from worldgen.export.heightmap import tile_terrain_sections
 from worldgen.export.instances import archetypes_glb, tree_sections
 from worldgen.export.merge import merge_glbs
@@ -29,6 +32,7 @@ from worldgen.export.tiles import (
     PieceSelector,
     archetypes_for,
     build_tile_assets,
+    buildings_by_tile,
     entity_strtree,
     generate_pieces,
     terrain_vertex_colors,
@@ -187,19 +191,25 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
     eindex = world.entity_index()
     built: dict[str, dict[str, Any]] = {}
     data = mode == "data"
+    bindex = buildings_by_tile(world) if data else {}
     for block in tile_blocks(dirty, EXPORT_BLOCK_TILES):
-        pieces = generate_pieces(world, set(block), selector)
+        pieces = generate_pieces(world, set(block), selector, building_meshes=not data)
         for t in block:
             progress.tile(t, "building")
             assets = build_tile_assets(world, t, pieces.pop(t, []), None, rgba, arche,
                                        trees_in_tile=tindex.get(t, NO_TREES), entity_index=eindex,
-                                       terrain_mesh=not data, trees_as_data=data)
+                                       terrain_mesh=not data, trees_as_data=data,
+                                       buildings_as_data=bindex.get(t, []) if data else None)
             content = out / paths[t]["content"]
             content.parent.mkdir(parents=True, exist_ok=True)
             if data:
                 i, j = parse_tile_id(t)
                 sections = tile_terrain_sections(world, t, rgba)
                 sections += tree_sections(world.trees, assets["tree_idx"], grid.bounds(t), cfg.vegetation.cell_size)
+                bl = bindex.get(t, [])
+                if bl:
+                    plans = [building_plan(b, cfg.buildings) for b in bl]
+                    sections += building_sections(bl, plans, grid.bounds(t))
                 sections.append(("GLB", assets["glb"], False))
                 content.write_bytes(write_container(0, i, j, sections))
             else:
@@ -237,6 +247,7 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
         tileset["trees"] = {"sections": ["TRE", "TOB"], "seed": cfg.vegetation.seed,
                             "cell_size": cfg.vegetation.cell_size, "archetypes": ARCHETYPES,
                             "categories": CATEGORIES, "seed_salts": {"tree": 3, "ground": 6}}
+        tileset["buildings"] = buildings_tileset_entry()
         (out / "tiles" / "archetypes.glb").write_bytes(archetypes_glb(cfg.vegetation.quality))
         for rel, doc in subtrees.items():
             _write_json(out / rel, doc, indent=None)

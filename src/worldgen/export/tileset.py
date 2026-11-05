@@ -12,7 +12,7 @@ from typing import Any
 
 from worldgen.tiling.grid import TileGrid, parse_tile_id
 
-DATA_SCHEMA_VERSION = "2.1.0"
+DATA_SCHEMA_VERSION = "2.2.0"
 # Tiles per subtree side: a subtree covers 16 x 16 level-0 tiles (4096 m with 256 m tiles).
 SUBTREE_TILES = 16
 
