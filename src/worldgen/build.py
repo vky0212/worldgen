@@ -7,6 +7,7 @@ import json
 import platform
 import shutil
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
@@ -61,15 +62,14 @@ from worldgen.pipeline import (
     vegetation_exclusions,
 )
 from worldgen.progress import current
-from worldgen.sources.base import SourceRecord, write_geotiff
+from worldgen.sources.base import GEOTIFF_BLOCK_ROWS, SourceRecord, write_geotiff_rows
 from worldgen.sources.synthetic import load_fixture
-from worldgen.spatial.raster import GeoRaster
 from worldgen.spatial.region import Region
 from worldgen.tiling.grid import TileGrid, parse_tile_id
 from worldgen.validation.checks import IndependenceSample, Issue, Report, check_vegetation, validate_world
 from worldgen.vegetation.classify import CATEGORIES
 from worldgen.vegetation.placement import ARCHETYPES, TreeTable, concat_tables
-from worldgen.vegetation.regions import environmental_fields, tree_cell_sums
+from worldgen.vegetation.regions import FIELD_NAMES, environmental_fields, tree_cell_sums
 from worldgen.world.world import CanonicalWorld
 
 log = get_logger("build")
@@ -484,10 +484,18 @@ def export_terrain(world: CanonicalWorld, out: Path) -> None:
     out.mkdir(parents=True, exist_ok=True)
     hf = world.terrain
     crs = world.region.frame.local_crs()
-    north_up = np.flipud(hf.z).astype(np.float32)
-    write_geotiff(out / "heightfield.tif", GeoRaster(north_up, hf.geotransform(), crs, None, "heightfield"),
-                  ["elevation_m"])
-    hf.z.astype("<f4").tofile(out / "heightfield.f32")
+    rows, cols = hf.z.shape
+
+    def north_up(grid: np.ndarray) -> Callable[[int, int], np.ndarray]:
+        # File rows r0:r1 (row 0 = north) are grid rows rows-r1 .. rows-r0, flipped.
+        return lambda r0, r1: grid[rows - r1:rows - r0][::-1][None]
+
+    # Written in row blocks: no whole-grid copies of the heights or codes.
+    write_geotiff_rows(out / "heightfield.tif", rows, cols, 1, np.float32, crs, hf.geotransform(), north_up(hf.z),
+                       ["elevation_m"])
+    with open(out / "heightfield.f32", "wb") as f:
+        for r0 in range(0, rows, GEOTIFF_BLOCK_ROWS):
+            f.write(hf.z[r0:r0 + GEOTIFF_BLOCK_ROWS].astype("<f4").tobytes())
     _write_json(out / "heightfield.json", {
         "schema": "worldgen.heightfield", "schema_version": SCHEMA_VERSION, "xmin": hf.xmin, "ymin": hf.ymin,
         "resolution": hf.resolution, "cols": hf.cols, "rows": hf.rows, "dtype": "float32", "byte_order": "little",
@@ -497,9 +505,8 @@ def export_terrain(world: CanonicalWorld, out: Path) -> None:
         "source_coverage": float(hf.valid.mean()) if hf.valid is not None else None,
     }, indent=1)
     if world.terrain_codes is not None:
-        codes = np.flipud(world.terrain_codes).astype(np.uint8)
-        write_geotiff(out / "landcover.tif", GeoRaster(codes, hf.geotransform(), crs, None, "landcover"),
-                      ["landcover_code"])
+        write_geotiff_rows(out / "landcover.tif", rows, cols, 1, np.uint8, crs, hf.geotransform(),
+                           north_up(world.terrain_codes), ["landcover_code"])
         _write_json(out / "landcover.json", {"codes": {str(k): v for k, v in LANDCOVER_CODES.items()}}, indent=1)
 
 
@@ -507,13 +514,18 @@ def export_fields(world: CanonicalWorld, out: Path, sums: tuple[np.ndarray, np.n
     """``sums``: the trees' ``tree_cell_sums`` when they are not all in ``world.trees``."""
     out.mkdir(parents=True, exist_ok=True)
     g = world.vegetation_grid
-    fields = environmental_fields(g, world.trees, sums)
-    names = list(fields)
-    stack = np.stack([np.flipud(fields[n]) for n in names]).astype(np.float32)
-    rows = g.shape[0]
+    if sums is None:
+        sums = tree_cell_sums(g, world.trees)
+    rows, cols = g.shape
     transform = Affine(g.resolution, 0.0, g.xmin, 0.0, -g.resolution, g.ymin + rows * g.resolution)
-    write_geotiff(out / "vegetation_fields.tif",
-                  GeoRaster(stack, transform, world.region.frame.local_crs(), float("nan"), "fields"), names)
+
+    def block(r0: int, r1: int) -> np.ndarray:
+        # File rows r0:r1 (row 0 = north): the fields of grid rows rows-r1 .. rows-r0, flipped.
+        f = environmental_fields(g, sums=sums, rows=slice(rows - r1, rows - r0))
+        return np.stack([f[n][::-1] for n in FIELD_NAMES]).astype(np.float32)
+
+    write_geotiff_rows(out / "vegetation_fields.tif", rows, cols, len(FIELD_NAMES), np.float32,
+                       world.region.frame.local_crs(), transform, block, FIELD_NAMES, nodata=float("nan"))
     _write_json(out / "fields.json", {
         "schema": "worldgen.fields", "schema_version": SCHEMA_VERSION, "file": "vegetation_fields.tif",
         "resolution": g.resolution, "xmin": g.xmin, "ymin": g.ymin, "cols": g.shape[1], "rows": g.shape[0],
