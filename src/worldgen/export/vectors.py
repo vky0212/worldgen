@@ -154,6 +154,8 @@ class TreesParquetWriter:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.writer = pq.ParquetWriter(self.part, self.schema, compression="zstd")
         self.writer.write_table(table.replace_schema_metadata(meta).cast(self.schema))
+        del table
+        pa.default_memory_pool().release_unused()  # a chunk's buffers; Arrow's pool keeps them otherwise
 
     def close(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

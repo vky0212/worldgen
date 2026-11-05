@@ -82,36 +82,42 @@ def tree_cell_sums(grid: VegetationGrid, trees: TreeTable,
                    sums: tuple[np.ndarray, np.ndarray] | None = None) -> tuple[np.ndarray, np.ndarray]:
     """Stems and trunk basal area per grid cell, added to ``sums`` (a chunked export feeds
     its tables one by one)."""
-    stems, basal = sums if sums is not None else (np.zeros(grid.shape), np.zeros(grid.shape))
+    # Stems are counts (uint32: exact, half the memory of float64); basal areas are float64.
+    stems, basal = sums if sums is not None else (np.zeros(grid.shape, dtype=np.uint32), np.zeros(grid.shape))
     if len(trees):
         big = np.array([a in ("broadleaf", "conifer", "palm") for a in trees.archetype])
         rr, cc, inside = grid.cell_of(trees.x, trees.y)
         sel = big & inside
-        np.add.at(stems, (rr[sel], cc[sel]), 1.0)
+        np.add.at(stems, (rr[sel], cc[sel]), 1)
         np.add.at(basal, (rr[sel], cc[sel]), math.pi * (trees.trunk_radius[sel] + 0.4) ** 2)
     return stems, basal
 
 
+FIELD_NAMES = ["canopy_height_m", "canopy_coverage", "vegetation_density", "ground_obstruction", "visual_occlusion",
+               "confidence", "vegetation_category"]
+
+
 def environmental_fields(grid: VegetationGrid, trees: TreeTable | None = None,
-                         sums: tuple[np.ndarray, np.ndarray] | None = None) -> dict[str, np.ndarray]:
-    """Application-independent vegetation descriptors on the vegetation grid, from ``trees``
-    or from their ``tree_cell_sums``."""
+                         sums: tuple[np.ndarray, np.ndarray] | None = None,
+                         rows: slice | None = None) -> dict[str, np.ndarray]:
+    """Application-independent vegetation descriptors on the vegetation grid (rows ``rows``,
+    default all; every cell is computed from its own values), from ``trees`` or from their
+    ``tree_cell_sums``."""
+    rows = rows if rows is not None else slice(0, grid.shape[0])
     cell_area = grid.resolution ** 2
     stems, basal = sums if sums is not None else tree_cell_sums(grid, trees if trees is not None else TreeTable())
+    stems, basal = stems[rows], basal[rows]
+    category, coverage, canopy = grid.category[rows], grid.coverage[rows], grid.canopy_height[rows]
     density = stems / cell_area * 1e4
-    shrub = np.isin(grid.category, [CAT["shrubland"], CAT["wetland"]]) * grid.coverage
+    shrub = np.isin(category, [CAT["shrubland"], CAT["wetland"]]) * coverage
     obstruction = np.clip(shrub + basal / cell_area, 0.0, 1.0)
-    h = np.minimum(np.nan_to_num(grid.canopy_height), 25.0)
-    occlusion = 1.0 - np.exp(-1.5 * grid.coverage * h / 10.0)
-    return {
-        "canopy_height_m": grid.canopy_height.astype(np.float32),
-        "canopy_coverage": grid.coverage.astype(np.float32),
-        "vegetation_density": density.astype(np.float32),
-        "ground_obstruction": obstruction.astype(np.float32),
-        "visual_occlusion": occlusion.astype(np.float32),
-        "confidence": grid.confidence.astype(np.float32),
-        "vegetation_category": grid.category.astype(np.float32),
-    }
+    h = np.minimum(np.nan_to_num(canopy), 25.0)
+    occlusion = 1.0 - np.exp(-1.5 * coverage * h / 10.0)
+    return dict(zip(FIELD_NAMES, [
+        canopy.astype(np.float32), coverage.astype(np.float32), density.astype(np.float32),
+        obstruction.astype(np.float32), occlusion.astype(np.float32), grid.confidence[rows].astype(np.float32),
+        category.astype(np.float32),
+    ]))
 
 
 def region_outline_pieces(regions: list[VegetationRegion], terrain: Heightfield, grid: TileGrid,

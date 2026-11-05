@@ -135,23 +135,52 @@ class SourceCache:
         return raster, meta
 
 
-def write_geotiff(path: Path, r: GeoRaster, band_names: list[str] | None = None) -> None:
-    data = r.data if r.data.ndim == 3 else r.data[None, ...]
+def _geotiff_profile(rows: int, cols: int, count: int, dtype: Any, crs: Any, transform: Affine,
+                     nodata: Any = None) -> dict[str, Any]:
     profile = {
         "driver": "GTiff",
-        "height": data.shape[1],
-        "width": data.shape[2],
-        "count": data.shape[0],
-        "dtype": str(data.dtype),
-        "crs": r.crs,
-        "transform": r.transform,
+        "height": rows,
+        "width": cols,
+        "count": count,
+        "dtype": str(np.dtype(dtype)),
+        "crs": crs,
+        "transform": transform,
         "compress": "deflate",
-        "tiled": data.shape[1] >= 256 and data.shape[2] >= 256,
+        "tiled": rows >= 256 and cols >= 256,
     }
-    if r.nodata is not None:
-        profile["nodata"] = r.nodata
-    with rasterio.open(path, "w", **profile) as ds:
+    if nodata is not None:
+        profile["nodata"] = nodata
+    return profile
+
+
+def write_geotiff(path: Path, r: GeoRaster, band_names: list[str] | None = None) -> None:
+    data = r.data if r.data.ndim == 3 else r.data[None, ...]
+    with rasterio.open(path, "w", **_geotiff_profile(data.shape[1], data.shape[2], data.shape[0], data.dtype,
+                                                     r.crs, r.transform, r.nodata)) as ds:
         ds.write(data)
+        if band_names:
+            for i, n in enumerate(band_names, start=1):
+                ds.set_band_description(i, n)
+
+
+# Rows per block of write_geotiff_rows: the GeoTIFF tile height, so every block completes
+# whole tile rows and the file matches a write_geotiff of the whole array.
+GEOTIFF_BLOCK_ROWS = 256
+
+
+def write_geotiff_rows(path: Path, rows: int, cols: int, count: int, dtype: Any, crs: Any, transform: Affine,
+                       block: Callable[[int, int], np.ndarray], band_names: list[str] | None = None,
+                       nodata: Any = None) -> None:
+    """A GeoTIFF like ``write_geotiff`` written in blocks of ``GEOTIFF_BLOCK_ROWS`` file rows
+    (row 0 = the top): ``block(r0, r1)`` returns file rows ``r0:r1`` as (count, r1 - r0, cols),
+    so the whole raster never has to exist in memory."""
+    from rasterio.windows import Window
+
+    with rasterio.open(path, "w", **_geotiff_profile(rows, cols, count, dtype, crs, transform, nodata)) as ds:
+        for r0 in range(0, rows, GEOTIFF_BLOCK_ROWS):
+            r1 = min(r0 + GEOTIFF_BLOCK_ROWS, rows)
+            ds.write(np.asarray(block(r0, r1), dtype=dtype).reshape(count, r1 - r0, cols),
+                     window=Window(0, r0, cols, r1 - r0))
         if band_names:
             for i, n in enumerate(band_names, start=1):
                 ds.set_band_description(i, n)

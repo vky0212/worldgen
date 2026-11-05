@@ -142,6 +142,10 @@ compiler.
     `vegetation.budget.max_total`, a world-wide cap, places the whole world at once.
     `compile_world` called directly still places every tree, and
     `BuildOptions(keep_trees=True)` keeps them in `BuildResult.world.trees`.
+    The whole-grid rasters (`terrain/heightfield.tif|.f32`, `terrain/landcover.tif`,
+    `fields/vegetation_fields.tif`) are written in blocks of 256 rows
+    (`sources.base.write_geotiff_rows`, the GeoTIFF tile height, so the files are
+    the same as a single write); the vegetation fields are computed per block.
 
 ## Progress and browser builds
 
