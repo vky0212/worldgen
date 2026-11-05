@@ -135,7 +135,9 @@ compiler.
     with `compile_world(..., place_trees=False)`: the vegetation stage prepares the
     world-level inputs (regions, exclusions, the ground-cover density scale) but
     places nothing. The export walks squares of `export.chunk_tiles` × `chunk_tiles`
-    tiles (default 8, 2 km): `pipeline.place_vegetation` places the chunk's trees and
+    tiles (default 4, 1 km; every square meeting the vegetation grid, so trees outside the
+    tiles are placed as a whole-world pass places them): `pipeline.place_vegetation` places
+    the chunk's trees and
     ground cover (`place_trees` pulls in every candidate that can thin a tree inside the
     window, so each window gets exactly the whole-world trees, in the same per-tile
     order), the per-tile instance budget applies, the chunk's tile hashes decide what
@@ -145,7 +147,23 @@ compiler.
     statistics before the next chunk replaces them. Tree memory therefore follows the
     chunk, not the world; every output file but `trees.parquet` (row order: by chunk)
     is identical whatever the chunk size (`tests/integration/test_chunked_export.py`).
-    `vegetation.budget.max_total`, a world-wide cap, places the whole world at once.
+    A world-wide `vegetation.budget.max_total` takes a first pass over the chunks that
+    gathers the budget keys of the trees each chunk's per-tile budget keeps; the export then
+    keeps the trees at or above the `max_total`-th largest key (`budget.key_floor`), the
+    trees a whole-world selection keeps (ties at the floor are all kept).
+
+    **Worker processes** (`export/chunked.py`, `export.workers`, default automatic: one
+    process below 256 tiles or 4 chunks, else up to the cores minus one, at most 8): chunks
+    run in spawned processes that load a snapshot of the compiled world written once to
+    `<output>/.work` - a pickle in which every large numeric array is a `.npy` file the
+    workers map read-only (shared through the OS page cache) and geometries keep their
+    precision grid (GEOS results such as `representative_point` depend on it). A chunk's
+    work and outputs are the same in any process: `ChunkExporter.run` writes the chunk's tile
+    files and returns a `ChunkResult` (tile states, locator ids, tree issues, the
+    trees.parquet rows, per-tree field contributions - basal areas summed as integers, so
+    in any order), and `ChunkMerger` applies results strictly in chunk order. Output files
+    are byte-identical for any worker count (`tests/integration/test_chunked_export.py`;
+    n25_179: all 1,970 files, 1 vs 8 workers).
     `compile_world` called directly still places every tree, and
     `BuildOptions(keep_trees=True)` keeps them in `BuildResult.world.trees`.
     The whole-grid rasters (`terrain/heightfield.tif|.f32`, `terrain/landcover.tif`,

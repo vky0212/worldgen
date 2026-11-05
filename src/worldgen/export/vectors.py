@@ -136,10 +136,15 @@ class TreesParquetWriter:
         self.typed: set[str] = set()   # columns not all-null in some table
 
     def add(self, trees: Any) -> None:
-        if not len(trees):
-            return
-        table = _geopandas_to_arrow(_json_columns(trees_frame(self.world, trees)), index=False,
-                                    write_covering_bbox=False)
+        if len(trees):
+            self.add_table(self.table_of(self.world, trees))
+
+    @staticmethod
+    def table_of(world: CanonicalWorld, trees: Any) -> pa.Table:
+        """The Arrow table of ``trees`` as ``add`` writes it (made where the trees are)."""
+        return _geopandas_to_arrow(_json_columns(trees_frame(world, trees)), index=False, write_covering_bbox=False)
+
+    def add_table(self, table: pa.Table) -> None:
         meta = dict(table.schema.metadata or {})
         geo = json.loads(meta.pop(b"geo"))
         self.typed |= {f.name for f in table.schema if not pa.types.is_null(f.type)}

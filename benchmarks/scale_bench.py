@@ -278,6 +278,7 @@ def measure(args: argparse.Namespace) -> dict[str, Any]:
         "peak_mb": None if (p := peak_rss_mb()) is None else round(p, 1),
         # Working set sampled during each stage ("setup" = loading sources and config).
         "stage_peak_mb": stage_peaks,
+        "export_workers": world.stats.get("export_workers"),
         "output_bytes": sizes,
         "counts": {"trees": len(tr), "trees_rendered": int(tr.rendered_mask().sum()) if len(tr) else 0,
                    "buildings": len(world.buildings), "graph_edges": len(world.graph.edges),
@@ -318,6 +319,9 @@ def _row(r: dict[str, Any], base: dict[str, Any] | None) -> str:
     if r.get("stage_peak_mb"):
         stage, mb = max(r["stage_peak_mb"].items(), key=lambda kv: kv[1])
         line += f"   peak in {stage}"
+    if r.get("export_workers"):
+        ew = r["export_workers"]
+        line += f"   + {ew['processes']} workers <= {ew['worker_peak_mb']:.0f} MB each"
     if base is not None:
         line += f"   [x{_work_s(base) / max(work, 1e-9):.2f} vs baseline]"
     return line

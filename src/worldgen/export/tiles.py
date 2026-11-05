@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 from typing import Any
 
 import numpy as np
@@ -57,6 +58,8 @@ def trees_by_tile(world: CanonicalWorld) -> dict[str, np.ndarray]:
         return {}
     size = float(world.config.tiling.tile_size)
     idx = np.nonzero(tr.rendered_mask())[0]
+    if not len(idx):   # every tree dropped by the budget
+        return {}
     i = _owner_cell(tr.x[idx], size)
     j = _owner_cell(tr.y[idx], size)
     order = np.lexsort((idx, j, i))
@@ -67,7 +70,7 @@ def trees_by_tile(world: CanonicalWorld) -> dict[str, np.ndarray]:
 
 
 # Configuration keys that never change a tile's files, kept out of the tile input hashes.
-NOT_TILE_INPUTS: dict[str, tuple[str, ...]] = {"export": ("combined_glb_max_tiles", "chunk_tiles")}
+NOT_TILE_INPUTS: dict[str, tuple[str, ...]] = {"export": ("combined_glb_max_tiles", "chunk_tiles", "workers")}
 # Keys added after format 1.0, hashed only when set away from their default, so worlds built
 # with the defaults keep their tile hashes (and incremental rebuilds) across the upgrade.
 LATER_KEY_DEFAULTS: dict[str, dict[str, Any]] = {"export": {"mode": "baked"}, "terrain": {"height_quantum_m": 0.0}}
@@ -290,15 +293,23 @@ def _overlaps(boxes: np.ndarray, b: tuple[float, float, float, float], margin: f
             & (boxes[:, 1] <= b[3] + margin) & (boxes[:, 3] >= b[1] - margin))
 
 
-def tile_chunks(tiles: list[str], chunk: int, tile_size: float
+def tile_chunks(tiles: list[str], chunk: int, tile_size: float,
+                extent: tuple[float, float, float, float] | None = None
                 ) -> list[tuple[tuple[float, float, float, float] | None, list[str]]]:
     """Tiles grouped into ``chunk`` x ``chunk`` squares of the tile lattice, with each square's
     bounds, squares in (j, i) order and tiles in their given order (``chunk`` <= 0: one chunk
-    covering everything, bounds None)."""
+    covering everything, bounds None). With ``extent`` (the vegetation grid's), every square
+    meeting it is a chunk, with or without tiles, so the chunks place the trees of the whole
+    extent as one whole-world placement does."""
     if chunk <= 0:
         return [(None, list(tiles))]
     span = chunk * tile_size
     groups: dict[tuple[int, int], list[str]] = {}
+    if extent is not None:
+        x0, y0, x1, y1 = extent
+        for cj in range(math.floor(y0 / span), math.ceil(y1 / span)):
+            for ci in range(math.floor(x0 / span), math.ceil(x1 / span)):
+                groups[(ci, cj)] = []
     for t in tiles:
         i, j = parse_tile_id(t)
         groups.setdefault((i // chunk, j // chunk), []).append(t)
