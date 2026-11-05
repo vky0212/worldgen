@@ -47,6 +47,7 @@ from worldgen.export.tiles import (
 )
 from worldgen.export.tileset import tile_paths
 from worldgen.export.vectors import TreesParquetWriter
+from worldgen.hashing import write_hashed
 from worldgen.log import get_logger
 from worldgen.pipeline import apply_tree_budget, place_vegetation, vegetation_exclusions
 from worldgen.progress import current
@@ -84,9 +85,9 @@ class ChunkResult:
     trees: dict[str, Any] | None = None                                  # deferred trees' outputs
 
 
-def _write_json(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, allow_nan=False), encoding="utf-8")
+def _json_bytes(data: Any) -> bytes:
+    """A tile's JSON document as written (compact JSON has no line breaks to translate)."""
+    return json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8")
 
 
 def _tob_ids(sections: dict[str, bytes]) -> list[str]:
@@ -179,6 +180,8 @@ class ChunkExporter:
                                    buildings_as_data=self.bindex.get(t, []) if self.data else None)
         content = out / paths["content"]
         content.parent.mkdir(parents=True, exist_ok=True)
+        # Each file's hash is taken from the bytes written (build_state "files"; write_manifest).
+        files: dict[str, list[Any]] = {}
         if self.data:
             i, j = parse_tile_id(t)
             sections = tile_terrain_sections(w, t, self.rgba)
@@ -187,25 +190,26 @@ class ChunkExporter:
             if bl:
                 sections += building_sections(bl, [building_plan(b, cfg.buildings) for b in bl], bounds)
             sections.append(("GLB", assets["glb"], False))
-            content.write_bytes(write_container(0, i, j, sections))
+            files["content"] = write_hashed(content, write_container(0, i, j, sections))
             res.tile_entities[t] = list(assets["meta"]["entities"]) + _tob_ids({s[0]: s[1] for s in sections})
         else:
-            content.write_bytes(assets["glb"])
+            files["content"] = write_hashed(content, assets["glb"])
         col = out / paths["collision"]
         if assets["collision"] is not None:
-            col.write_bytes(assets["collision"])
+            files["collision"] = write_hashed(col, assets["collision"])
         elif col.exists():
             col.unlink()
-        _write_json(out / paths["meta"], assets["meta"])
+        files["meta"] = write_hashed(out / paths["meta"], _json_bytes(assets["meta"]))
         ortho = out / paths["ortho"]
         if self.baker is not None:
-            ortho.write_bytes(self.baker.bake(bounds))
+            files["ortho"] = write_hashed(ortho, self.baker.bake(bounds))
         elif ortho.exists():
             ortho.unlink()
         res.built[t] = {"hash": res.hashes[t], "counts": assets["counts"], "zrange": assets["zrange"],
                         "collision": assets["collision"] is not None, "ortho": self.baker is not None}
         if self.data:
             res.built[t]["lift"] = assets["lift"]
+        res.built[t]["files"] = files
 
     def _tree_outputs(self, tr: Any, bounds: tuple[float, float, float, float] | None, tiles: list[str],
                       budget: Any) -> dict[str, Any]:

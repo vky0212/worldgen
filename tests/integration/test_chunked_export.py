@@ -26,8 +26,20 @@ def _build(out: Path, mode: str, chunk: int, workers: int, cap: int):  # noqa: A
     return build(cfg, BuildOptions(out, fixture="demo_town"))
 
 
+def _digest(p: Path) -> str:
+    if p.name != "build_state.json":
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+    # The build state records when each tile file was written (its "files" mtime): leave that out.
+    state = json.loads(p.read_text(encoding="utf-8"))
+    for group in ("tiles", "levels"):
+        for st in state.get(group, {}).values():
+            for rec in st.get("files", {}).values():
+                del rec[2]
+    return hashlib.sha256(json.dumps(state, sort_keys=True).encode("utf-8")).hexdigest()
+
+
 def _digests(root: Path) -> dict[str, str]:
-    return {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+    return {p.relative_to(root).as_posix(): _digest(p)
             for p in sorted(root.rglob("*")) if p.is_file() and p.name != "manifest.json"}
 
 

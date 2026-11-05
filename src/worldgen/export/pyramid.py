@@ -41,7 +41,7 @@ from worldgen.export.coarse import coarse_buildings, coarse_trees, read_leaves
 from worldgen.export.container import write_container
 from worldgen.export.heightmap import level_node_range, terrain_sections, tile_node_range
 from worldgen.export.tileset import DATA_SCHEMA_VERSION, SUBTREE_LEVEL, level_paths
-from worldgen.hashing import sha256_json
+from worldgen.hashing import sha256_json, write_hashed
 from worldgen.terrain.heightfield import Heightfield
 from worldgen.tiling.grid import TileGrid, parse_tile_id, tile_id
 
@@ -131,7 +131,7 @@ def export_coarse_tile(world: Any, rgba: np.ndarray, baker: Any, out: Path, leve
                        leaves: list[Key], h: str) -> dict[str, Any]:
     """Writes a coarse tile's ``.wgt`` (and orthophoto with a ``baker`` for its level); returns
     its ``build_state.json`` entry: hash, terrain and content errors, height range of its terrain
-    and content, ortho, building and tree counts. Its content comes from the level-0 tiles'
+    and content, ortho, building and tree counts, and its files' hashes (``write_hashed``). Its content comes from the level-0 tiles'
     files in ``out``, so they must be written first."""
     cfg = world.config
     size = cfg.tiling.tile_size
@@ -146,10 +146,10 @@ def export_coarse_tile(world: Any, rgba: np.ndarray, baker: Any, out: Path, leve
     sections += bld + tre
     content = out / paths["content"]
     content.parent.mkdir(parents=True, exist_ok=True)
-    content.write_bytes(write_container(level, i, j, sections))
+    files = {"content": write_hashed(content, write_container(level, i, j, sections))}
     ortho = out / paths["ortho"]
     if baker is not None:
-        ortho.write_bytes(baker.bake(bounds))
+        files["ortho"] = write_hashed(ortho, baker.bake(bounds))
     elif ortho.exists():
         ortho.unlink()
     grid = TileGrid(size)
@@ -160,7 +160,7 @@ def export_coarse_tile(world: Any, rgba: np.ndarray, baker: Any, out: Path, leve
     if t_top is not None:
         zmax = max(zmax, t_top)
     return {"hash": h, "terr": terr, "cerr": max(b_err, t_err), "zrange": [round(zmin, 3), round(zmax, 3)],
-            "ortho": baker is not None, "counts": {"buildings": n_bld, "trees": n_tre}}
+            "ortho": baker is not None, "counts": {"buildings": n_bld, "trees": n_tre}, "files": files}
 
 
 def level_work(plan: dict[int, dict[Key, list[Key]]], leaf_hashes: dict[Key, str], prev: dict[str, Any],
