@@ -1,4 +1,4 @@
-"""Coarser levels of detail of a data-first world (format 2.4): the terrain pyramid.
+"""Coarser levels of detail of a data-first world (format 2.4, content 2.5): the pyramid.
 
 A tile of level ``L`` (1 to 4) stands for the ``2**L x 2**L`` level-0 tiles of its square,
 ``tile_size * 2**L`` metres on a side, and exists where any of them does. It has as many
@@ -10,7 +10,8 @@ heightmap nodes per side as a level-0 tile, ``2**L`` times further apart:
   above (the terrain colour, with the water surface blended over water);
 * land-cover codes: the level-0 codes at the coarse nodes;
 * orthophoto: the imagery baked for the tile's square at the level's pixel size, with the
-  level-0 colour levels.
+  level-0 colour levels;
+* buildings and trees (format 2.5): those of its level-0 tiles, simplified (``coarse``).
 
 A coarse tile covers only its level-0 tiles: consumers leave out the cells over missing ones.
 
@@ -19,8 +20,9 @@ stands for, in metres. It is the largest of
 
 * ``terr``, the terrain error: the largest height difference between the level-0 heightmap and
   the coarse mesh at the level-0 nodes of the tile's level-0 tiles;
+* ``cerr``, the content error of its buildings and trees (``coarse``);
 * the height of what the tile leaves out: the ``lift`` of its level-0 tiles, the largest height
-  of their buildings, trees, bridges and other layers above the terrain;
+  of their roads, bridges, water and other ``GLB `` layers above the terrain;
 * half the tile's node spacing;
 
 and never less than a child's. Viewers refine a tile when its error projects to more pixels
@@ -35,6 +37,7 @@ from typing import Any
 
 import numpy as np
 
+from worldgen.export.coarse import coarse_buildings, coarse_trees, read_leaves
 from worldgen.export.container import write_container
 from worldgen.export.heightmap import level_node_range, terrain_sections, tile_node_range
 from worldgen.export.tileset import DATA_SCHEMA_VERSION, SUBTREE_LEVEL, level_paths
@@ -43,7 +46,7 @@ from worldgen.terrain.heightfield import Heightfield
 from worldgen.tiling.grid import TileGrid, parse_tile_id, tile_id
 
 # Part of every coarse tile's input hash: bump when what a coarse tile holds changes.
-PYRAMID_VERSION = 1
+PYRAMID_VERSION = 2
 
 Key = tuple[int, int]
 
@@ -99,14 +102,20 @@ def coarse_hash(level: int, i: int, j: int, leaf_hashes: dict[Key, str], extra: 
                         "tile": [i, j], "leaves": near, **extra})
 
 
+def coarse_heightfield(hf: Heightfield, bounds: tuple[float, float, float, float], level: int) -> Heightfield:
+    """The terrain of a coarse tile: the level-0 heights at its level's nodes."""
+    k = 1 << level
+    r = hf.resolution
+    r0, r1, c0, c1 = level_node_range(hf, bounds, level)
+    return Heightfield(hf.xmin + c0 * r, hf.ymin + r0 * r, r * k, hf.z[r0:r1 + 1:k, c0:c1 + 1:k])
+
+
 def terrain_error(hf: Heightfield, bounds: tuple[float, float, float, float], level: int,
                   leaf_bounds: list[tuple[float, float, float, float]]) -> float:
     """Largest |level-0 height - coarse mesh| at the level-0 nodes of the given level-0 tiles
     (the coarse mesh splits its cells along the same diagonal), rounded up to the millimetre."""
-    k = 1 << level
     r = hf.resolution
-    r0, r1, c0, c1 = level_node_range(hf, bounds, level)
-    coarse = Heightfield(hf.xmin + c0 * r, hf.ymin + r0 * r, r * k, hf.z[r0:r1 + 1:k, c0:c1 + 1:k])
+    coarse = coarse_heightfield(hf, bounds, level)
     worst = 0.0
     for b in leaf_bounds:
         a0, a1, b0, b1 = tile_node_range(hf, b)
@@ -121,13 +130,20 @@ def terrain_error(hf: Heightfield, bounds: tuple[float, float, float, float], le
 def export_coarse_tile(world: Any, rgba: np.ndarray, baker: Any, out: Path, level: int, i: int, j: int,
                        leaves: list[Key], h: str) -> dict[str, Any]:
     """Writes a coarse tile's ``.wgt`` (and orthophoto with a ``baker`` for its level); returns
-    its ``build_state.json`` entry: hash, terrain error, terrain height range, ortho."""
+    its ``build_state.json`` entry: hash, terrain and content errors, height range of its terrain
+    and content, ortho, building and tree counts. Its content comes from the level-0 tiles'
+    files in ``out``, so they must be written first."""
     cfg = world.config
     size = cfg.tiling.tile_size
     hf = world.terrain
     bounds = level_bounds(size, level, i, j)
     paths = level_paths(level, i, j)
     sections = terrain_sections(hf, bounds, cfg.height_quantum(), rgba, world.terrain_codes, level)
+    coarse = coarse_heightfield(hf, bounds, level)
+    leaf_content = read_leaves(out, leaves, size)
+    bld, b_err, b_range, n_bld = coarse_buildings(leaf_content, hf, level, bounds)
+    tre, t_err, t_top, n_tre = coarse_trees(leaf_content, coarse, level, bounds)
+    sections += bld + tre
     content = out / paths["content"]
     content.parent.mkdir(parents=True, exist_ok=True)
     content.write_bytes(write_container(level, i, j, sections))
@@ -138,11 +154,13 @@ def export_coarse_tile(world: Any, rgba: np.ndarray, baker: Any, out: Path, leve
         ortho.unlink()
     grid = TileGrid(size)
     terr = terrain_error(hf, bounds, level, [grid.bounds(tile_id(a, b)) for a, b in leaves])
-    r0, r1, c0, c1 = level_node_range(hf, bounds, level)
-    k = 1 << level
-    z = hf.z[r0:r1 + 1:k, c0:c1 + 1:k]
-    return {"hash": h, "terr": terr, "zrange": [round(float(z.min()), 3), round(float(z.max()), 3)],
-            "ortho": baker is not None}
+    zmin, zmax = float(coarse.z.min()), float(coarse.z.max())
+    if b_range is not None:
+        zmin, zmax = min(zmin, b_range[0]), max(zmax, b_range[1])
+    if t_top is not None:
+        zmax = max(zmax, t_top)
+    return {"hash": h, "terr": terr, "cerr": max(b_err, t_err), "zrange": [round(zmin, 3), round(zmax, 3)],
+            "ortho": baker is not None, "counts": {"buildings": n_bld, "trees": n_tre}}
 
 
 def level_work(plan: dict[int, dict[Key, list[Key]]], leaf_hashes: dict[Key, str], prev: dict[str, Any],
@@ -218,7 +236,7 @@ def finish_levels(plan: dict[int, dict[Key, list[Key]]], tile_state: dict[str, d
             hi = [st["zrange"][1]] + [zr[c][1] for c in kids if zr.get(c)]
             k_lift[key] = max([lift[c] for c in kids], default=0.0)
             floor = resolution * (1 << level) / 2.0
-            e = max(st["terr"], k_lift[key], floor, max([err[c] for c in kids], default=0.0))
+            e = max(st["terr"], st.get("cerr", 0.0), k_lift[key], floor, max([err[c] for c in kids], default=0.0))
             k_err[key] = round(e, 3)
             k_zr[key] = [min(lo), max(hi)]
             rows[key] = {"err": k_err[key], "terr": st["terr"], "zrange": k_zr[key], "ortho": st["ortho"],

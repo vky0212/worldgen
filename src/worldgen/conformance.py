@@ -10,7 +10,8 @@
   corner, as float32): positions, normals, texture coordinates, colours (u8) and triangle
   indices. The level-1 tile's mesh is that of the every-other-node heightfield.
 * ``tree_tiles.json``: a tile with tree records (TRE, TOB) and the ids, instance transforms and
-  seeds a runtime derives from them.
+  seeds a runtime derives from them; and the level-1 tile over it (``coarse``: thinned trees
+  and flat building prisms without ids) with its instance transforms and prism heights.
 * ``building_tiles.json``: a tile with building footprint records (BLD, IDS) and the volume,
   roof / floor areas and height range of each building's baked mesh.
 * ``graph_core.json``: a small road graph's ``core.wgt`` (base64) and ``strings.json`` with the
@@ -161,7 +162,54 @@ def tree_vectors() -> dict[str, Any]:
                          "translation": inst["TRANSLATION"].ravel().tolist(),
                          "rotation": inst["ROTATION"].ravel().tolist(),
                          "scale": inst["SCALE"].ravel().tolist(), "seeds": seeds},
+            "coarse": _coarse_vector(hf, rgba, codes, c.sections, x0, y0),
             "note": "translation: compare within 1e-4 (float32 of a float64 height lookup)"}
+
+
+def _coarse_vector(hf: Heightfield, rgba: np.ndarray, codes: np.ndarray, tree_tile: dict[str, bytes],
+                   x0: float, y0: float) -> dict[str, Any]:
+    """The level-1 tile (0, 0) over the tree tile and two buildings of tile (0, 0)."""
+    from shapely.geometry import box
+
+    from worldgen.export.coarse import LeafContent, coarse_buildings, coarse_trees
+    from worldgen.export.container import decode_heights, read_container
+    from worldgen.export.footprints import COLUMNS, decode_buildings, encode_buildings
+    from worldgen.export.instances import decode_trees, instances_from_records
+    from worldgen.export.pyramid import coarse_heightfield
+
+    cols: dict[str, list[Any]] = {name: [] for name, _, _ in COLUMNS}
+    xy = []
+    # A flat block (80 m2) and a small, tall gabled building (36 m2, 14 m), both kept at level 1.
+    for poly, height, roof in ((box(6, 5, 16, 13), 9.0, 0.0), (box(20, 20, 26, 26), 14.0, 3.0)):
+        base = float(hf.sample(*np.asarray(poly.exterior.coords)[:-1].T).min())
+        cols["bottom"].append(base - 1.0)
+        cols["top"].append(base + height)
+        cols["polygons"].append(1)
+        cols["material"].append(len(cols["material"]))
+        cols["shape"].append(1 if roof else 0)
+        cols["rings"].append(1)
+        cols["eave"].append(base + height - roof)
+        for name, v in (("cx", poly.centroid.x), ("cy", poly.centroid.y), ("ux", 1.0), ("uy", 0.0), ("half", 3.0)):
+            cols[name].append(v)
+        v = np.asarray(poly.exterior.coords)[:-1]
+        cols["vertices"].append(len(v))
+        xy.append(np.rint(v * 1000.0))
+    leaves = LeafContent()
+    leaves.add({"BLD": encode_buildings(cols, xy)}, 0.0, 0.0, TILE)
+    leaves.add(tree_tile, x0, y0, TILE)
+    bounds = (0.0, 0.0, 2 * TILE, 2 * TILE)
+    bld = coarse_buildings(leaves, hf, 1, bounds)[0]
+    tre = coarse_trees(leaves, coarse_heightfield(hf, bounds, 1), 1, bounds)[0]
+    wgt = write_container(1, 0, 0, terrain_sections(hf, bounds, QUANTUM, rgba, codes, level=1) + bld + tre)
+    c = read_container(wgt)
+    rec = decode_trees(c.sections["TRE"])
+    inst = instances_from_records(rec, decode_heights(c.sections["HGT"]), 0.0, 0.0, 2 * TILE)
+    b = decode_buildings(c.sections["BLD"])
+    return {"level": 1, "i": 0, "j": 0, "size": 2 * TILE, "wgt_base64": base64.b64encode(wgt).decode("ascii"),
+            "expected": {"archetype_codes": [int(v) & 15 for v in rec["arch_cat"]],
+                         "translation": inst["TRANSLATION"].ravel().tolist(),
+                         "scale": inst["SCALE"].ravel().tolist(),
+                         "bottom": b["bottom"].astype(float).tolist(), "top": b["top"].astype(float).tolist()}}
 
 
 BUILDING_TILE = (3, -2, 256.0)

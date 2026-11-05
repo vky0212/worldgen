@@ -165,8 +165,12 @@ def test_incremental_and_mode_switch(tmp_path):
 
 
 def test_coarser_levels(data_world):
+    from worldgen.export.coarse import BUILDING_THRESHOLDS, TREE_LEVELS
     from worldgen.export.container import encode_heights, write_container
+    from worldgen.export.footprints import decode_buildings
+    from worldgen.export.instances import decode_trees
     from worldgen.export.pyramid import plan_levels, top_level
+    from worldgen.export.tileset import level_paths
 
     out, res = data_world
     world, cfg = res.world, res.world.config
@@ -175,10 +179,10 @@ def test_coarser_levels(data_world):
     tiles = list(state["tiles"])
     plan = plan_levels(tiles, top_level(cfg.export.lod_levels, cfg.tiling.tile_size, world.terrain.resolution))
     assert sorted(plan) == [lv["level"] for lv in ts["levels"][1:]] == [1, 2]
-    assert all(st["lift"] >= 0 for st in state["tiles"].values())
-    assert max(st["lift"] for st in state["tiles"].values()) > 10            # buildings and trees
+    assert all(st["lift"] >= 0 for st in state["tiles"].values())     # GLB layers only (bridges, ...)
     assert ts["uri"]["ortho"] == "tiles/{level}/{si}_{sj}/{i}_{j}.ortho.jpg"
     seen = 0
+    content = {"BLD": 0, "TRE": 0}
     for st in ts["subtrees"]:
         sub = json.loads((out / ts["uri"]["subtree"].format(**st)).read_text(encoding="utf-8"))
         for lv in sub["levels"][1:]:
@@ -186,16 +190,41 @@ def test_coarser_levels(data_world):
             floor = world.terrain.resolution * (1 << level) / 2
             for k, (i, j) in enumerate(zip(lv["i"], lv["j"])):
                 assert (i, j) in plan[level]
-                assert lv["err"][k] >= max(lv["terr"][k], floor)
+                cerr = state["levels"][f"{level}/{i}_{j}"]["cerr"]
+                assert lv["err"][k] >= max(lv["terr"][k], cerr, floor)
                 keys = {"level": level, "si": st["si"], "sj": st["sj"], "i": i, "j": j}
                 c = read_container((out / ts["uri"]["content"].format(**keys)).read_bytes())
-                assert (c.level, c.i, c.j) == (level, i, j) and sorted(c.sections) == ["HGT", "LCC", "RGB"]
+                assert (c.level, c.i, c.j) == (level, i, j)
+                # Terrain, and buildings and trees without entities (no IDS, no TOB).
+                assert {"HGT", "LCC", "RGB"} <= set(c.sections) <= {"HGT", "LCC", "RGB", "BLD", "TRE"}
                 assert decode_heights(c.sections["HGT"]).spacing == world.terrain.resolution * (1 << level)
+                if "TRE" in c.sections:
+                    assert level <= TREE_LEVELS
+                    tr = decode_trees(c.sections["TRE"])
+                    assert not (tr["k"].any() or tr["dx"].any() or tr["dy"].any() or (tr["flags"] > 1).any())
+                    content["TRE"] += 1
+                if "BLD" in c.sections:
+                    rec = decode_buildings(c.sections["BLD"])
+                    assert (rec["shape"] == 0).all() and (rec["bottom"] < rec["top"]).all()     # flat prisms
+                    assert np.array_equal(rec["eave"], np.repeat(rec["top"], rec["polygons"]))
+                    content["BLD"] += 1
                 seen += 1
     assert seen == sum(len(v) for v in plan.values())
+    assert content["BLD"] and content["TRE"]
     assert state["levels"] and all(k.split("/")[0] in ("1", "2") for k in state["levels"])
+    # Fewer buildings and trees up the levels.
+    n = {lv: [0, 0] for lv in (0, 1, 2)}
+    for t in state["tiles"].values():
+        n[0] = [n[0][0] + t["counts"]["buildings"], n[0][1] + t["counts"]["trees"]]
+    for key, st in state["levels"].items():
+        lv = int(key.split("/")[0])
+        n[lv] = [n[lv][0] + st["counts"]["buildings"], n[lv][1] + st["counts"]["trees"]]
+    assert n[0][0] >= n[1][0] >= n[2][0] and n[0][1] > n[1][1] > n[2][1] > 0, n
+    assert sorted(BUILDING_THRESHOLDS) == [1, 2, 3, 4]
     v = validate_outputs(out)
+    assert v["errors"] == 0, v["lines"]
     assert any("heights nest in level 0" in line for line in v["lines"]), v["lines"]
+    assert any("each one is a tree of the level below" in line for line in v["lines"]), v["lines"]
 
     # The validator notices a coarse tile that disagrees with level 0.
     level, (i, j) = 1, next(iter(plan[1]))
@@ -212,6 +241,23 @@ def test_coarser_levels(data_world):
         path.write_bytes(write_container(level, i, j, sections))
         lines = validate_outputs(out)["lines"]
         assert any("coarser-level tiles differ from level 0" in line for line in lines), lines
+    finally:
+        path.write_bytes(original)
+
+    # ... and a coarse tree that is not a tree of the level below.
+    level, (i, j) = next((lv, key) for lv in (2, 1) for key in plan[lv]
+                         if "TRE" in read_container((out / level_paths(lv, *key)["content"]).read_bytes()).sections)
+    path = out / level_paths(level, i, j)["content"]
+    original = path.read_bytes()
+    try:
+        c = read_container(original)
+        tr = decode_trees(c.sections["TRE"]).copy()
+        tr["x"][0] = (int(tr["x"][0]) + 6000) % 65536
+        payload = c.sections["TRE"][:8] + tr.tobytes()
+        sections = [(t, payload if t == "TRE" else data, True) for t, data in c.sections.items()]
+        path.write_bytes(write_container(level, i, j, sections))
+        lines = validate_outputs(out)["lines"]
+        assert any("are not trees of the level below" in line for line in lines), lines
     finally:
         path.write_bytes(original)
 

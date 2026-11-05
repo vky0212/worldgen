@@ -18,6 +18,10 @@ Major version 2 is the **data-first** layout (`export.mode: data`, see
 [Data-first tiles](#data-first-tiles-format-2x)): terrain ships as heightmaps that
 consumers mesh themselves. `export.mode: baked` (the default) keeps writing 1.x.
 
+* **2.5.0** — coarse tiles carry simplified buildings and trees: flat building prisms
+  (`BLD `, no `IDS `) at every coarse level and a thinned, nested subset of the trees
+  (`TRE `, no `TOB `) at levels 1 and 2; their content error enters the geometric error
+  ([Levels of detail](#levels-of-detail-24)). Readers of 2.5 still accept 2.0–2.4 worlds.
 * **2.4.0** — levels of detail: tiles of levels 1 to 4 (`export.lod_levels`), each
   standing for `2^L × 2^L` level-0 tiles with terrain, colours, land cover and orthophoto
   only, listed in the subtree files with their geometric and terrain errors
@@ -277,7 +281,7 @@ square as in 1.x. A tile of level `L` covers `T·2^L` metres, tile `(i, j)` span
 
 ```jsonc
 {
-  "schema": "worldgen.tileset", "schema_version": "2.4.0",
+  "schema": "worldgen.tileset", "schema_version": "2.5.0",
   "tile_size": 256, "subtree_tiles": 16,
   "levels": [{"level": 0, "size": 256, "spacing": 4.0, "geometric_error": 0.0},
              // 2.4: coarser levels; geometric_error = the level's largest; ortho with imagery
@@ -383,9 +387,9 @@ and its record is in the tile's `meta.json`.
 
 Levels 1 to 4 (`export.lod_levels`, default 4; `export/pyramid.py`) let a consumer draw a
 large world from afar without loading every tile. A tile of level `L` stands for the
-`2^L × 2^L` level-0 tiles of its square and exists where any of them does. Its `.wgt` holds
-`HGT `, `RGB ` and `LCC ` only (container `level` = `L`), with as many nodes per side as a
-level-0 tile, `2^L` times further apart:
+`2^L × 2^L` level-0 tiles of its square and exists where any of them does. Its `.wgt`
+(container `level` = `L`) holds `HGT `, `RGB ` and `LCC ` with as many nodes per side as a
+level-0 tile, `2^L` times further apart, and (2.5) simplified buildings and trees:
 
 * **Heights:** the level-0 heights at every `2^L`-th node, so the levels are **nested**: a
   coarse vertex is a level-0 vertex (bit for bit), and the apron follows the level-0 rule
@@ -398,15 +402,37 @@ level-0 tile, `2^L` times further apart:
   `levels[L].ortho.pixels`, with the level-0 colour levels.
 * **Coverage:** where some of its level-0 tiles do not exist (the region's edge), the tile
   stands for the others only: leave out the cells whose centre lies in a missing tile.
-* **No entities:** no `meta.json`, no collision mesh, no feature ids.
+* **Buildings** (2.5, every coarse level; `export/coarse.py`): those of its level-0 tiles'
+  `BLD ` whose footprint area or height above the terrain (top minus the lowest level-0
+  terrain at the footprint's vertices) reaches the level's threshold — level 1: 50 m² or
+  12 m, level 2: 300 m² or 25 m, level 3: 2,000 m² or 40 m, level 4: 8,000 m² or 80 m — as
+  flat prisms (`shape` 0, `eave` = `top`): footprint polygons simplified (Douglas–Peucker,
+  topology preserved) with a tolerance of half the level's node spacing, the roof halfway
+  between the building's lowest eave and its top, the floor lowered to the lowest coarse
+  terrain node around the footprint, the same material. Mesh them like level-0 buildings.
+* **Trees** (2.5, levels 1 and 2): the tile is cut into 64 × 64 cells, and each cell keeps
+  its tallest level-0 tree (ties: the southmost, then the westmost), its crown radius grown
+  to `√(Σ r²)` over the cell's trees, but to no more than half its height (and never
+  shrunk). A level-2 cell is four level-1 cells, so the levels are **nested**: every level-2
+  tree is a level-1 tree. Records as at level 0, positions relative to the coarse tile, with
+  `k`, `dx`, `dy` 0 and only the observed flag. Levels 3 and 4 have no trees.
+* **No entities:** no `meta.json`, no collision mesh, no feature ids, no `IDS ` or `TOB `.
 
 **Geometric error** `err` (m): how far drawing the tile may be from the full-detail world
-it stands for — the largest of its terrain error `terr` (the largest height difference
-between the level-0 heightmap and the coarse mesh at the level-0 nodes of its tiles), the
-height of what it leaves out (the largest height of its level-0 tiles' buildings, trees,
-bridges and other layers above the terrain) and half its node spacing, and never less than
-a child's. Refine a tile (draw its children instead) when `err` projects to more than your
-screen-space error threshold.
+it stands for — the largest of
+
+* its terrain error `terr`: the largest height difference between the level-0 heightmap and
+  the coarse mesh at the level-0 nodes of its tiles;
+* its content error (2.5): the height of every building it leaves out; half the roof height
+  (`top` − lowest eave) of every prism and the simplification tolerance; for every tree it
+  leaves out, the smaller of its height and its distance to its cell's kept tree (at levels
+  3 and 4: every tree's height); the crown growth of every kept tree;
+* the height of what it leaves out entirely: the largest height of its level-0 tiles' roads,
+  bridges, water and other `GLB ` layers above the terrain;
+* half its node spacing;
+
+and never less than a child's. Refine a tile (draw its children instead) when `err`
+projects to more than your screen-space error threshold.
 
 **Cracks:** a coarse edge skips the level-0 nodes between its own, so neighbouring tiles of
 different levels leave small gaps. The bundled viewer hangs **skirts** under every tile edge
@@ -416,7 +442,8 @@ neighbour's same-level tile and its coarser ancestors, plus 1 m.
 **Conformance:** `tests/conformance/` (written by `python -m worldgen.conformance`)
 holds `hash64.json`, `terrain_tiles.json` — containers with the exact vertex arrays of
 their baked terrain, a level-1 tile among them — `tree_tiles.json` — a tile's tree records with their ids,
-instance transforms and seeds — and `building_tiles.json` — footprint records of every
+instance transforms and seeds, and the level-1 tile over it with its thinned trees' transforms
+and its prisms' heights — and `building_tiles.json` — footprint records of every
 roof type and fallback with the volume, roof and floor areas and height range of their
 baked meshes — `graph_core.json` — a small graph's binary files and the document they
 decode to — and `locate.json` — locator hashes and buckets — that every implementation can

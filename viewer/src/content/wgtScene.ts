@@ -5,9 +5,10 @@
  * `userData.layer`, terrain feature id `terrain:<i>_<j>`), so the world model,
  * picking, colour modes and photoreal mode treat both formats alike.
  *
- * Tiles of a coarser level (format 2.4) hold terrain only, `2^level` times the
- * size: root `tile_<level>/<i>_<j>`, a terrain mesh without feature ids
- * (`userData.level` set), optional skirts and cells limited to what it covers.
+ * Tiles of a coarser level (format 2.4) are `2^level` times the size: root
+ * `tile_<level>/<i>_<j>`, a terrain mesh with optional skirts and cells limited
+ * to what it covers, and (2.5) simplified buildings and trees. Their content has
+ * no entities: no feature or instance ids, and `userData.level` on every mesh.
  */
 import { BufferAttribute, BufferGeometry, Group, InstancedMesh, LinearSRGBColorSpace, Matrix4, Mesh, MeshStandardMaterial, Quaternion, Vector3 } from 'three';
 import type { Object3D } from 'three';
@@ -21,8 +22,8 @@ import type { TreeContext } from './trees.ts';
 import type { ArchetypeLibrary } from './archetypes.ts';
 import { decodeBuildings } from './buildings.ts';
 import { buildingMeshes } from '../gen/buildingMesh.ts';
-import { LAYER_NAMES } from '../types';
-import type { BuildingMaterialDoc, EntityRecord } from '../types';
+import { LAYER_NAMES } from '../types.ts';
+import type { BuildingMaterialDoc, EntityRecord } from '../types.ts';
 
 /** World-level inputs of data tiles (tileset.json). */
 export interface WgtWorld {
@@ -93,13 +94,13 @@ export async function buildWgtScene(buffer: ArrayBuffer, loader: GLTFLoader, bas
   root.children.unshift(mesh);
 
   const bld = c.sections.get('BLD');
-  if (bld) addBuildings(root, bld, c.sections.get('IDS'), c.i * tileSize, c.j * tileSize, world.buildingMaterials ?? []);
+  if (bld) addBuildings(root, bld, c.sections.get('IDS'), c.i * tileSize, c.j * tileSize, world.buildingMaterials ?? [], c.level);
 
   const tre = c.sections.get('TRE');
   const library = world.archetypes ? await world.archetypes : null;
   if (tre && world.trees && library) {
     const ctx: TreeContext = { i: c.i, j: c.j, tileSize, ...world.trees };
-    addTrees(root, scene, decodeTrees(tre, c.sections.get('TOB')), heights, ctx, library);
+    addTrees(root, scene, decodeTrees(tre, c.sections.get('TOB')), heights, ctx, library, c.level);
   }
   return scene;
 }
@@ -110,10 +111,11 @@ export async function buildWgtScene(buffer: ArrayBuffer, loader: GLTFLoader, bas
  * `feature_ids`) holding one mesh per material whose `_feature_id_0` indexes those ids.
  */
 function addBuildings(root: Object3D, bld: Uint8Array, ids: Uint8Array | undefined, x0: number, y0: number,
-  palette: readonly BuildingMaterialDoc[]): void {
+  palette: readonly BuildingMaterialDoc[], level: number): void {
   const rec = decodeBuildings(bld, ids);
   if (!rec.count) return;
-  const featureIds = rec.ids;
+  // Coarser levels: prisms standing for buildings, without entities.
+  const featureIds = level ? [] : rec.ids;
   const layer = new Group();
   layer.name = 'buildings';
   layer.userData = { layer: 'buildings', feature_ids: featureIds };
@@ -134,7 +136,7 @@ function addBuildings(root: Object3D, bld: Uint8Array, ids: Uint8Array | undefin
     material.opacity = doc.color[3];
     const mesh = new Mesh(geo, material);
     mesh.name = 'buildings';
-    mesh.userData = { layer: 'buildings', feature_ids: featureIds };
+    mesh.userData = level ? { layer: 'buildings', feature_ids: featureIds, level } : { layer: 'buildings', feature_ids: featureIds };
     layer.add(mesh);
   }
   // Keep the baked layer order (terrain, roads, bridges, tunnels, buildings, water, ...).
@@ -153,7 +155,7 @@ function addBuildings(root: Object3D, bld: Uint8Array, ids: Uint8Array | undefin
  * `layer`, `archetype`, `instance_ids`) > one InstancedMesh per archetype part.
  */
 function addTrees(root: Object3D, scene: Group, records: ReturnType<typeof decodeTrees>, heights: HeightGrid,
-  ctx: TreeContext, library: ArchetypeLibrary): void {
+  ctx: TreeContext, library: ArchetypeLibrary, level: number): void {
   if (!records.count) return;
   const inst = treeInstances(records, heights, ctx);
   const layer = new Group();
@@ -168,7 +170,8 @@ function addTrees(root: Object3D, scene: Group, records: ReturnType<typeof decod
     const arch = ctx.archetypes[code];
     const parts = arch ? library.get(arch) : undefined;
     if (!parts) continue;
-    const ids = rows.map((n) => treeIdAt(records, n, ctx));
+    // Coarser levels: a thinned stand-in for the trees, without entities.
+    const ids = level ? [] : rows.map((n) => treeIdAt(records, n, ctx));
     ids.forEach((id, k) => rowOf.set(id, rows[k]));
     const group = new Group();
     group.name = arch;
@@ -185,12 +188,13 @@ function addTrees(root: Object3D, scene: Group, records: ReturnType<typeof decod
       });
       im.instanceMatrix.needsUpdate = true;
       im.computeBoundingSphere();
-      im.userData = { layer: 'trees', archetype: arch, instance_ids: ids };
+      im.userData = level ? { layer: 'trees', archetype: arch, instance_ids: ids, level } : { layer: 'trees', archetype: arch, instance_ids: ids };
       group.add(im);
     }
     layer.add(group);
   }
   root.add(layer);
+  if (level) return;
   scene.userData[RECORD_PROVIDER] = (id: string): EntityRecord | undefined => {
     const n = rowOf.get(id);
     return n === undefined ? undefined : treeRecordAt(records, n, ctx, heights);

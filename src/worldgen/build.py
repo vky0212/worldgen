@@ -196,7 +196,12 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
         if mode == "data":
             levels = plan_levels(tiles, top_level(cfg.export.lod_levels, cfg.tiling.tile_size,
                                                   world.terrain.resolution))
-            leaves = {parse_tile_id(t): merger.hashes[t] for t in tiles}
+            # Coarse content comes from the level-0 files: a tile left stale (only_tiles) keys
+            # its coarse tiles by what its files hold too.
+            leaves = {}
+            for t in tiles:
+                on_disk = merger.built[t]["hash"] if t in merger.built else prev_tiles.get(t, {}).get("hash")
+                leaves[parse_tile_id(t)] = merger.hashes[t] + ("" if on_disk == merger.hashes[t] else f"|{on_disk}")
             items, level_state = level_work(levels, leaves, prev.get("levels", {}), out, opts.force,
                                             {"quantum": cfg.height_quantum(), "imagery": imagery_hash(world)})
             for level, key, state in runner.coarse(items):

@@ -16,7 +16,7 @@ import {
   Mesh,
   MeshLambertMaterial,
 } from 'three';
-import type { BufferGeometry, Material, Side } from 'three';
+import type { BufferGeometry, Material, Object3D, Side } from 'three';
 import { FEATURE_ATTR } from './picking';
 import { markShared } from './stream/content';
 import type { EntityRecord } from './types';
@@ -239,7 +239,8 @@ export class ColorModeManager {
     // Colour table per feature index.
     const tmp = new Color();
     const table = new Float32Array(p.featureIds.length * 3);
-    const mute = p.layer === 'terrain';
+    // Terrain is muted; so is everything of a coarser level of detail (no records there).
+    const mute = p.layer === 'terrain' || isCoarse(obj);
     p.featureIds.forEach((id, k) => {
       tmp.set(this.colorFor(world.recordFor(id, p.tileId)));
       if (mute) tmp.lerp(TERRAIN_MUTE, TERRAIN_MUTE_AMOUNT);
@@ -247,7 +248,7 @@ export class ColorModeManager {
       table[k * 3 + 1] = tmp.g;
       table[k * 3 + 2] = tmp.b;
     });
-    // Terrain without a record (coarser levels of detail have none) is muted like the rest.
+    // Content without a record (coarser levels of detail have none) is muted like the rest.
     const fallback = new Color(UNKNOWN);
     if (mute) fallback.lerp(TERRAIN_MUTE, TERRAIN_MUTE_AMOUNT);
 
@@ -294,7 +295,12 @@ export class ColorModeManager {
     obj.instanceColor = ic;
     const tmp = new Color();
     const cache = new Map<string, string>();
+    const coarse = isCoarse(obj) ? new Color(UNKNOWN).lerp(TERRAIN_MUTE, TERRAIN_MUTE_AMOUNT) : null;
     for (let i = 0; i < n; i++) {
+      if (coarse) {
+        obj.setColorAt(i, coarse);
+        continue;
+      }
       const id = ids[i];
       let hex = cache.get(id);
       if (!hex) {
@@ -321,6 +327,11 @@ export class ColorModeManager {
     }
     return m;
   }
+}
+
+/** Objects of a coarser level of detail (format 2.4+) carry `userData.level`. */
+function isCoarse(obj: Object3D): boolean {
+  return ((obj.userData as { level?: number }).level ?? 0) > 0;
 }
 
 function sideOf(m: Material | Material[]): Side {

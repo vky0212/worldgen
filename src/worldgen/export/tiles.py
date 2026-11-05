@@ -339,7 +339,8 @@ def build_tile_assets(world: CanonicalWorld, tid: str, pieces: list[Piece], terr
     without them they are derived here, which costs O(trees + entities) per tile. Without
     ``terrain_mesh`` (data-first tiles, whose terrain ships as a heightmap) the GLB has no
     terrain layer; the terrain record and height range are still produced, and ``lift``: the
-    largest height of the tile's other content above the terrain (for the coarser levels). With
+    largest height of its GLB layers (roads, bridges, water, ...) above the terrain, which the
+    coarser levels leave out (they carry simplified buildings and trees of their own). With
     ``trees_as_data`` the GLB has no tree instances and meta.json no tree records: the trees
     ship as a ``TRE `` section built from ``tree_idx`` (rendered trees, in TRE order).
     ``buildings_as_data`` (the tile's ``buildings_by_tile`` entry) are buildings shipped as a
@@ -370,7 +371,6 @@ def build_tile_assets(world: CanonicalWorld, tid: str, pieces: list[Piece], terr
             layers["buildings"].feature_index(b.id)
             bottom, top = building_extent(b, cfg.buildings)
             zmin, zmax = min(zmin, bottom), max(zmax, top)
-            lift = max(lift, top - bottom)
     for p in pieces:
         if p.layer == "collision":
             collision.add(p.mesh, p.material, p.feature_id)
@@ -417,7 +417,6 @@ def build_tile_assets(world: CanonicalWorld, tid: str, pieces: list[Piece], terr
                                                                          "instance_ids": ids}, extensions=ext))
             top = tr.ground_z[idx] + tr.height[idx]
             zmax = max(zmax, float(top.max()))
-            lift = max(lift, float(tr.height[idx].max()))
         if tree_children:
             children.append(gb.add_node("trees", children=tree_children, extras={"layer": "trees"}))
     gb.add_node(f"tile_{tid}", children=children, translation=(x0, 0.0, -y0),

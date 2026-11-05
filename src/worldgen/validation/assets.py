@@ -12,6 +12,7 @@ import trimesh
 
 from worldgen.export.container import HeightGrid, decode_heights, read_container
 from worldgen.export.footprints import decode_buildings
+from worldgen.export.instances import decode_trees
 from worldgen.export.gltf import read_glb_json
 from worldgen.hashing import sha256_file
 from worldgen.topology.graph import RoadGraph
@@ -57,6 +58,8 @@ def validate_outputs(world: Path) -> dict[str, Any]:
     degenerate = bad_normals = 0
     feature_errors = bad_buildings = n_buildings = 0
     heights: dict[tuple[int, int, int], HeightGrid] = {}
+    trees: dict[int, list[np.ndarray]] = {}     # level -> (x, y, height cm) of data tiles' trees
+    tree_step: dict[int, float] = {}            # level -> TRE position quantum (m)
     for t in tiles:
         data = (world / t["content"]).read_bytes()
         record_ids: list[str] = []
@@ -71,9 +74,17 @@ def validate_outputs(world: Path) -> dict[str, Any]:
                 rec = decode_buildings(c.sections["BLD"])
                 record_ids = json.loads(c.sections.get("IDS", b"{}")).get("BLD", [])
                 n_buildings += len(rec)
-                bad_buildings += int(len(record_ids) != len(rec)) + int((rec["bottom"] >= rec["top"]).sum())
+                # Coarser levels' buildings have no ids.
+                bad_buildings += int(len(record_ids) != (0 if c.level else len(rec)))
+                bad_buildings += int((rec["bottom"] >= rec["top"]).sum())
                 bad_buildings += int((rec["vertices"] < 3).sum()) + int((rec["eave"] > rec["top"][
                     np.repeat(np.arange(len(rec)), rec["polygons"])] + 1e-3).sum())
+            if "TRE" in c.sections:
+                tr = decode_trees(c.sections["TRE"])
+                size = float(m["tiling"]["tile_size"]) * (1 << c.level)
+                trees.setdefault(c.level, []).append(np.column_stack([
+                    (c.i + tr["x"] / 65535.0) * size, (c.j + tr["y"] / 65535.0) * size, tr["h"].astype(np.float64)]))
+                tree_step[c.level] = size / 65535.0
         if t["meta"] is None:  # a coarser level's tile: terrain only
             continue
         meta = json.loads((world / t["meta"]).read_text(encoding="utf-8"))
@@ -124,6 +135,14 @@ def validate_outputs(world: Path) -> dict[str, Any]:
             else:
                 levels = sorted({k[0] for k in coarse})
                 lines.append(f"ok    {len(coarse)} tiles of levels {levels[0]}-{levels[-1]}: heights nest in level 0")
+    coarse_trees = sorted(lv for lv in trees if lv > 0)
+    if coarse_trees:
+        n_bad, n_all = _trees_unnested(trees, tree_step)
+        if n_bad:
+            errors += 1
+            lines.append(f"ERROR {n_bad} trees of levels {coarse_trees[0]}-{coarse_trees[-1]} are not trees of the level below")
+        else:
+            lines.append(f"ok    {n_all} trees of levels {coarse_trees[0]}-{coarse_trees[-1]}: each one is a tree of the level below")
     if bad_normals:
         errors += 1
         lines.append(f"ERROR {bad_normals} vertices with invalid normals")
@@ -165,6 +184,28 @@ def _unnested(heights: dict[tuple[int, int, int], HeightGrid], inner: dict[tuple
                 continue
             break
     return bad
+
+
+def _trees_unnested(trees: dict[int, list[np.ndarray]], step: dict[int, float]) -> tuple[int, int]:
+    """(trees of a coarser level with no tree of the level below at their position - within
+    both levels' position quanta - and the same height, trees of the coarser levels)."""
+    from scipy.spatial import cKDTree
+
+    bad = total = 0
+    for lv in sorted(trees):
+        if lv == 0:
+            continue
+        q = np.concatenate(trees[lv])
+        total += len(q)
+        below = trees.get(lv - 1)
+        if not below:
+            bad += len(q)
+            continue
+        p = np.concatenate(below)
+        d, k = cKDTree(p[:, :2]).query(q[:, :2])
+        tol = 1.5 * (step[lv] + step[lv - 1])
+        bad += int(((d > tol) | (p[k, 2] != q[:, 2])).sum())
+    return bad, total
 
 
 def _tile_files(world: Path, manifest: dict[str, Any]) -> list[dict[str, Any]]:
