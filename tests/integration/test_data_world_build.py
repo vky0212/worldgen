@@ -340,3 +340,45 @@ def test_locator_lists_every_recorded_entity(data_world):
             got.update(ents)
     assert {k: sorted(v) for k, v in got.items()} == {k: sorted(v) for k, v in expected.items()}
     assert loc["ids"] == len(expected) > 0 and any(k.startswith("tree:") for k in got)
+
+
+def test_manifest_takes_tile_file_hashes_from_their_writers(data_world, monkeypatch):
+    import re
+
+    import worldgen.build as build_mod
+    from worldgen.build import BuildOptions, recorded_hashes, write_manifest
+    from worldgen.hashing import sha256_file
+
+    out, res = data_world
+    known = recorded_hashes(out, "data")
+    outputs = json.loads((out / "manifest.json").read_text(encoding="utf-8"))["outputs"]
+    tile_files = [rel for rel in outputs if re.match(r"^tiles/[0-4]/", rel)]
+    assert any(rel.startswith("tiles/1/") for rel in tile_files) and set(tile_files) <= set(known)
+    for rel in tile_files:
+        assert outputs[rel]["sha256"] == known[rel][0] == sha256_file(out / rel)
+        assert outputs[rel]["bytes"] == known[rel][1]
+    read: list[str] = []
+
+    def counting(path):  # noqa: ANN001, ANN202
+        read.append(path.relative_to(out).as_posix())
+        return sha256_file(path)
+
+    monkeypatch.setattr(build_mod, "sha256_file", counting)
+    opts = BuildOptions(out, fixture="demo_town")
+    # Files rewritten since their writer hashed them (earlier tests restore tampered files).
+    stale = {r for r in tile_files if [(out / r).stat().st_size, (out / r).stat().st_mtime_ns] != known[r][1:]}
+    assert len(stale) < len(tile_files) / 10
+    rel = next(r for r in tile_files if r.endswith(".meta.json") and r not in stale)
+    path = out / rel
+    original = path.read_bytes()
+    try:
+        assert write_manifest(res.world, res.report, opts, 1.0)["outputs"] == outputs
+        assert read and set(read) & set(tile_files) == stale    # the rest: world-level documents
+        # A tile file changed since its writer hashed it (same size) is read again.
+        path.write_bytes(original[::-1])
+        read.clear()
+        doc = write_manifest(res.world, res.report, opts, 1.0)
+        assert rel in read and doc["outputs"][rel]["sha256"] == sha256_file(path) != known[rel][0]
+    finally:
+        path.write_bytes(original)
+        write_manifest(res.world, res.report, opts, 1.0)

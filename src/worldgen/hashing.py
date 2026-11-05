@@ -37,6 +37,15 @@ def sha256_json(data: Any) -> str:
     return sha256_bytes(canonical_json(data).encode("utf-8"))
 
 
+def write_hashed(path: Path, data: bytes) -> list[Any]:
+    """Writes ``data`` to ``path`` and returns ``[sha256, size, mtime_ns]``: what the manifest
+    records of the file, so it need not read the file back (reading a file back is the slow
+    part on systems that scan files on first access); the size and modification time tell
+    whether the file is still the one written."""
+    path.write_bytes(data)
+    return [hashlib.sha256(data).hexdigest(), len(data), path.stat().st_mtime_ns]
+
+
 def sha256_file(path: str | Path, chunk: int = 1 << 20) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as fh:

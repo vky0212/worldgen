@@ -98,7 +98,7 @@ def tile_config_hash(cfg: Any) -> str:
                             "vegetation", "smoothing", "export", exclude={k: tuple(v) for k, v in exclude.items()})
 
 
-def tile_input_hash(world: CanonicalWorld, tid: str, entity_tree: tuple[STRtree, list[Any]] | None = None,
+def tile_input_hash(world: CanonicalWorld, tid: str, entity_tree: EntityIndex | None = None,
                     tree_index: dict[str, np.ndarray] | None = None, config_hash: str | None = None) -> str:
     """Hash of everything that can influence a tile's assets.
 
@@ -132,14 +132,13 @@ def tile_input_hash(world: CanonicalWorld, tid: str, entity_tree: tuple[STRtree,
             # Blended colours also depend on classes just outside the window.
             rgb = np.round(world.terrain_rgba[r0:r1 + 1, c0:c1 + 1] * 1000).astype(np.int32)
             parts["terrain_colors"] = sha256_bytes(rgb.tobytes())
-    tree, ents = entity_tree if entity_tree is not None else entity_strtree(world)
-    hits = sorted(tree.query(shapely.box(x0 - 2, y0 - 2, x1 + 2, y1 + 2)).tolist())
+    index = entity_tree if entity_tree is not None else entity_strtree(world)
+    hits = sorted(index.tree.query(shapely.box(x0 - 2, y0 - 2, x1 + 2, y1 + 2)).tolist())
     ent_parts = []
     for k in hits:
-        e = ents[k]
+        e = index.ents[k]
         rec = e.record()
-        g = sha256_bytes(shapely.to_wkb(shapely.set_precision(e.geometry, 0.001)))
-        item = [e.id, g, rec]
+        item = [e.id, index.geometry_hash(k), rec]
         if e.kind == "road" and getattr(e, "elevation", None) is not None:
             item.append(np.round(e.elevation, 2).tolist())
         if e.kind == "building":
@@ -163,10 +162,28 @@ def tile_input_hash(world: CanonicalWorld, tid: str, entity_tree: tuple[STRtree,
     return sha256_json(parts)
 
 
-def entity_strtree(world: CanonicalWorld) -> tuple[STRtree, list[Any]]:
-    """Spatial index over all entities (road elevations cover bridge and tunnel decks)."""
-    ents = [e for e in world.entities() if e.geometry is not None and not e.geometry.is_empty]
-    return STRtree([e.geometry for e in ents]), ents
+class EntityIndex:
+    """Spatial index over all entities (road elevations cover bridge and tunnel decks), and the
+    hash of each entity's geometry, computed once: large polygons (forests, land cover, water)
+    touch many tiles, and hashing them again for every tile grew with area squared."""
+
+    def __init__(self, ents: list[Any]) -> None:
+        self.ents = ents
+        self.tree = STRtree([e.geometry for e in ents])
+        self._geometry_hash: dict[int, str] = {}
+
+    def geometry_hash(self, k: int) -> str:
+        """SHA-256 of entity ``k``'s geometry on a 1 mm grid (WKB)."""
+        h = self._geometry_hash.get(k)
+        if h is None:
+            g = shapely.set_precision(self.ents[k].geometry, 0.001)
+            h = self._geometry_hash[k] = sha256_bytes(shapely.to_wkb(g))
+        return h
+
+
+def entity_strtree(world: CanonicalWorld) -> EntityIndex:
+    """The world's ``EntityIndex``."""
+    return EntityIndex([e for e in world.entities() if e.geometry is not None and not e.geometry.is_empty])
 
 
 def generate_pieces(world: CanonicalWorld, wanted: set[str], selector: PieceSelector | None = None,

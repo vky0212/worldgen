@@ -124,7 +124,14 @@ compiler.
     regenerated → tile GLB/collision/meta, tile index, combined `world.glb`
     (binary merge of tile GLBs, only up to `export.combined_glb_max_tiles`),
     graph JSON, GeoParquet, GeoTIFFs, fields, diagnostics, attribution and
-    finally the manifest with output hashes. Dirty tiles are generated and
+    finally the manifest with output hashes. Tile files are hashed from the bytes their
+    writer holds (`hashing.write_hashed`, in the workers) and recorded in
+    `build_state.json` with their size and modification time; the manifest takes those
+    hashes while size and time still match and reads back only the other files (reading
+    a file back is slow wherever files are scanned on first access: ~3.5 ms per file on
+    Windows with on-access scanning, minutes for a 40 km world). The tile input hashes
+    hash each entity's geometry once per process (`tiles.EntityIndex`): large polygons
+    touch many tiles. Dirty tiles are generated and
     written in blocks of 8 × 8 tiles: `export.tiles.PieceSelector` hands each
     block only the entities whose bounding box can reach it (every piece is
     anchored inside its entity's box), and terrain normals are computed per

@@ -34,7 +34,7 @@ from worldgen.export.tiles import (
     tile_chunks,
     world_tiles,
 )
-from worldgen.export.tileset import DATA_SCHEMA_VERSION, data_index, tile_paths
+from worldgen.export.tileset import DATA_SCHEMA_VERSION, data_index, level_paths, tile_paths
 from worldgen.export.vectors import write_geoparquet
 from worldgen.hashing import sha256_file
 from worldgen.landcover.landcover import LANDCOVER_CODES
@@ -441,15 +441,42 @@ def attribution_text(world: CanonicalWorld) -> str:
     return "\n".join(lines)
 
 
+def recorded_hashes(out: Path, mode: str) -> dict[str, list[Any]]:
+    """Output path -> ``[sha256, size, mtime_ns]`` of the tile files, as their writers hashed
+    them (``hashing.write_hashed``; build_state.json ``files`` of every tile and coarse tile)."""
+    try:
+        state = json.loads((out / "build_state.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    known: dict[str, list[Any]] = {}
+    for tid, st in state.get("tiles", {}).items():
+        paths = tile_paths(mode, tid)
+        for kind, rec in st.get("files", {}).items():
+            known[paths[kind]] = rec
+    for key, st in state.get("levels", {}).items():
+        level, ij = key.split("/")
+        paths = level_paths(int(level), *parse_tile_id(ij))
+        for kind, rec in st.get("files", {}).items():
+            known[paths[kind]] = rec
+    return known
+
+
 def write_manifest(world: CanonicalWorld, report: Report, opts: BuildOptions, duration: float) -> dict[str, Any]:
     out = opts.output
     cfg = world.config
     region = world.region
     hf = world.terrain
+    # Tile files keep the hash their writer took while their size and modification time are
+    # unchanged; the others are read and hashed here.
+    known = recorded_hashes(out, cfg.export.mode)
     outputs: dict[str, Any] = {}
     for p in sorted(out.rglob("*")):
         if p.is_file() and p.name not in ("manifest.json", "build_state.json"):
-            outputs[p.relative_to(out).as_posix()] = {"sha256": sha256_file(p), "bytes": p.stat().st_size}
+            rel = p.relative_to(out).as_posix()
+            st = p.stat()
+            rec = known.get(rel)
+            sha = rec[0] if rec is not None and rec[1] == st.st_size and rec[2] == st.st_mtime_ns else sha256_file(p)
+            outputs[rel] = {"sha256": sha, "bytes": st.st_size}
     zr = [float(hf.z.min()), float(hf.z.max())] if hf is not None else [0.0, 0.0]
     xmin, ymin, xmax, ymax = region.extent
     summary = report.to_dict(world)["summary"]

@@ -214,11 +214,19 @@ uv run python benchmarks/scale_bench.py --world generated/taipei --fractions 0.2
 a native kernel) against saved results, and `--fixture NAME` runs offline on a
 synthetic scenario.
 
+`benchmarks/coordinator_profile.py` profiles a full parallel build's main process:
+everything it reports besides waiting for the workers is serial work, which bounds
+the build's wall time however many workers run (`docs/performance.md`).
+
+```bash
+uv run python benchmarks/coordinator_profile.py --world generated/n25_179_smooth --set export.mode=data --out build-out
+```
+
 ## Repository layout
 
 ```text
 configs/            profiles (basic, procedural, high_detail)
-docs/               architecture, data model, coordinate systems, output format, sources
+docs/               architecture, data model, coordinate systems, output format, sources, performance
 src/worldgen/       the compiler (see docs/architecture.md)
 tests/              unit, integration, regression
 viewer/             Three.js viewer
