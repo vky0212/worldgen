@@ -116,8 +116,8 @@ def validate_world(world: CanonicalWorld) -> Report:
     rep.run("bridge_terrain_clearance", lambda: check_bridge_terrain(world))
     rep.run("terrain_tile_seams", lambda: check_terrain_seams(world))
     rep.run("building_meshes", lambda: check_building_meshes(world))
-    # Vegetation.
-    if cfg.vegetation.enabled and world.vegetation_grid is not None:
+    # Vegetation (deferred trees are checked chunk by chunk as the export places them).
+    if cfg.vegetation.enabled and world.vegetation_grid is not None and not world.trees_deferred:
         rep.run("vegetation_placement", lambda: check_vegetation(world))
         rep.run("vegetation_tile_independence", lambda: check_tree_tile_independence(world))
     return rep
@@ -503,10 +503,14 @@ def check_building_meshes(world: CanonicalWorld) -> list[Issue]:
 # vegetation
 
 
-def check_vegetation(world: CanonicalWorld) -> list[Issue]:
+def check_vegetation(world: CanonicalWorld, trees: Any = None, bounds: tuple[float, float, float, float] | None = None,
+                     exclusions: Any = None) -> list[Issue]:
+    """Placement rules of ``trees`` (default ``world.trees``), the trees placed in ``bounds``
+    (default: everywhere). ``exclusions``: ``vegetation_exclusions(world, 0.0)``, computed
+    here when not given."""
     from worldgen.pipeline import vegetation_exclusions
 
-    tr = world.trees
+    tr = world.trees if trees is None else trees
     out: list[Issue] = []
     if len(tr) == 0:
         return out
@@ -519,7 +523,7 @@ def check_vegetation(world: CanonicalWorld) -> list[Issue]:
     for k in np.nonzero(bad)[0][:20]:
         out.append(Issue("vegetation_placement", "error", f"{tr.ids[k]} placed outside a forest/woodland region",
                          [tr.ids[k]], float(tr.x[k]), float(tr.y[k])))
-    excl = vegetation_exclusions(world, 0.0)
+    excl = exclusions if exclusions is not None else vegetation_exclusions(world, 0.0)
     procedural = np.array([s == "procedural" for s in tr.source])
     inside_excl = excl.contains(tr.x, tr.y) & procedural
     for k in np.nonzero(inside_excl)[0][:20]:
@@ -544,6 +548,8 @@ def check_vegetation(world: CanonicalWorld) -> list[Issue]:
     for ot in world.observed_trees:
         if not hf.contains(ot.x, ot.y):
             continue
+        if bounds is not None and not (bounds[0] <= ot.x < bounds[2] and bounds[1] <= ot.y < bounds[3]):
+            continue
         k = pos.get(ot.id)
         if k is None:
             out.append(Issue("vegetation_placement", "error", f"observed tree {ot.id} missing from output", [ot.id],
@@ -564,34 +570,62 @@ def check_vegetation(world: CanonicalWorld) -> list[Issue]:
     return out
 
 
+class IndependenceSample:
+    """The tiles ``check_tree_tile_independence`` re-generates: the two with the most generated
+    trees (ties by id), with those trees' ids. Fed table by table (whole tiles each), so a
+    chunked export samples exactly the tiles a whole-world table would."""
+
+    KEEP = 2
+
+    def __init__(self, world: CanonicalWorld) -> None:
+        self.world = world
+        self.grid = TileGrid(world.config.tiling.tile_size)
+        # (-count, tile, generated ids); tiles without generated trees count 0
+        self.best: list[tuple[int, str, list[str]]] = []
+
+    def add(self, tr: Any, tiles: list[str]) -> None:
+        if len(tr):
+            gen = np.array([s == "procedural" and a in ("broadleaf", "conifer", "palm")
+                            for s, a in zip(tr.source, tr.archetype)])
+            tile_of = self.grid.tiles_of(tr.x, tr.y)
+        else:
+            gen, tile_of = np.zeros(0, dtype=bool), np.zeros(0, dtype=object)
+        counts: dict[str, int] = {}
+        if gen.any():
+            names, n = np.unique(tile_of[gen], return_counts=True)
+            counts = {str(t): int(c) for t, c in zip(names, n)}
+        for neg, t in sorted((-counts.get(t, 0), t) for t in tiles)[: self.KEEP]:
+            ids = [tr.ids[k] for k in np.nonzero(gen & (tile_of == t))[0]] if neg else []
+            self.best.append((neg, t, ids))
+        self.best = sorted(self.best, key=lambda b: (b[0], b[1]))[: self.KEEP]
+
+    def check(self) -> list[Issue]:
+        from worldgen.pipeline import vegetation_exclusions
+        from worldgen.vegetation.placement import place_trees
+
+        w = self.world
+        excl = w.vegetation_exclusions
+        if excl is None:
+            excl = vegetation_exclusions(w, w.config.vegetation.exclusion_buffer)
+        out = []
+        for neg, t, ids in self.best:
+            if neg == 0:
+                continue
+            local = place_trees(w.vegetation_grid, w.terrain, excl, w.observed_trees, w.config.vegetation,
+                                bounds=self.grid.bounds(t))
+            a = sorted(i for i in local.ids if i.startswith("tree:gen:"))
+            b = sorted(ids)
+            if a != b:
+                out.append(Issue("vegetation_tile_independence", "error",
+                                 f"tile {t}: isolated tree generation differs from global run "
+                                 f"({len(a)} vs {len(b)} trees)", [], *self.grid.origin(t)))
+        return out
+
+
 def check_tree_tile_independence(world: CanonicalWorld) -> list[Issue]:
     """Re-generate two tiles in isolation and compare with the global placement."""
-    from worldgen.pipeline import vegetation_exclusions
-    from worldgen.vegetation.placement import place_trees
-
-    tr = world.trees
-    if len(tr) == 0:
+    if len(world.trees) == 0:
         return []
-    grid = TileGrid(world.config.tiling.tile_size)
-    tiles = [tile_id(i, j) for i, j in world.region.tiles()]
-    gen_mask = np.array([s == "procedural" and a in ("broadleaf", "conifer", "palm")
-                         for s, a in zip(tr.source, tr.archetype)])
-    tile_of = grid.tiles_of(tr.x, tr.y)
-    names, n = np.unique(tile_of[gen_mask], return_counts=True)
-    per_tile = dict(zip(names.tolist(), n.tolist()))
-    counts = {t: per_tile.get(t, 0) for t in tiles}
-    sample = sorted(tiles, key=lambda t: (-counts[t], t))[:2]
-    excl = vegetation_exclusions(world, world.config.vegetation.exclusion_buffer)
-    out = []
-    for t in sample:
-        if counts[t] == 0:
-            continue
-        local = place_trees(world.vegetation_grid, world.terrain, excl, world.observed_trees,
-                            world.config.vegetation, bounds=grid.bounds(t))
-        a = sorted(i for i, o in zip(local.ids, local.observed) if i.startswith("tree:gen:"))
-        b = sorted(tr.ids[k] for k in np.nonzero(gen_mask & (tile_of == t))[0])
-        if a != b:
-            out.append(Issue("vegetation_tile_independence", "error",
-                             f"tile {t}: isolated tree generation differs from global run "
-                             f"({len(a)} vs {len(b)} trees)", [], *grid.origin(t)))
-    return out
+    sample = IndependenceSample(world)
+    sample.add(world.trees, [tile_id(i, j) for i, j in world.region.tiles()])
+    return sample.check()

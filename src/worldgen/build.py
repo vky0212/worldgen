@@ -41,25 +41,35 @@ from worldgen.export.tiles import (
     tile_blocks,
     tile_config_hash,
     tile_input_hash,
+    tile_chunks,
     trees_by_tile,
     world_tiles,
 )
 from worldgen.export.tileset import DATA_SCHEMA_VERSION, data_index, tile_paths
-from worldgen.export.vectors import write_geoparquet
+from worldgen.budget import BudgetResult
+from worldgen.export.vectors import TreesParquetWriter, write_geoparquet
 from worldgen.hashing import sha256_file
 from worldgen.landcover.landcover import LANDCOVER_CODES
 from worldgen.log import get_logger, stage
-from worldgen.pipeline import acquire, bundle_from_fixture, compile_world
+from worldgen.pipeline import (
+    acquire,
+    apply_tree_budget,
+    budget_issue,
+    bundle_from_fixture,
+    compile_world,
+    place_vegetation,
+    vegetation_exclusions,
+)
 from worldgen.progress import current
 from worldgen.sources.base import SourceRecord, write_geotiff
 from worldgen.sources.synthetic import load_fixture
 from worldgen.spatial.raster import GeoRaster
 from worldgen.spatial.region import Region
 from worldgen.tiling.grid import TileGrid, parse_tile_id
-from worldgen.validation.checks import Report, validate_world
+from worldgen.validation.checks import IndependenceSample, Issue, Report, check_vegetation, validate_world
 from worldgen.vegetation.classify import CATEGORIES
-from worldgen.vegetation.placement import ARCHETYPES
-from worldgen.vegetation.regions import environmental_fields
+from worldgen.vegetation.placement import ARCHETYPES, TreeTable, concat_tables
+from worldgen.vegetation.regions import environmental_fields, tree_cell_sums
 from worldgen.world.world import CanonicalWorld
 
 log = get_logger("build")
@@ -76,6 +86,9 @@ class BuildOptions:
     fixture: str | None = None
     only_tiles: set[str] | None = None
     force: bool = False
+    # Keep every tree in BuildResult.world.trees (the export places and releases them chunk by
+    # chunk; tests and tools that inspect them ask for them).
+    keep_trees: bool = False
 
 
 @dataclass
@@ -114,7 +127,7 @@ def build(cfg: WorldConfig, opts: BuildOptions) -> BuildResult:
                 progress.source(rec.name, rec.status, "synthetic fixture")
         else:
             bundle = acquire(region, cfg, opts.cache_dir, offline=opts.offline)
-    world = compile_world(region, cfg, bundle)
+    world = compile_world(region, cfg, bundle, place_trees=False)
     world.timings = {**timings, **world.timings}
     with stage("validate", world.timings):
         report = validate_world(world) if cfg.validation.enabled else Report()
@@ -160,79 +173,105 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
     prev_tiles = prev.get("tiles", {})
     # World-level indexes, built once: per-tile lookups must not scan every tree or entity.
     etree = entity_strtree(world)
-    tindex = trees_by_tile(world)
     chash = tile_config_hash(cfg)
-    hashes = {t: tile_input_hash(world, t, etree, tindex, chash) for t in tiles}
     baker = ortho_baker(world)
-    dirty = []
-    for t in tiles:
-        files_ok = (out / paths[t]["content"]).is_file() and (out / paths[t]["meta"]).is_file()
-        if baker is not None:
-            files_ok = files_ok and (out / paths[t]["ortho"]).is_file()
-        if opts.force or not files_ok or prev_tiles.get(t, {}).get("hash") != hashes[t]:
-            dirty.append(t)
     if opts.only_tiles is not None:
         unknown = opts.only_tiles - set(tiles)
         if unknown:
             raise ValueError(f"unknown tiles requested: {sorted(unknown)}")
-        dirty = [t for t in dirty if t in opts.only_tiles]
-    skipped = [t for t in tiles if t not in dirty]
-    log.info("tiles: %d total, %d to (re)build, %d unchanged", len(tiles), len(dirty), len(skipped))
+    # Chunk by chunk: deferred trees are placed for a chunk of tiles, the chunk's tile hashes
+    # decide what to rebuild, its dirty tiles are generated block by block, and its trees go
+    # to validation, vectors/trees.parquet, the fields and the statistics before the next
+    # chunk replaces them. Every tile gets the same trees, in the same order, whatever the
+    # chunking, so the files do not depend on it.
+    trees = _ChunkTrees(world, report, opts) if world.trees_deferred else None
+    chunk = cfg.export.chunk_tiles
+    if trees is not None and cfg.vegetation.budget.max_total > 0:
+        log.info("vegetation.budget.max_total is set: trees are placed for the whole world at once")
+        chunk = 0
     progress = current()
-    for t in skipped:
-        progress.tile(t, "unchanged")
-    total_steps = len(dirty)
-    progress.step("export", 0, total_steps, "generating geometry")
-
-    # Dirty tiles are generated and written block by block, so the mesh pieces held in memory
-    # cover one block instead of the whole world; the selector hands each block only the
-    # entities that can own pieces in it.
-    selector = PieceSelector(world) if dirty else None
+    progress.step("export", 0, len(tiles), "generating geometry")
+    selector: PieceSelector | None = None
     rgba = terrain_vertex_colors(world)
     arche = archetypes_for(world)
     eindex = world.entity_index()
+    hashes: dict[str, str] = {}
     built: dict[str, dict[str, Any]] = {}
+    visited = 0
     data = mode == "data"
     bindex = buildings_by_tile(world) if data else {}
     tile_entities: dict[str, list[str]] = {}       # data mode: ids recorded per tile (the locator)
-    for block in tile_blocks(dirty, EXPORT_BLOCK_TILES):
-        pieces = generate_pieces(world, set(block), selector, building_meshes=not data)
-        for t in block:
-            progress.tile(t, "building")
-            assets = build_tile_assets(world, t, pieces.pop(t, []), None, rgba, arche,
-                                       trees_in_tile=tindex.get(t, NO_TREES), entity_index=eindex,
-                                       terrain_mesh=not data, trees_as_data=data,
-                                       buildings_as_data=bindex.get(t, []) if data else None)
-            content = out / paths[t]["content"]
-            content.parent.mkdir(parents=True, exist_ok=True)
-            if data:
-                i, j = parse_tile_id(t)
-                sections = tile_terrain_sections(world, t, rgba)
-                sections += tree_sections(world.trees, assets["tree_idx"], grid.bounds(t), cfg.vegetation.cell_size)
-                bl = bindex.get(t, [])
-                if bl:
-                    plans = [building_plan(b, cfg.buildings) for b in bl]
-                    sections += building_sections(bl, plans, grid.bounds(t))
-                sections.append(("GLB", assets["glb"], False))
-                content.write_bytes(write_container(0, i, j, sections))
-                tile_entities[t] = list(assets["meta"]["entities"]) + _tob_ids(dict((s[0], s[1]) for s in sections))
-            else:
-                content.write_bytes(assets["glb"])
-            col = out / paths[t]["collision"]
-            if assets["collision"] is not None:
-                col.write_bytes(assets["collision"])
-            elif col.exists():
-                col.unlink()
-            _write_json(out / paths[t]["meta"], assets["meta"])
-            ortho = out / paths[t]["ortho"]
+    for bounds, ctiles in tile_chunks(tiles, chunk, cfg.tiling.tile_size):
+        if trees is not None:
+            world.trees = TreeTable()  # release the previous chunk's trees before placing
+            world.trees = trees.place(bounds)
+        tindex = trees_by_tile(world)
+        dirty = []
+        for t in ctiles:
+            hashes[t] = tile_input_hash(world, t, etree, tindex, chash)
+            files_ok = (out / paths[t]["content"]).is_file() and (out / paths[t]["meta"]).is_file()
             if baker is not None:
-                ortho.write_bytes(baker.bake(grid.bounds(t)))
-            elif ortho.exists():
-                ortho.unlink()
-            built[t] = {"hash": hashes[t], "counts": assets["counts"], "zrange": assets["zrange"],
-                        "collision": assets["collision"] is not None, "ortho": baker is not None}
-            progress.tile(t, "built")
-            progress.step("export", len(built), total_steps, f"tile {t}")
+                files_ok = files_ok and (out / paths[t]["ortho"]).is_file()
+            if opts.force or not files_ok or prev_tiles.get(t, {}).get("hash") != hashes[t]:
+                if opts.only_tiles is None or t in opts.only_tiles:
+                    dirty.append(t)
+        for t in ctiles:
+            if t not in dirty:
+                progress.tile(t, "unchanged")
+                visited += 1
+        # Dirty tiles are generated and written block by block, so the mesh pieces held in
+        # memory cover one block; the selector hands each block only the entities that can own
+        # pieces in it.
+        if dirty and selector is None:
+            selector = PieceSelector(world)
+        for block in tile_blocks(dirty, EXPORT_BLOCK_TILES):
+            pieces = generate_pieces(world, set(block), selector, building_meshes=not data)
+            for t in block:
+                progress.tile(t, "building")
+                assets = build_tile_assets(world, t, pieces.pop(t, []), None, rgba, arche,
+                                           trees_in_tile=tindex.get(t, NO_TREES), entity_index=eindex,
+                                           terrain_mesh=not data, trees_as_data=data,
+                                           buildings_as_data=bindex.get(t, []) if data else None)
+                content = out / paths[t]["content"]
+                content.parent.mkdir(parents=True, exist_ok=True)
+                if data:
+                    i, j = parse_tile_id(t)
+                    sections = tile_terrain_sections(world, t, rgba)
+                    sections += tree_sections(world.trees, assets["tree_idx"], grid.bounds(t),
+                                              cfg.vegetation.cell_size)
+                    bl = bindex.get(t, [])
+                    if bl:
+                        plans = [building_plan(b, cfg.buildings) for b in bl]
+                        sections += building_sections(bl, plans, grid.bounds(t))
+                    sections.append(("GLB", assets["glb"], False))
+                    content.write_bytes(write_container(0, i, j, sections))
+                    tile_entities[t] = list(assets["meta"]["entities"]) + _tob_ids(
+                        {sec[0]: sec[1] for sec in sections})
+                else:
+                    content.write_bytes(assets["glb"])
+                col = out / paths[t]["collision"]
+                if assets["collision"] is not None:
+                    col.write_bytes(assets["collision"])
+                elif col.exists():
+                    col.unlink()
+                _write_json(out / paths[t]["meta"], assets["meta"])
+                ortho = out / paths[t]["ortho"]
+                if baker is not None:
+                    ortho.write_bytes(baker.bake(grid.bounds(t)))
+                elif ortho.exists():
+                    ortho.unlink()
+                built[t] = {"hash": hashes[t], "counts": assets["counts"], "zrange": assets["zrange"],
+                            "collision": assets["collision"] is not None, "ortho": baker is not None}
+                progress.tile(t, "built")
+                visited += 1
+                progress.step("export", visited, len(tiles), f"tile {t}")
+        if trees is not None:
+            trees.done(world.trees, bounds, ctiles)
+    if trees is not None:
+        world.trees = trees.finish(out)
+    dirty = [t for t in tiles if t in built]
+    skipped = [t for t in tiles if t not in built]
+    log.info("tiles: %d total, %d (re)built, %d unchanged", len(tiles), len(dirty), len(skipped))
     tile_state = dict(prev_tiles)
     for t in dirty:  # in tile order, as build_state.json has always been written
         tile_state[t] = built[t]
@@ -303,14 +342,81 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
         (out / "graph" / "core.wgt").write_bytes(core)
         _write_json(out / "graph" / "strings.json", strings, indent=None)
     if cfg.export.geoparquet:
-        write_geoparquet(world, out / "vectors")
+        write_geoparquet(world, out / "vectors", trees=trees is None)
     if cfg.export.heightfield:
         export_terrain(world, out / "terrain")
     if cfg.export.fields and world.vegetation_grid is not None:
-        export_fields(world, out / "fields")
+        export_fields(world, out / "fields", trees.field_sums if trees is not None else None)
     _write_json(out / "diagnostics.json", report.to_dict(world), indent=1)
     (out / "ATTRIBUTION.txt").write_text(attribution_text(world), encoding="utf-8")
     return dirty, skipped
+
+
+class _ChunkTrees:
+    """Deferred trees during a chunked export: places a chunk's trees (with the per-tile
+    instance budget) and, once its tiles are written, hands them to the tree validation
+    checks, ``vectors/trees.parquet``, the vegetation field sums and the statistics."""
+
+    def __init__(self, world: CanonicalWorld, report: Report, opts: BuildOptions) -> None:
+        cfg = world.config
+        self.world, self.report, self.opts = world, report, opts
+        self.check = cfg.validation.enabled and world.vegetation_grid is not None
+        self.exclusions0 = vegetation_exclusions(world, 0.0) if self.check else None
+        self.sample = IndependenceSample(world) if self.check else None
+        self.placement_issues: list[Issue] = []
+        self.parquet = (TreesParquetWriter(world, opts.output / "vectors" / "trees.parquet")
+                        if cfg.export.geoparquet else None)
+        self.field_sums: tuple[np.ndarray, np.ndarray] | None = None
+        self.kept: list[Any] = []
+        self.total = self.observed = self.rendered = self.dropped = 0
+        self.over_budget: list[str] = []
+
+    def place(self, bounds: tuple[float, float, float, float] | None) -> Any:
+        tr = place_vegetation(self.world, bounds)
+        res = apply_tree_budget(tr, self.world.config)
+        if res is not None:
+            self.dropped += res.dropped
+            self.over_budget += res.tiles_over_budget
+        return tr
+
+    def done(self, tr: Any, bounds: tuple[float, float, float, float] | None, tiles: list[str]) -> None:
+        w = self.world
+        if self.check:
+            if len(tr):
+                self.placement_issues += check_vegetation(w, tr, bounds, self.exclusions0)
+            self.sample.add(tr, tiles)  # type: ignore[union-attr]
+        if self.parquet is not None:
+            self.parquet.add(tr)
+        if w.config.export.fields:
+            self.field_sums = tree_cell_sums(w.vegetation_grid, tr, self.field_sums)
+        self.total += len(tr)
+        if len(tr):
+            self.observed += int(np.sum(tr.observed))
+            self.rendered += int(tr.rendered_mask().sum())
+        if self.opts.keep_trees:
+            self.kept.append(tr)
+
+    def finish(self, out: Path) -> Any:
+        """Close the outputs, record checks and statistics; the trees to leave in the world."""
+        w = self.world
+        if self.parquet is not None:
+            self.parquet.close()
+        if self.check:
+            self.report.run("vegetation_placement", lambda: self.placement_issues)
+            self.report.run("vegetation_tile_independence", self.sample.check)  # type: ignore[union-attr]
+        if self.total:
+            res = BudgetResult(np.zeros(0, dtype=bool), self.dropped, sorted(set(self.over_budget)))
+            before = len(w.stage_issues)
+            budget_issue(w, w.config, res)
+            # Where validate_world would have listed it: after the earlier stage issues.
+            for k, raw in enumerate(w.stage_issues[before:]):
+                self.report.issues.insert(min(before + k, len(self.report.issues)), Issue(
+                    raw["check"], raw["severity"], raw["message"], raw.get("entity_ids", [])))
+        w.stats["trees"] = self.total
+        w.stats["trees_observed"] = self.observed
+        w.stats["trees_rendered"] = self.rendered
+        w.trees_deferred = False
+        return concat_tables(self.kept) if self.kept else TreeTable()
 
 
 def _tob_ids(sections: dict[str, bytes]) -> list[str]:
@@ -397,10 +503,11 @@ def export_terrain(world: CanonicalWorld, out: Path) -> None:
         _write_json(out / "landcover.json", {"codes": {str(k): v for k, v in LANDCOVER_CODES.items()}}, indent=1)
 
 
-def export_fields(world: CanonicalWorld, out: Path) -> None:
+def export_fields(world: CanonicalWorld, out: Path, sums: tuple[np.ndarray, np.ndarray] | None = None) -> None:
+    """``sums``: the trees' ``tree_cell_sums`` when they are not all in ``world.trees``."""
     out.mkdir(parents=True, exist_ok=True)
     g = world.vegetation_grid
-    fields = environmental_fields(g, world.trees)
+    fields = environmental_fields(g, world.trees, sums)
     names = list(fields)
     stack = np.stack([np.flipud(fields[n]) for n in names]).astype(np.float32)
     rows = g.shape[0]

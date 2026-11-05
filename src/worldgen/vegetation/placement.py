@@ -425,18 +425,34 @@ def _observed_archetype(p: dict) -> str:
     return "broadleaf"
 
 
+SHRUB_CATEGORIES = ("shrubland", "wetland")
+GRASS_CATEGORIES = ("grassland", "agricultural")
+
+
+def ground_cover_scale(grid: VegetationGrid, cfg: VegetationConfig) -> float:
+    """Density factor keeping the world's expected ground cover under ``max_instances``.
+
+    A world-level constant (it counts the whole grid's shrub and grass cells), computed once
+    and passed to every window's ``place_ground_cover`` so windows agree."""
+    gc = cfg.ground_cover
+    area_shrub = float(np.isin(grid.category, [CAT[c] for c in SHRUB_CATEGORIES]).sum()) * grid.resolution ** 2
+    area_grass = float(np.isin(grid.category, [CAT[c] for c in GRASS_CATEGORIES]).sum()) * grid.resolution ** 2
+    expected = area_shrub * gc.shrub_density + area_grass * gc.grass_density
+    return min(1.0, gc.max_instances / expected) if expected > 0 else 1.0
+
+
 def place_ground_cover(grid: VegetationGrid, terrain: Heightfield, exclusions: Exclusions,
-                       cfg: VegetationConfig, bounds: tuple[float, float, float, float] | None = None) -> TreeTable:
-    """Shrubs and grass clusters (no hard core; deterministic per sampling cell)."""
+                       cfg: VegetationConfig, bounds: tuple[float, float, float, float] | None = None,
+                       scale: float | None = None) -> TreeTable:
+    """Shrubs and grass clusters (no hard core; deterministic per sampling cell). ``scale``:
+    ``ground_cover_scale(grid, cfg)``, computed here when not given."""
     gc = cfg.ground_cover
     if not gc.enabled:
         return TreeTable()
-    shrub_cats = np.array([CAT["shrubland"], CAT["wetland"]])
-    grass_cats = np.array([CAT["grassland"], CAT["agricultural"]])
-    area_shrub = float(np.isin(grid.category, shrub_cats).sum()) * grid.resolution ** 2
-    area_grass = float(np.isin(grid.category, grass_cats).sum()) * grid.resolution ** 2
-    expected = area_shrub * gc.shrub_density + area_grass * gc.grass_density
-    scale = min(1.0, gc.max_instances / expected) if expected > 0 else 1.0
+    shrub_cats = np.array([CAT[c] for c in SHRUB_CATEGORIES])
+    grass_cats = np.array([CAT[c] for c in GRASS_CATEGORIES])
+    if scale is None:
+        scale = ground_cover_scale(grid, cfg)
     cs = cfg.cell_size
     xmin, ymin = grid.xmin, grid.ymin
     xmax = xmin + grid.shape[1] * grid.resolution

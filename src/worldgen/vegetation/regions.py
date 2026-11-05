@@ -78,18 +78,26 @@ def extract_regions(grid: VegetationGrid, landcover: list[LandcoverArea], cfg: V
     return out
 
 
-def environmental_fields(grid: VegetationGrid, trees: TreeTable) -> dict[str, np.ndarray]:
-    """Application-independent vegetation descriptors on the vegetation grid."""
-    rows, cols = grid.shape
-    cell_area = grid.resolution ** 2
-    stems = np.zeros(grid.shape)
-    basal = np.zeros(grid.shape)
+def tree_cell_sums(grid: VegetationGrid, trees: TreeTable,
+                   sums: tuple[np.ndarray, np.ndarray] | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Stems and trunk basal area per grid cell, added to ``sums`` (a chunked export feeds
+    its tables one by one)."""
+    stems, basal = sums if sums is not None else (np.zeros(grid.shape), np.zeros(grid.shape))
     if len(trees):
         big = np.array([a in ("broadleaf", "conifer", "palm") for a in trees.archetype])
         rr, cc, inside = grid.cell_of(trees.x, trees.y)
         sel = big & inside
         np.add.at(stems, (rr[sel], cc[sel]), 1.0)
         np.add.at(basal, (rr[sel], cc[sel]), math.pi * (trees.trunk_radius[sel] + 0.4) ** 2)
+    return stems, basal
+
+
+def environmental_fields(grid: VegetationGrid, trees: TreeTable | None = None,
+                         sums: tuple[np.ndarray, np.ndarray] | None = None) -> dict[str, np.ndarray]:
+    """Application-independent vegetation descriptors on the vegetation grid, from ``trees``
+    or from their ``tree_cell_sums``."""
+    cell_area = grid.resolution ** 2
+    stems, basal = sums if sums is not None else tree_cell_sums(grid, trees if trees is not None else TreeTable())
     density = stems / cell_area * 1e4
     shrub = np.isin(grid.category, [CAT["shrubland"], CAT["wetland"]]) * grid.coverage
     obstruction = np.clip(shrub + basal / cell_area, 0.0, 1.0)

@@ -481,6 +481,10 @@ class ExportConfig:
     collision: bool = True
     heightfield: bool = True
     fields: bool = True
+    # Tiles per side of an export chunk (squares of the tile lattice): trees are placed,
+    # checked and exported one chunk at a time, so they never all exist at once; a chunk's
+    # placement needs memory for its area. Outputs do not depend on it (0: one chunk).
+    chunk_tiles: int = 8
 
 
 @dataclass

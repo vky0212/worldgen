@@ -26,7 +26,7 @@ def _build(out: Path, mode: str = "data", **kw):  # noqa: ANN003, ANN202
 @pytest.fixture(scope="module")
 def data_world(tmp_path_factory):  # noqa: ANN001, ANN201
     out = tmp_path_factory.mktemp("data_world")
-    return out, _build(out)
+    return out, _build(out, keep_trees=True)
 
 
 def _tiles(out: Path) -> list[tuple[Path, Path]]:

@@ -54,7 +54,7 @@ consumers mesh themselves. `export.mode: baked` (the default) keeps writing 1.x.
 ├── vectors/                      # GeoParquet, EPSG:4326 geometry
 │   ├── roads.parquet  bridges.parquet  tunnels.parquet  buildings.parquet
 │   ├── water.parquet  landcover.parquet  vegetation_regions.parquet
-│   ├── trees.parquet  graph_nodes.parquet  graph_edges.parquet
+│   ├── trees.parquet  graph_nodes.parquet  graph_edges.parquet   # trees: rows grouped by export chunk
 ├── terrain/
 │   ├── heightfield.tif           # GeoTIFF, local CRS, float32 metres
 │   ├── heightfield.f32           # raw little-endian float32, row 0 = south

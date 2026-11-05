@@ -8,7 +8,7 @@ import numpy as np
 import shapely
 from shapely.ops import unary_union
 
-from worldgen.budget import building_sizes, select_within_budget, tree_budget_uniforms, tree_sizes
+from worldgen.budget import BudgetResult, building_sizes, select_within_budget, tree_budget_uniforms, tree_sizes
 from worldgen.buildings.buildings import assign_base_elevations, prepare_buildings
 from worldgen.config import WorldConfig
 from worldgen.errors import SourceError
@@ -40,7 +40,14 @@ from worldgen.transportation.elevation import compute_elevations
 from worldgen.transportation.junctions import compute_junctions
 from worldgen.transportation.meshing import build_intersections
 from worldgen.vegetation.classify import classify_vegetation
-from worldgen.vegetation.placement import Exclusions, concat_tables, place_ground_cover, place_trees
+from worldgen.vegetation.placement import (
+    Exclusions,
+    TreeTable,
+    concat_tables,
+    ground_cover_scale,
+    place_ground_cover,
+    place_trees,
+)
 from worldgen.vegetation.regions import extract_regions
 from worldgen.tiling.grid import TileGrid
 from worldgen.world.world import CanonicalWorld, SourceBundle
@@ -132,7 +139,12 @@ def bundle_from_fixture(fx: Fixture) -> SourceBundle:
 # compilation
 
 
-def compile_world(region: Region, cfg: WorldConfig, bundle: SourceBundle) -> CanonicalWorld:
+def compile_world(region: Region, cfg: WorldConfig, bundle: SourceBundle, place_trees: bool = True
+                  ) -> CanonicalWorld:
+    """Compile the canonical world. Without ``place_trees`` the vegetation stage prepares the
+    world-level inputs of tree placement but places none (``world.trees_deferred``): the
+    export places them chunk by chunk with ``place_vegetation``, so they never all exist at
+    once."""
     world = CanonicalWorld(region=region, config=cfg, sources=list(bundle.records), imagery=bundle.imagery)
     t = world.timings
     extent = region.extent_box
@@ -219,7 +231,7 @@ def compile_world(region: Region, cfg: WorldConfig, bundle: SourceBundle) -> Can
 
     if cfg.vegetation.enabled:
         with stage("vegetation", t):
-            _vegetation(world, cfg)
+            _vegetation(world, cfg, place_trees)
     else:
         current().stage_skipped("vegetation")
 
@@ -291,19 +303,37 @@ def _smooth_borders(world: CanonicalWorld, cfg: WorldConfig) -> None:
     world.stats["smoothing"] = stats
 
 
-def _vegetation(world: CanonicalWorld, cfg: WorldConfig) -> None:
+def _vegetation(world: CanonicalWorld, cfg: WorldConfig, place: bool = True) -> None:
     vc = cfg.vegetation
     progress = current()
     grid = world.vegetation_grid
     # Region outlines keep the configured minimum size when the grid was refined.
     world.vegetation_regions = extract_regions(grid, world.landcover, vc, min_area=2.0 * vc.resolution ** 2)
     progress.step("vegetation", 1, 3, f"{len(world.vegetation_regions)} regions")
-    excl = vegetation_exclusions(world, vc.exclusion_buffer)
-    trees = place_trees(grid, world.terrain, excl, world.observed_trees, vc)  # type: ignore[arg-type]
-    progress.step("vegetation", 2, 3, f"{len(trees)} trees placed")
-    ground = place_ground_cover(grid, world.terrain, excl, vc)  # type: ignore[arg-type]
-    world.trees = concat_tables([trees, ground])
-    _tree_budget(world, cfg)
+    world.vegetation_exclusions = vegetation_exclusions(world, vc.exclusion_buffer)
+    world.ground_cover_scale = ground_cover_scale(grid, vc)
+    if not place:
+        world.trees_deferred = True
+        return
+    world.trees = place_vegetation(world)
+    progress.step("vegetation", 2, 3, f"{len(world.trees)} trees placed")
+    budget_issue(world, cfg, apply_tree_budget(world.trees, cfg))
+
+
+def place_vegetation(world: CanonicalWorld, bounds: tuple[float, float, float, float] | None = None) -> TreeTable:
+    """Trees, then ground cover, inside ``bounds`` (default: the whole grid), without budget.
+
+    The same trees, in the same relative order, whatever the bounds: every window places
+    exactly the whole-grid placement's trees that fall inside it (``place_trees``)."""
+    vc = world.config.vegetation
+    grid = world.vegetation_grid
+    excl = world.vegetation_exclusions
+    if excl is None:
+        excl = world.vegetation_exclusions = vegetation_exclusions(world, vc.exclusion_buffer)
+    trees = place_trees(grid, world.terrain, excl, world.observed_trees, vc, bounds=bounds)  # type: ignore[arg-type]
+    ground = place_ground_cover(grid, world.terrain, excl, vc, bounds=bounds,  # type: ignore[arg-type]
+                                scale=world.ground_cover_scale)
+    return concat_tables([trees, ground])
 
 
 def _building_budget(world: CanonicalWorld, cfg: WorldConfig) -> None:
@@ -331,22 +361,32 @@ def _building_budget(world: CanonicalWorld, cfg: WorldConfig) -> None:
         })
 
 
-def _tree_budget(world: CanonicalWorld, cfg: WorldConfig) -> None:
+def apply_tree_budget(tr: TreeTable, cfg: WorldConfig) -> BudgetResult | None:
+    """Mark the trees the instance budget renders (``tr.rendered``). Per tile, so a chunk of
+    whole tiles gets the same result as the world; ``max_total`` needs the whole world."""
     vb = cfg.vegetation.budget
-    tr = world.trees
     if not len(tr):
-        return
+        return None
     grid = TileGrid(cfg.tiling.tile_size)
     protected = tr.observed.copy() if vb.keep_observed else np.zeros(len(tr), dtype=bool)
     res = select_within_budget(tr.ids, grid.tiles_of(tr.x, tr.y), tree_sizes(tr.height, tr.crown_radius),
                                protected, vb, cfg.vegetation.seed, "trees",
                                u=tree_budget_uniforms(cfg.vegetation.seed, tr.seed))
     tr.rendered = res.keep
-    world.stats["trees_budget_dropped"] = res.dropped
-    if res.dropped:
+    return res
+
+
+def budget_issue(world: CanonicalWorld, cfg: WorldConfig, res: BudgetResult | None) -> None:
+    """Stats and the info issue of the tree budget (``res`` may merge several chunks)."""
+    vb = cfg.vegetation.budget
+    if res is None:  # no trees
+        return
+    dropped = res.dropped
+    world.stats["trees_budget_dropped"] = dropped
+    if dropped:
         world.stage_issues.append({
             "check": "instance_budget", "severity": "info", "entity_ids": [],
-            "message": f"{res.dropped} smaller trees/plants not rendered (budget {vb.max_per_tile}/tile"
+            "message": f"{dropped} smaller trees/plants not rendered (budget {vb.max_per_tile}/tile"
                        f"{f', {vb.max_total} total' if vb.max_total else ''}) in {len(res.tiles_over_budget)} "
                        f"tile(s); still present in vectors/trees.parquet",
         })
