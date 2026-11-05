@@ -65,7 +65,9 @@ class Container:
     sections: dict[str, bytes]      # tag (trailing spaces stripped) -> decoded payload
 
 
-def read_container(data: bytes) -> Container:
+def read_container(data: bytes, only: set[str] | None = None) -> Container:
+    """Decodes a container; with ``only``, just the sections of those tags (the others are skipped
+    without inflating them)."""
     magic, version, count, level, i, j, _ = _HEADER.unpack_from(data, 0)
     if magic != MAGIC:
         raise ValueError("not a WorldGen tile container (.wgt)")
@@ -74,8 +76,11 @@ def read_container(data: bytes) -> Container:
     sections = {}
     for k in range(count):
         tag, off, length, flags, _ = _SECTION.unpack_from(data, _HEADER.size + k * _SECTION.size)
+        name = tag.decode("ascii").rstrip()
+        if only is not None and name not in only:
+            continue
         raw = data[off:off + length]
-        sections[tag.decode("ascii").rstrip()] = zlib.decompress(raw, wbits=-15) if flags & FLAG_DEFLATE else raw
+        sections[name] = zlib.decompress(raw, wbits=-15) if flags & FLAG_DEFLATE else raw
     return Container(level, i, j, sections)
 
 

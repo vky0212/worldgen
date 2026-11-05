@@ -95,15 +95,20 @@ def building_sections(buildings: list[Building], plans: list[BuildingPlan],
                 c = np.asarray(ring.coords)[:-1, :2]
                 cols["vertices"].append(len(c))
                 xy.append(np.rint((c - (x0, y0)) * 1000.0))
+    ids = json.dumps({"BLD": [b.id for b in buildings]}, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return [("BLD", encode_buildings(cols, xy), True), ("IDS", ids, True)]
+
+
+def encode_buildings(cols: dict[str, list[Any]], xy: list[np.ndarray]) -> bytes:
+    """``BLD `` payload of the ``COLUMNS`` other than ``xy`` and the rings' vertices ``xy``
+    (millimetres from the tile corner, one (n, 2) array per ring, in ring order)."""
     v = np.concatenate(xy) if xy else np.zeros((0, 2))
-    cols["xy"] = v.ravel().tolist()
     counts = (len(cols["bottom"]), len(cols["shape"]), len(cols["vertices"]), len(v))
     out = bytearray(_HEADER.pack(*counts))
     for name, dtype, _ in COLUMNS:
-        out += np.asarray(cols[name], dtype=dtype).tobytes()
+        out += np.asarray(v.ravel() if name == "xy" else cols[name], dtype=dtype).tobytes()
         out += b"\0" * (-len(out) % 4)
-    ids = json.dumps({"BLD": [b.id for b in buildings]}, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    return [("BLD", bytes(out), True), ("IDS", ids, True)]
+    return bytes(out)
 
 
 @dataclass

@@ -180,11 +180,17 @@ compiler.
     (`ChunkExporter.coarse_tile`): every `2^L`-th node of the compiled terrain, a binomial
     colour pyramid computed in a window with a margin of `2^L` nodes (so any tile's window
     gives a node the same colour), the orthophoto at the level's pixel size and the tile's
-    terrain error. A coarse tile's input hash covers its level-0 tiles and the ring around
-    them, so incremental builds rewrite only what changed. The build's process then sets the
-    geometric errors bottom up from the terrain errors and the `lift` of the level-0 tiles
-    (the height of their content above the terrain), and lists every level in the subtree
-    files. `worldgen validate` checks that coarse heights nest in level 0.
+    terrain error. Buildings and trees (`export/coarse.py`) come from the level-0 tiles'
+    files (`BLD `, `TRE `), which the chunks have written by then, because deferred trees
+    exist only while their chunk runs: flat prisms of the buildings above the level's size
+    thresholds, and at levels 1-2 the tallest tree of each 1/64-tile cell with a grown
+    crown, plus the content error of what they leave out or simplify. A coarse tile's input
+    hash covers its level-0 tiles and the ring around them (and what a stale level-0 file
+    holds), so incremental builds rewrite only what changed. The build's process then sets
+    the geometric errors bottom up from the terrain and content errors and the `lift` of the
+    level-0 tiles (the height of their GLB layers above the terrain), and lists every level
+    in the subtree files. `worldgen validate` checks that coarse heights nest in level 0 and
+    that every coarse tree is a tree of the level below.
     `compile_world` called directly still places every tree, and
     `BuildOptions(keep_trees=True)` keeps them in `BuildResult.world.trees`.
     The whole-grid rasters (`terrain/heightfield.tif|.f32`, `terrain/landcover.tif`,
