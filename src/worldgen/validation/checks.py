@@ -584,6 +584,13 @@ class IndependenceSample:
         self.best: list[tuple[int, str, list[str]]] = []
 
     def add(self, tr: Any, tiles: list[str]) -> None:
+        self.merge(self.candidates(tr, tiles))
+
+    def merge(self, candidates: list[tuple[int, str, list[str]]]) -> None:
+        self.best = sorted(self.best + candidates, key=lambda b: (b[0], b[1]))[: self.KEEP]
+
+    def candidates(self, tr: Any, tiles: list[str]) -> list[tuple[int, str, list[str]]]:
+        """This table's (whole tiles') best tiles, for ``merge`` (possibly in another process)."""
         if len(tr):
             gen = np.array([s == "procedural" and a in ("broadleaf", "conifer", "palm")
                             for s, a in zip(tr.source, tr.archetype)])
@@ -594,10 +601,11 @@ class IndependenceSample:
         if gen.any():
             names, n = np.unique(tile_of[gen], return_counts=True)
             counts = {str(t): int(c) for t, c in zip(names, n)}
+        out = []
         for neg, t in sorted((-counts.get(t, 0), t) for t in tiles)[: self.KEEP]:
             ids = [tr.ids[k] for k in np.nonzero(gen & (tile_of == t))[0]] if neg else []
-            self.best.append((neg, t, ids))
-        self.best = sorted(self.best, key=lambda b: (b[0], b[1]))[: self.KEEP]
+            out.append((neg, t, ids))
+        return out
 
     def check(self) -> list[Issue]:
         from worldgen.pipeline import vegetation_exclusions

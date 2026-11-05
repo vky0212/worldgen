@@ -78,19 +78,38 @@ def extract_regions(grid: VegetationGrid, landcover: list[LandcoverArea], cfg: V
     return out
 
 
+def tree_cell_contributions(grid: VegetationGrid, trees: TreeTable) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(rows, cols, basal areas) of the trees that count as stems, in table order."""
+    if not len(trees):
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64), np.zeros(0)
+    big = np.array([a in ("broadleaf", "conifer", "palm") for a in trees.archetype])
+    rr, cc, inside = grid.cell_of(trees.x, trees.y)
+    sel = big & inside
+    return rr[sel], cc[sel], math.pi * (trees.trunk_radius[sel] + 0.4) ** 2
+
+
+# Basal-area sums are integers of this many m2: exact, so the same in any order of trees.
+BASAL_UNIT_M2 = 1e-9
+
+
+def add_cell_contributions(grid: VegetationGrid, contrib: tuple[np.ndarray, np.ndarray, np.ndarray],
+                           sums: tuple[np.ndarray, np.ndarray] | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """``contrib`` added to ``sums``: stem counts (uint32) and basal areas (int64 in units of
+    ``BASAL_UNIT_M2``), both exact, so the sums do not depend on how the trees were split
+    into tables or in which order those arrive."""
+    stems, basal = sums if sums is not None else (np.zeros(grid.shape, dtype=np.uint32),
+                                                  np.zeros(grid.shape, dtype=np.int64))
+    rr, cc, val = contrib
+    if len(rr):
+        np.add.at(stems, (rr, cc), 1)
+        np.add.at(basal, (rr, cc), np.rint(np.asarray(val) / BASAL_UNIT_M2).astype(np.int64))
+    return stems, basal
+
+
 def tree_cell_sums(grid: VegetationGrid, trees: TreeTable,
                    sums: tuple[np.ndarray, np.ndarray] | None = None) -> tuple[np.ndarray, np.ndarray]:
-    """Stems and trunk basal area per grid cell, added to ``sums`` (a chunked export feeds
-    its tables one by one)."""
-    # Stems are counts (uint32: exact, half the memory of float64); basal areas are float64.
-    stems, basal = sums if sums is not None else (np.zeros(grid.shape, dtype=np.uint32), np.zeros(grid.shape))
-    if len(trees):
-        big = np.array([a in ("broadleaf", "conifer", "palm") for a in trees.archetype])
-        rr, cc, inside = grid.cell_of(trees.x, trees.y)
-        sel = big & inside
-        np.add.at(stems, (rr[sel], cc[sel]), 1)
-        np.add.at(basal, (rr[sel], cc[sel]), math.pi * (trees.trunk_radius[sel] + 0.4) ** 2)
-    return stems, basal
+    """Stems and trunk basal area per grid cell, added to ``sums``."""
+    return add_cell_contributions(grid, tree_cell_contributions(grid, trees), sums)
 
 
 FIELD_NAMES = ["canopy_height_m", "canopy_coverage", "vegetation_density", "ground_obstruction", "visual_occlusion",
@@ -106,7 +125,7 @@ def environmental_fields(grid: VegetationGrid, trees: TreeTable | None = None,
     rows = rows if rows is not None else slice(0, grid.shape[0])
     cell_area = grid.resolution ** 2
     stems, basal = sums if sums is not None else tree_cell_sums(grid, trees if trees is not None else TreeTable())
-    stems, basal = stems[rows], basal[rows]
+    stems, basal = stems[rows], basal[rows] * BASAL_UNIT_M2
     category, coverage, canopy = grid.category[rows], grid.coverage[rows], grid.canopy_height[rows]
     density = stems / cell_area * 1e4
     shrub = np.isin(category, [CAT["shrubland"], CAT["wetland"]]) * coverage

@@ -483,8 +483,12 @@ class ExportConfig:
     fields: bool = True
     # Tiles per side of an export chunk (squares of the tile lattice): trees are placed,
     # checked and exported one chunk at a time, so they never all exist at once; a chunk's
-    # placement needs memory for its area. Outputs do not depend on it (0: one chunk).
-    chunk_tiles: int = 8
+    # placement needs memory for its area, and small chunks balance worker processes.
+    # Outputs do not depend on it (0: one chunk).
+    chunk_tiles: int = 4
+    # Worker processes exporting chunks in parallel (0: automatic - one for small worlds, else
+    # up to the cores minus one, at most 8). Outputs do not depend on it.
+    workers: int = 0
 
 
 @dataclass
@@ -536,6 +540,8 @@ class WorldConfig:
         r = self.terrain.resolution
         if t <= 0 or r <= 0:
             raise ConfigError("tiling.tile_size and terrain.resolution must be positive")
+        if self.export.chunk_tiles < 0 or self.export.workers < 0:
+            raise ConfigError("export.chunk_tiles and export.workers must be >= 0")
         cells = t / r
         if abs(cells - round(cells)) > 1e-9:
             raise ConfigError(

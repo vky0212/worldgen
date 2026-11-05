@@ -26,6 +26,16 @@ class BudgetResult:
     keep: np.ndarray            # bool per item
     dropped: int
     tiles_over_budget: list[str]
+    keys: np.ndarray | None = None   # selection key per item (larger is kept first)
+
+
+def key_floor(keys: np.ndarray, max_total: int) -> float | None:
+    """The key of the ``max_total``-th largest of ``keys`` (the alive items of a whole world,
+    gathered chunk by chunk): keeping the items with a key at or above it applies the
+    world-wide budget without holding the items; None when the budget is not exceeded."""
+    if max_total <= 0 or len(keys) <= max_total:
+        return None
+    return float(np.partition(keys, len(keys) - max_total)[len(keys) - max_total])
 
 
 # Salt of the tree budget's hash (hashing.hash_unit over the per-tree seed).
@@ -38,8 +48,11 @@ def tree_budget_uniforms(seed: int, tree_seeds: np.ndarray) -> np.ndarray:
 
 
 def select_within_budget(ids: list[str], tiles: np.ndarray, sizes: np.ndarray, protected: np.ndarray,
-                         cfg: BudgetConfig, seed: int, salt: str, u: np.ndarray | None = None) -> BudgetResult:
-    """``u``: one uniform per item; by default a hash of (seed, salt, id) per item (slow for many)."""
+                         cfg: BudgetConfig, seed: int, salt: str, u: np.ndarray | None = None,
+                         floor: float | None = None) -> BudgetResult:
+    """``u``: one uniform per item; by default a hash of (seed, salt, id) per item (slow for many).
+    ``floor`` (``key_floor`` of the whole world's alive keys) replaces the ``max_total`` cut for
+    items selected chunk by chunk: items below it are dropped (ties at it are kept)."""
     n = len(ids)
     keep = np.ones(n, dtype=bool)
     if not cfg.enabled or n == 0:
@@ -62,12 +75,14 @@ def select_within_budget(ids: list[str], tiles: np.ndarray, sizes: np.ndarray, p
             ranked = members[np.argsort(-key[members], kind="stable")]
             keep[ranked[cfg.max_per_tile:]] = False
             over.append(str(t_sorted[a]))
-    if cfg.max_total > 0 and keep.sum() > cfg.max_total:
+    if floor is not None:
+        keep &= key >= floor
+    elif cfg.max_total > 0 and keep.sum() > cfg.max_total:
         alive = np.nonzero(keep)[0]
         ranked = alive[np.argsort(-key[alive], kind="stable")]
         keep[ranked[cfg.max_total:]] = False
     # Protected items rank first (infinite key); they are only dropped when they alone exceed the budget.
-    return BudgetResult(keep, int((~keep).sum()), sorted(over))
+    return BudgetResult(keep, int((~keep).sum()), sorted(over), key)
 
 
 def building_sizes(buildings: list) -> np.ndarray:  # noqa: ANN001

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import numpy as np
@@ -361,17 +362,23 @@ def _building_budget(world: CanonicalWorld, cfg: WorldConfig) -> None:
         })
 
 
-def apply_tree_budget(tr: TreeTable, cfg: WorldConfig) -> BudgetResult | None:
-    """Mark the trees the instance budget renders (``tr.rendered``). Per tile, so a chunk of
-    whole tiles gets the same result as the world; ``max_total`` needs the whole world."""
+def apply_tree_budget(tr: TreeTable, cfg: WorldConfig, chunk: bool = False, floor: float | None = None
+                      ) -> BudgetResult | None:
+    """Mark the trees the instance budget renders (``tr.rendered``).
+
+    The per-tile budget only looks at a tile's own trees. The world-wide ``max_total`` is
+    applied here to a whole world's table; for a ``chunk`` of tiles it is the ``floor``
+    (``budget.key_floor`` of every chunk's alive keys, see ``export.chunked``), or nothing."""
     vb = cfg.vegetation.budget
     if not len(tr):
         return None
+    if chunk:
+        vb = dataclasses.replace(vb, max_total=0)
     grid = TileGrid(cfg.tiling.tile_size)
     protected = tr.observed.copy() if vb.keep_observed else np.zeros(len(tr), dtype=bool)
     res = select_within_budget(tr.ids, grid.tiles_of(tr.x, tr.y), tree_sizes(tr.height, tr.crown_radius),
                                protected, vb, cfg.vegetation.seed, "trees",
-                               u=tree_budget_uniforms(cfg.vegetation.seed, tr.seed))
+                               u=tree_budget_uniforms(cfg.vegetation.seed, tr.seed), floor=floor if chunk else None)
     tr.rendered = res.keep
     return res
 
