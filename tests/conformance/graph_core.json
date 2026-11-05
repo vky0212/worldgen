@@ -1,0 +1,342 @@
+{
+ "schema": "worldgen.conformance.graph_core",
+ "core_base64": "V0dUMQEABgAAAAAAAAAAAAAAAAAAAAAAVEFCIHgAAADfAAAAAQAAAE5PRCBYAQAAQwAAAAEAAABFREcgoAEAAHkAAAABAAAAR0VPICACAABSAAAAAQAAAFRJTCB4AgAACgAAAAEAAABSU1QgiAIAABcAAAABAAAAPZBBisMwDEWvMmhbE5JANoWeZAhBsd1YbWwF2UwppXcf2YXuHtLXs+QXbIJHWLINPuLy5yUTJzjD0A1dDwZYaCMtvGDHAudx6noDe40M49BNBoKnLWin7/q3ASu5ZdnirpbTIXy7lOjF/pxUsPSXcVLipNQEUId2zNnr4C9cmcsDn/rwIRRRKonP5HwqpEoDxYuSNmYDd0qujVlOydvCUquORFnPaK2VS9CxK8sDxSmtaO8N56YuQi28fGW6c6CV1FZfj5gcNtZ8ZPfZM7KW9LsC2d1XKdnnh+oFML//AQBjZYCCF8xgass1Roa/K5nBNAiYfYRI+33+/z/hFQPDhHiIOIclA4OlAQPDCSMGhiUWDAyT1SDqGBmYGJiBmIkBCQAAAAAAAABjZYAAMdMZbQ+VPRxgNETUD0r/qIfRjECSCYiZoTQLVD9MjAEqxghlP7jGyDBVgIkh2Y6BwSmHkaHBm4kBGTCi6YWB/0gAFx+mFqSXFYjZgZgbiHmRzGaGugckzwbEXUxdTIwsXUwnkB0AcgMTI9gJFhYWlmpQmf8AAAAAAAAAAONlQAWWBgwMUa8ZGFR+/f8/x5CBYcs1Rga/z///nzBCZf9dycyQ8IqBYYkFKpvhBTOD2UcGBg5LTL0KfgwMk6wh7AJBRjh7Qjwjw2Q1VDayewAAAAAAAABjY8AOGNFodAAAAAAAAAAAY2JAgP9AwASlmYE0E5IcIxoNYzAyAAA=",
+ "strings": {
+  "schema": "worldgen.graph_strings",
+  "schema_version": "2.3.0",
+  "nodes": [
+   "n:bnd:104-105",
+   "n:osm:101",
+   "n:osm:102",
+   "n:osm:103",
+   "n:osm:106"
+  ],
+  "edges": [
+   "e:osm:way/1:0",
+   "e:osm:way/1:1",
+   "e:osm:way/2:0",
+   "e:osm:way/3:0",
+   "e:osm:way/4:0"
+  ],
+  "roads": [
+   "road:osm:way/1",
+   "road:osm:way/2",
+   "road:osm:way/3",
+   "road:osm:way/4"
+  ],
+  "names": [
+   "\u4e2d\u5c71\u8def"
+  ],
+  "structures": [
+   "bridge:osm:way/3"
+  ],
+  "restrictions": [
+   {
+    "id": "r:osm:relation/7",
+    "restriction": "no_left_turn",
+    "from_way": "way/1",
+    "to_way": "way/3",
+    "source_id": "relation/7"
+   },
+   {
+    "id": "r:osm:relation/8",
+    "restriction": "only_straight_on",
+    "from_way": "way/9",
+    "to_way": "way/2",
+    "source_id": "relation/8"
+   }
+  ]
+ },
+ "expected": {
+  "schema": "worldgen.road_graph",
+  "schema_version": "1.1.0",
+  "origin": {
+   "lat": 25.0,
+   "lon": 121.5,
+   "height": 0.0
+  },
+  "crs": {
+   "local": "+proj=tmerc +lat_0=25 +lon_0=121.5"
+  },
+  "nodes": [
+   {
+    "id": "n:bnd:104-105",
+    "osm_id": null,
+    "kind": "connector",
+    "x": 256.0,
+    "y": 61.75,
+    "z": 14.6,
+    "degree": 1
+   },
+   {
+    "id": "n:osm:101",
+    "osm_id": 101,
+    "kind": "connector",
+    "x": 0.0,
+    "y": 0.0,
+    "z": 12.345,
+    "degree": 2
+   },
+   {
+    "id": "n:osm:102",
+    "osm_id": 102,
+    "kind": "connector",
+    "x": 120.5,
+    "y": -3.25,
+    "z": 13.0,
+    "degree": 3
+   },
+   {
+    "id": "n:osm:103",
+    "osm_id": 103,
+    "kind": "connector",
+    "x": 240.125,
+    "y": 60.0,
+    "z": 14.5,
+    "degree": 2
+   },
+   {
+    "id": "n:osm:106",
+    "osm_id": 106,
+    "kind": "connector",
+    "x": 120.5,
+    "y": 90.0,
+    "z": 9.875,
+    "degree": 2
+   }
+  ],
+  "edges": [
+   {
+    "id": "e:osm:way/1:0",
+    "road_id": "road:osm:way/1",
+    "from": "n:osm:101",
+    "to": "n:osm:102",
+    "direction": "both",
+    "length_m": 120.544,
+    "class": "residential",
+    "name": "\u4e2d\u5c71\u8def",
+    "bridge": false,
+    "tunnel": false,
+    "structure_implied": false,
+    "layer": 0,
+    "structure_id": null,
+    "modes": {
+     "motor_vehicle": true,
+     "bicycle": true,
+     "foot": true
+    },
+    "maxspeed_kmh": 48.28032,
+    "width_m": 6.5,
+    "geometry": [
+     [
+      0.0,
+      0.0,
+      12.345
+     ],
+     [
+      60.25,
+      -1.5,
+      12.7
+     ],
+     [
+      120.5,
+      -3.25,
+      13.0
+     ]
+    ],
+    "tiles": [
+     "0_0"
+    ]
+   },
+   {
+    "id": "e:osm:way/1:1",
+    "road_id": "road:osm:way/1",
+    "from": "n:osm:102",
+    "to": "n:osm:103",
+    "direction": "forward",
+    "length_m": 135.317,
+    "class": "residential",
+    "name": "\u4e2d\u5c71\u8def",
+    "bridge": false,
+    "tunnel": false,
+    "structure_implied": false,
+    "layer": 0,
+    "structure_id": null,
+    "modes": {
+     "motor_vehicle": true,
+     "bicycle": true,
+     "foot": true
+    },
+    "maxspeed_kmh": 48.28032,
+    "width_m": 6.5,
+    "geometry": [
+     [
+      120.5,
+      -3.25,
+      13.0
+     ],
+     [
+      240.125,
+      60.0,
+      14.5
+     ]
+    ],
+    "tiles": [
+     "0_0",
+     "1_0"
+    ]
+   },
+   {
+    "id": "e:osm:way/2:0",
+    "road_id": "road:osm:way/2",
+    "from": "n:osm:103",
+    "to": "n:bnd:104-105",
+    "direction": "both",
+    "length_m": 15.971,
+    "class": "primary",
+    "name": null,
+    "bridge": false,
+    "tunnel": false,
+    "structure_implied": false,
+    "layer": 0,
+    "structure_id": null,
+    "modes": {
+     "motor_vehicle": true,
+     "bicycle": true,
+     "foot": true
+    },
+    "maxspeed_kmh": 60.0,
+    "width_m": 10.25,
+    "geometry": [
+     [
+      240.125,
+      60.0,
+      14.5
+     ],
+     [
+      256.0,
+      61.75,
+      14.6
+     ]
+    ],
+    "tiles": [
+     "1_0"
+    ]
+   },
+   {
+    "id": "e:osm:way/3:0",
+    "road_id": "road:osm:way/3",
+    "from": "n:osm:102",
+    "to": "n:osm:106",
+    "direction": "both",
+    "length_m": 93.25,
+    "class": "tertiary",
+    "name": null,
+    "bridge": true,
+    "tunnel": false,
+    "structure_implied": false,
+    "layer": 1,
+    "structure_id": "bridge:osm:way/3",
+    "modes": {
+     "motor_vehicle": true,
+     "bicycle": true,
+     "foot": true
+    },
+    "maxspeed_kmh": null,
+    "width_m": 6.5,
+    "geometry": [
+     [
+      120.5,
+      -3.25,
+      13.0
+     ],
+     [
+      120.5,
+      20.0,
+      15.25
+     ],
+     [
+      120.5,
+      70.0,
+      15.25
+     ],
+     [
+      120.5,
+      90.0,
+      9.875
+     ]
+    ],
+    "tiles": [
+     "0_0"
+    ]
+   },
+   {
+    "id": "e:osm:way/4:0",
+    "road_id": "road:osm:way/4",
+    "from": "n:osm:106",
+    "to": "n:osm:101",
+    "direction": "both",
+    "length_m": 150.4,
+    "class": "footway",
+    "name": null,
+    "bridge": false,
+    "tunnel": true,
+    "structure_implied": true,
+    "layer": -1,
+    "structure_id": null,
+    "modes": {
+     "motor_vehicle": false,
+     "bicycle": false,
+     "foot": true
+    },
+    "maxspeed_kmh": null,
+    "width_m": 2.0,
+    "geometry": [
+     [
+      120.5,
+      90.0,
+      9.875
+     ],
+     [
+      0.0,
+      0.0,
+      12.345
+     ]
+    ],
+    "tiles": [
+     "0_0"
+    ]
+   }
+  ],
+  "restrictions": [
+   {
+    "id": "r:osm:relation/7",
+    "restriction": "no_left_turn",
+    "kind": "prohibitory",
+    "from_edge": "e:osm:way/1:0",
+    "via_node": "n:osm:102",
+    "to_edge": "e:osm:way/3:0",
+    "via_edges": [],
+    "from_way": "way/1",
+    "to_way": "way/3",
+    "source_id": "relation/7",
+    "enforced": true
+   },
+   {
+    "id": "r:osm:relation/8",
+    "restriction": "only_straight_on",
+    "kind": "mandatory",
+    "from_edge": null,
+    "via_node": null,
+    "to_edge": "e:osm:way/2:0",
+    "via_edges": [
+     "e:osm:way/1:1"
+    ],
+    "from_way": "way/9",
+    "to_way": "way/2",
+    "source_id": "relation/8",
+    "enforced": false
+   }
+  ]
+ }
+}

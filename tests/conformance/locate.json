@@ -1,0 +1,72 @@
+{
+ "schema": "worldgen.conformance.locate",
+ "hash": "fnv1a32 over UTF-8 bytes",
+ "cases": [
+  {
+   "id": "",
+   "fnv1a32": "0x811c9dc5",
+   "bucket_64": 5
+  },
+  {
+   "id": "a",
+   "fnv1a32": "0xe40c292c",
+   "bucket_64": 44
+  },
+  {
+   "id": "building:osm:way/1",
+   "fnv1a32": "0x1ecd6dff",
+   "bucket_64": 63
+  },
+  {
+   "id": "road:osm:way/1005161805",
+   "fnv1a32": "0x49dbab5d",
+   "bucket_64": 29
+  },
+  {
+   "id": "bridge:osm:way/107",
+   "fnv1a32": "0xca08b0cf",
+   "bucket_64": 15
+  },
+  {
+   "id": "water:osm:relation/9",
+   "fnv1a32": "0xfa9ddab3",
+   "bucket_64": 51
+  },
+  {
+   "id": "tree:osm:node/42",
+   "fnv1a32": "0x8820e2fb",
+   "bucket_64": 59
+  },
+  {
+   "id": "\u5efa\u7269:\u00e4\u00f6\u00fc",
+   "fnv1a32": "0x6f61a4cf",
+   "bucket_64": 15
+  }
+ ],
+ "bucket_counts": [
+  [
+   0,
+   1
+  ],
+  [
+   1,
+   1
+  ],
+  [
+   4096,
+   1
+  ],
+  [
+   4097,
+   2
+  ],
+  [
+   100000,
+   32
+  ],
+  [
+   1000000000,
+   4096
+  ]
+ ]
+}

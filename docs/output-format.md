@@ -18,6 +18,9 @@ Major version 2 is the **data-first** layout (`export.mode: data`, see
 [Data-first tiles](#data-first-tiles-format-2x)): terrain ships as heightmaps that
 consumers mesh themselves. `export.mode: baked` (the default) keeps writing 1.x.
 
+* **2.3.0** — `graph/core.wgt` + `graph/strings.json`, a binary copy of the road graph
+  (`road_graph.json` is still written), listed as `manifest.files.graph_core` /
+  `graph_strings`; the entity locator `tiles/locate/<bucket>.json` (`tileset.locate`).
 * **2.2.0** — buildings as data: `BLD `/`IDS ` footprint tables with the compiler's
   resolved roofs replace the GLB `buildings` layer; `tileset.buildings` carries the
   material palette. Building records stay in `meta.json`. Readers of 2.2 still accept 2.0
@@ -266,7 +269,7 @@ tiles/
 
 ```jsonc
 {
-  "schema": "worldgen.tileset", "schema_version": "2.2.0",
+  "schema": "worldgen.tileset", "schema_version": "2.3.0",
   "tile_size": 256, "subtree_tiles": 16,
   "levels": [{"level": 0, "size": 256, "spacing": 4.0, "geometric_error": 0.0}],
   "uri": {"content": "tiles/{level}/{si}_{sj}/{i}_{j}.wgt", "meta": "…", "collision": "…",
@@ -284,7 +287,9 @@ tiles/
   "buildings": {"sections": ["BLD", "IDS"], "uv_scale": 4.0,
                 "roof_shapes": ["flat", "gabled", "skillion", "pyramidal"],
                 "materials": [{"name": "building_residential", "color": [0.84, 0.79, 0.70, 1.0],
-                               "roughness": 0.85, "metallic": 0.0}, ...]}
+                               "roughness": 0.85, "metallic": 0.0}, ...]},
+  // 2.3: entity locator
+  "locate": {"uri": "tiles/locate/{bucket}.json", "buckets": 1, "hash": "fnv1a32", "ids": 59}
 }
 ```
 
@@ -366,7 +371,44 @@ holds `hash64.json`, `terrain_tiles.json` — containers with the exact vertex a
 their baked terrain — `tree_tiles.json` — a tile's tree records with their ids,
 instance transforms and seeds — and `building_tiles.json` — footprint records of every
 roof type and fallback with the volume, roof and floor areas and height range of their
-baked meshes — that every implementation can test against.
+baked meshes — `graph_core.json` — a small graph's binary files and the document they
+decode to — and `locate.json` — locator hashes and buckets — that every implementation can
+test against.
+
+### tiles/locate/<bucket>.json
+
+The **entity locator** (2.3): which tiles record an entity, so a consumer can resolve a
+link, an issue or a search to entities in tiles it has not loaded. `tileset.locate` is
+`{"uri": "tiles/locate/{bucket}.json", "buckets": B, "hash": "fnv1a32", "ids": n}`; an id
+lives in bucket `fnv1a32(utf-8 bytes of the id) & (B − 1)` (FNV-1a 32: offset basis
+`0x811C9DC5`, prime `0x01000193`), `B` a power of two with about 4096 ids per bucket. A
+bucket is `{"schema": "worldgen.locate", "bucket": b, "entities": {"<id>": ["<i>_<j>", ...]}}`
+listing every id recorded in some tile's `meta.json` or `TOB ` section, with all tiles
+recording it. Not listed, because the id gives the tile: `terrain:<i>_<j>`, and generated
+trees `tree:gen:<cx>_<cy>_…` (the tile holding sampling cell `(cx, cy)`).
+
+### graph/core.wgt and graph/strings.json
+
+A binary copy of `graph/road_graph.json` (2.3) for runtimes that load the graph as typed
+arrays: about 6× smaller than the JSON (`export/graphcore.py` is the reference,
+`viewer/src/content/graphCore.ts` a decoder). `core.wgt` is a `.wgt` container (level, i,
+j = 0); every section but `TAB ` is a `u32` count followed by columnar arrays, each starting
+8-byte aligned within the section:
+
+| tag | content |
+|---|---|
+| `TAB ` | JSON: `graph_schema_version` (of `road_graph.json`), `origin`, `crs`, code tables `classes`, `kinds`, `directions` (`both`, `forward`, `backward`), `restriction_kinds` (`prohibitory`, `mandatory`), `modes`. |
+| `NOD ` | `N` · `i32 x[N], y[N], z[N]` (mm) · `u16 degree[N]` · `u8 kind[N]`. |
+| `EDG ` | `E` · `f64 maxspeed_kmh[E]` (NaN: none) · `u32 from[E], to[E]` (node rows) · `u32 length[E]` (mm) · `u32 road[E], name[E], structure[E]` (rows of the `strings.json` tables, `0xFFFFFFFF`: none) · `u32 geometry[E+1], tiles[E+1]` (first `GEO ` vertex / `TIL ` entry of each edge) · `u16 width[E]` (cm) · `u8 direction[E], class[E], flags[E]` · `i8 layer[E]`. Flags: bit 0 bridge, 1 tunnel, 2 structure implied, 3/4/5 open to motor_vehicle/bicycle/foot. |
+| `GEO ` | `V` · `i32 xyz[3V]` (mm): each edge's polyline (bridge and tunnel decks: their profile). |
+| `TIL ` | `T` · `i32 ij[2T]`: each edge's tiles. |
+| `RST ` | `R` · `i32 from_edge[R], via_node[R], to_edge[R]` (rows, −1: none) · `u32 via[R+1]` · `u32 via_edges[via[R]]` · `u8 kind[R], enforced[R]`. |
+
+Rows are in `road_graph.json` order (sorted by id). `strings.json` (`worldgen.graph_strings`)
+holds `nodes` and `edges` (the id of each row), the tables `roads`, `names` and `structures`,
+and per restriction `id`, `restriction`, `from_way`, `to_way`, `source_id`. Decoding gives
+`road_graph.json` exactly, except that nodes carry no `lon`/`lat` (convert `x`, `y` with
+`crs.local`) and `osm_id` is read from `n:osm:<id>` node ids.
 
 ## graph/road_graph.json
 

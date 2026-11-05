@@ -39,6 +39,10 @@ import type { NearTile } from './stream/metaCache';
 import { keyAt, keyId } from './stream/quadtree';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { loadArchetypes } from './content/archetypes';
+import { decodeGraphCore } from './content/graphCore';
+import type { GraphStrings } from './content/graphCore';
+import { Locator, derivedTile } from './stream/locate';
+import type { LocateDoc } from './stream/locate';
 import { TileStreamer } from './stream/TileStreamer';
 import { fillUri, indexFromTileset, tilesetFromIndex } from './stream/tileset';
 import type { TileNode, Tileset } from './stream/tileset';
@@ -162,6 +166,8 @@ class App {
   private streamer: TileStreamer | null = null;
   /** tiles/tileset.json of a data-first (2.x) world. */
   private tilesetDoc: TilesetDoc | null = null;
+  /** Data-first worlds: entity id -> tiles recording it (tiles/locate). */
+  private locator: Locator | null = null;
   private metaCache: MetaCache | null = null;
   private readonly standardShadow = new ShadowFitter();
   private bench: FlyBench | null = null;
@@ -297,6 +303,7 @@ class App {
         }));
         index = indexFromTileset(ts, subtrees);
         this.tilesetDoc = ts;
+        if (ts.locate) this.locator = new Locator(ts.locate, (p) => fetchOptionalJson<LocateDoc>(worldUrl(this.base, p)));
       } else {
         index = await fetchJson<TileIndex>(worldUrl(this.base, indexPath));
         for (const w of checkSchema(index, 'worldgen.tile_index', indexPath)) this.toasts.show(w, 'warn');
@@ -682,10 +689,26 @@ class App {
     }
   }
 
+  /** The binary graph of a data-first world (graph/core.wgt + strings.json), null when absent. */
+  private async fetchGraphCore(corePath: string, stringsPath: string): Promise<RoadGraph | null> {
+    const url = worldUrl(this.base, corePath);
+    const res = await fetch(url, { cache: 'no-cache' });
+    if (res.status === 404 || res.status === 410) return null;
+    if (!res.ok) throw new HttpError(res.status, url, `HTTP ${res.status} for ${url}`);
+    const [core, strings] = await Promise.all([res.arrayBuffer(), fetchJson<GraphStrings>(worldUrl(this.base, stringsPath))]);
+    return decodeGraphCore(core, strings);
+  }
+
   private async loadGraph(): Promise<void> {
-    const path = this.manifest?.files?.graph ?? 'graph/road_graph.json';
+    const files = this.manifest?.files;
+    let path = files?.graph ?? 'graph/road_graph.json';
     try {
-      const graph = await fetchOptionalJson<RoadGraph>(worldUrl(this.base, path));
+      let graph: RoadGraph | null = null;
+      if (files?.graph_core && files.graph_strings) {
+        graph = await this.fetchGraphCore(files.graph_core, files.graph_strings);
+        if (graph) path = files.graph_core;
+      }
+      graph ??= await fetchOptionalJson<RoadGraph>(worldUrl(this.base, path));
       if (!graph) {
         this.setOverlayNote(this.topoCheck, this.topoNote, `${path} not found — topology and routing unavailable.`);
         this.routeStats.textContent = 'No road graph: routing unavailable.';
@@ -1412,7 +1435,7 @@ class App {
    * Selects anything by id: tile entity, graph edge or node. `hintTiles` are
    * tiles whose meta.json may describe the entity when it is not loaded yet.
    */
-  private selectById(id: string, hintTiles: readonly string[] = []): void {
+  private selectById(id: string, hintTiles: readonly string[] = [], located = false): void {
     if (this.world.getEntity(id) || this.world.occurrencesOf(id).length) {
       this.selectEntity(id, { fly: true });
       return;
@@ -1442,7 +1465,13 @@ class App {
     }
     const unloaded = hintTiles.filter((t) => this.tileset?.byContentId.has(t) && !this.world.hasMeta(t));
     if (unloaded.length) {
-      void this.ensureMeta(unloaded).then(() => this.selectById(id));
+      void this.ensureMeta(unloaded).then(() => this.selectById(id, [], located));
+      return;
+    }
+    if (!located && this.locator && this.tileset) {
+      // Not in any loaded tile: ask the locator which tiles record it, load their meta.json.
+      const derived = derivedTile(id, this.tileset.tileSize, this.tilesetDoc?.trees?.cell_size);
+      void this.locator.tilesOf(id).then((tiles) => this.selectById(id, derived ? [...tiles, derived] : tiles, true));
       return;
     }
     this.toasts.show(`"${id}" is not in any loaded tile or in the road graph.`, 'warn');
