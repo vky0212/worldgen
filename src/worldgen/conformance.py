@@ -280,6 +280,13 @@ def _graph_doc() -> dict[str, Any]:
         {"id": "r:osm:relation/8", "restriction": "only_straight_on", "from_edge": None, "via_node": None,
          "to_edge": "e:osm:way/2:0", "via_edges": ["e:osm:way/1:1"], "from_way": "way/9", "to_way": "way/2",
          "source_id": "relation/8", "enforced": False},
+        # References the graph does not contain (a via node off the graph, a via way outside it).
+        {"id": "r:osm:relation/9", "restriction": "no_right_turn", "from_edge": "e:osm:way/2:0",
+         "via_node": "n:osm:618956032", "to_edge": None, "via_edges": [], "from_way": "way/2",
+         "to_way": "way/77", "source_id": "relation/9", "enforced": False},
+        {"id": "r:osm:relation/10", "restriction": "no_u_turn", "from_edge": None, "via_node": None,
+         "to_edge": "e:osm:way/1:0", "via_edges": ["e:osm:way/1:1", "e:osm:way/88:0"], "from_way": "way/5",
+         "to_way": "way/1", "source_id": "relation/10", "enforced": False},
     ]
     return {"schema": "worldgen.road_graph", "schema_version": "1.1.0", "nodes": nodes, "edges": edges,
             "restrictions": restrictions}

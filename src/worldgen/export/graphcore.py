@@ -23,7 +23,9 @@ Edge ``flags``: bit 0 bridge, 1 tunnel, 2 structure implied, 3 / 4 / 5 open to
 motor_vehicle / bicycle / foot. Rows follow ``road_graph.json`` (nodes, edges and
 restrictions sorted by id). ``strings.json`` holds ``nodes`` and ``edges`` (ids per row),
 ``roads``, ``names`` and ``structures`` (tables) and per restriction its ``id``,
-``restriction``, ``from_way``, ``to_way`` and ``source_id``. ``decode_graph`` rebuilds the
+``restriction``, ``from_way``, ``to_way`` and ``source_id``, plus the id of any reference
+the graph does not contain (``from_edge``, ``via_node``, ``to_edge``, or all ``via_edges``),
+whose row is then -1 (no ``VIA`` entries). ``decode_graph`` rebuilds the
 ``road_graph.json`` document from both (without node lon/lat).
 """
 
@@ -157,12 +159,22 @@ def graph_files(graph: Any, origin: dict[str, Any] | None, crs_local: str | None
     via: list[int] = []
     vstart = [0]
     rcols: dict[str, list[int]] = {"from_edge": [], "via_node": [], "to_edge": [], "kind": [], "enforced": []}
+    # References outside the graph (a via node the graph does not contain, say) are stored
+    # as -1 with their id in the restriction's strings record, so nothing is lost.
+    unresolved: list[dict[str, Any]] = []
     for r in restrictions:
-        rcols["from_edge"].append(erow[r.from_edge] if r.from_edge is not None else -1)
-        rcols["via_node"].append(nrow[r.via_node] if r.via_node is not None else -1)
-        rcols["to_edge"].append(erow[r.to_edge] if r.to_edge is not None else -1)
-        via += [erow[v] for v in r.via_edges]
+        extra: dict[str, Any] = {}
+        for key, ref, rows in (("from_edge", r.from_edge, erow), ("via_node", r.via_node, nrow),
+                               ("to_edge", r.to_edge, erow)):
+            if ref is not None and ref not in rows:
+                extra[key] = ref
+            rcols[key].append(rows[ref] if ref is not None and ref in rows else -1)
+        if all(v in erow for v in r.via_edges):
+            via += [erow[v] for v in r.via_edges]
+        else:
+            extra["via_edges"] = list(r.via_edges)
         vstart.append(len(via))
+        unresolved.append(extra)
         rcols["kind"].append(1 if r.mandatory else 0)
         rcols["enforced"].append(1 if r.enforced else 0)
     rst = _pack(len(restrictions), [
@@ -181,7 +193,8 @@ def graph_files(graph: Any, origin: dict[str, Any] | None, crs_local: str | None
     strings = {"schema": "worldgen.graph_strings", "schema_version": schema_version, "nodes": node_ids,
                "edges": edge_ids, **tables,
                "restrictions": [{"id": r.id, "restriction": r.restriction, "from_way": r.from_way,
-                                 "to_way": r.to_way, "source_id": r.source_id} for r in restrictions]}
+                                 "to_way": r.to_way, "source_id": r.source_id, **extra}
+                                for r, extra in zip(restrictions, unresolved)]}
     return core, strings
 
 
@@ -233,10 +246,11 @@ def decode_graph(core: bytes, strings: dict[str, Any]) -> dict[str, Any]:
         fe, vn, te = int(rc["from_edge"][k]), int(rc["via_node"][k]), int(rc["to_edge"][k])
         restrictions.append({
             "id": s["id"], "restriction": s["restriction"], "kind": tab["restriction_kinds"][rc["kind"][k]],
-            "from_edge": strings["edges"][fe] if fe >= 0 else None,
-            "via_node": node_ids[vn] if vn >= 0 else None,
-            "to_edge": strings["edges"][te] if te >= 0 else None,
-            "via_edges": [strings["edges"][int(v)] for v in rc["via_edges"][int(rc["via"][k]):int(rc["via"][k + 1])]],
+            "from_edge": strings["edges"][fe] if fe >= 0 else s.get("from_edge"),
+            "via_node": node_ids[vn] if vn >= 0 else s.get("via_node"),
+            "to_edge": strings["edges"][te] if te >= 0 else s.get("to_edge"),
+            "via_edges": s["via_edges"] if "via_edges" in s else
+            [strings["edges"][int(v)] for v in rc["via_edges"][int(rc["via"][k]):int(rc["via"][k + 1])]],
             "from_way": s["from_way"], "to_way": s["to_way"], "source_id": s["source_id"],
             "enforced": bool(rc["enforced"][k]),
         })

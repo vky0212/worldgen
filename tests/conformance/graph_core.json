@@ -1,6 +1,6 @@
 {
  "schema": "worldgen.conformance.graph_core",
- "core_base64": "V0dUMQEABgAAAAAAAAAAAAAAAAAAAAAAVEFCIHgAAADfAAAAAQAAAE5PRCBYAQAAQwAAAAEAAABFREcgoAEAAHkAAAABAAAAR0VPICACAABSAAAAAQAAAFRJTCB4AgAACgAAAAEAAABSU1QgiAIAABcAAAABAAAAPZBBisMwDEWvMmhbE5JANoWeZAhBsd1YbWwF2UwppXcf2YXuHtLXs+QXbIJHWLINPuLy5yUTJzjD0A1dDwZYaCMtvGDHAudx6noDe40M49BNBoKnLWin7/q3ASu5ZdnirpbTIXy7lOjF/pxUsPSXcVLipNQEUId2zNnr4C9cmcsDn/rwIRRRKonP5HwqpEoDxYuSNmYDd0qujVlOydvCUquORFnPaK2VS9CxK8sDxSmtaO8N56YuQi28fGW6c6CV1FZfj5gcNtZ8ZPfZM7KW9LsC2d1XKdnnh+oFML//AQBjZYCCF8xgass1Roa/K5nBNAiYfYRI+33+/z/hFQPDhHiIOIclA4OlAQPDCSMGhiUWDAyT1SDqGBmYGJiBmIkBCQAAAAAAAABjZYAAMdMZbQ+VPRxgNETUD0r/qIfRjECSCYiZoTQLVD9MjAEqxghlP7jGyDBVgIkh2Y6BwSmHkaHBm4kBGTCi6YWB/0gAFx+mFqSXFYjZgZgbiHmRzGaGugckzwbEXUxdTIwsXUwnkB0AcgMTI9gJFhYWlmpQmf8AAAAAAAAAAONlQAWWBgwMUa8ZGFR+/f8/x5CBYcs1Rga/z///nzBCZf9dycyQ8IqBYYkFKpvhBTOD2UcGBg5LTL0KfgwMk6wh7AJBRjh7Qjwjw2Q1VDayewAAAAAAAABjY8AOGNFodAAAAAAAAAAAY2JAgP9AwASlmYE0E5IcIxoNYzAyAAA=",
+ "core_base64": "V0dUMQEABgAAAAAAAAAAAAAAAAAAAAAAVEFCIHgAAADfAAAAAQAAAE5PRCBYAQAAQwAAAAEAAABFREcgoAEAAHkAAAABAAAAR0VPICACAABSAAAAAQAAAFRJTCB4AgAACgAAAAEAAABSU1QgiAIAAB4AAAABAAAAPZBBisMwDEWvMmhbE5JANoWeZAhBsd1YbWwF2UwppXcf2YXuHtLXs+QXbIJHWLINPuLy5yUTJzjD0A1dDwZYaCMtvGDHAudx6noDe40M49BNBoKnLWin7/q3ASu5ZdnirpbTIXy7lOjF/pxUsPSXcVLipNQEUId2zNnr4C9cmcsDn/rwIRRRKonP5HwqpEoDxYuSNmYDd0qujVlOydvCUquORFnPaK2VS9CxK8sDxSmtaO8N56YuQi28fGW6c6CV1FZfj5gcNtZ8ZPfZM7KW9LsC2d1XKdnnh+oFML//AQBjZYCCF8xgass1Roa/K5nBNAiYfYRI+33+/z/hFQPDhHiIOIclA4OlAQPDCSMGhiUWDAyT1SDqGBmYGJiBmIkBCQAAAAAAAABjZYAAMdMZbQ+VPRxgNETUD0r/qIfRjECSCYiZoTQLVD9MjAEqxghlP7jGyDBVgIkh2Y6BwSmHkaHBm4kBGTCi6YWB/0gAFx+mFqSXFYjZgZgbiHmRzGaGugckzwbEXUxdTIwsXUwnkB0AcgMTI9gJFhYWlmpQmf8AAAAAAAAAAONlQAWWBgwMUa8ZGFR+/f8/x5CBYcs1Rga/z///nzBCZf9dycyQ8IqBYYkFKpvhBTOD2UcGBg5LTL0KfgwMk6wh7AJBRjh7Qjwjw2Q1VDayewAAAAAAAABjY8AOGNFodAAAAAAAAAAAY2GAgP9AAKOZ0GiYHDMQMyGphQFGKGZAouEsIAUA",
  "strings": {
   "schema": "worldgen.graph_strings",
   "schema_version": "2.3.0",
@@ -32,6 +32,17 @@
   ],
   "restrictions": [
    {
+    "id": "r:osm:relation/10",
+    "restriction": "no_u_turn",
+    "from_way": "way/5",
+    "to_way": "way/1",
+    "source_id": "relation/10",
+    "via_edges": [
+     "e:osm:way/1:1",
+     "e:osm:way/88:0"
+    ]
+   },
+   {
     "id": "r:osm:relation/7",
     "restriction": "no_left_turn",
     "from_way": "way/1",
@@ -44,6 +55,14 @@
     "from_way": "way/9",
     "to_way": "way/2",
     "source_id": "relation/8"
+   },
+   {
+    "id": "r:osm:relation/9",
+    "restriction": "no_right_turn",
+    "from_way": "way/2",
+    "to_way": "way/77",
+    "source_id": "relation/9",
+    "via_node": "n:osm:618956032"
    }
   ]
  },
@@ -310,6 +329,22 @@
   ],
   "restrictions": [
    {
+    "id": "r:osm:relation/10",
+    "restriction": "no_u_turn",
+    "kind": "prohibitory",
+    "from_edge": null,
+    "via_node": null,
+    "to_edge": "e:osm:way/1:0",
+    "via_edges": [
+     "e:osm:way/1:1",
+     "e:osm:way/88:0"
+    ],
+    "from_way": "way/5",
+    "to_way": "way/1",
+    "source_id": "relation/10",
+    "enforced": false
+   },
+   {
     "id": "r:osm:relation/7",
     "restriction": "no_left_turn",
     "kind": "prohibitory",
@@ -335,6 +370,19 @@
     "from_way": "way/9",
     "to_way": "way/2",
     "source_id": "relation/8",
+    "enforced": false
+   },
+   {
+    "id": "r:osm:relation/9",
+    "restriction": "no_right_turn",
+    "kind": "prohibitory",
+    "from_edge": "e:osm:way/2:0",
+    "via_node": "n:osm:618956032",
+    "to_edge": null,
+    "via_edges": [],
+    "from_way": "way/2",
+    "to_way": "way/77",
+    "source_id": "relation/9",
     "enforced": false
    }
   ]
