@@ -539,7 +539,7 @@ class App {
     const near: NearTile[] = [];
     for (const w of res.wanted) {
       const c = w.node.content;
-      if (!c) continue;
+      if (!c || !c.entry.meta) continue; // coarser levels have no meta.json
       if (w.distance <= META_RADIUS || (colourMode && w.ready && w.tier <= 1)) near.push({ entry: c.entry, distance: w.distance });
     }
     near.sort((a, b) => a.distance - b.distance);
@@ -1310,17 +1310,23 @@ class App {
    * there; null when no tile is loaded at that point.
    */
   private groundZAt(x: number, y: number): number | null {
-    const tiles = this.world.tilesAt(x, y);
-    if (!tiles.length) return null;
+    const all = this.world.tilesAt(x, y);
+    if (!all.length) return null;
     const top = (this.bounds.zmax ?? 1000) + 1000;
     const origin = enuToThree(x, y, top);
-    const pick = (accept: (layer: string) => boolean): Object3D[] =>
-      tiles.flatMap((t) => t.pickables.filter((p) => accept(p.layer) && p.object instanceof Mesh).map((p) => p.object));
-    let objects = pick((l) => l === 'terrain');
-    if (!objects.length) objects = pick((l) => l !== 'trees' && l !== 'vegetation_regions');
     this.picker.raycaster.set(origin, new Vector3(0, -1, 0));
-    const hit = this.picker.intersect(objects)[0];
-    return hit ? hit.point.y : null;
+    // The finest loaded level of detail there first (coarser tiles approximate the terrain).
+    const levels = [...new Set(all.map((t) => t.entry.level ?? 0))].sort((a, b) => a - b);
+    for (const level of levels) {
+      const tiles = all.filter((t) => (t.entry.level ?? 0) === level);
+      const pick = (accept: (layer: string) => boolean): Object3D[] =>
+        tiles.flatMap((t) => t.pickables.filter((p) => accept(p.layer) && p.object instanceof Mesh).map((p) => p.object));
+      let objects = pick((l) => l === 'terrain');
+      if (!objects.length) objects = pick((l) => l !== 'trees' && l !== 'vegetation_regions');
+      const hit = this.picker.intersect(objects)[0];
+      if (hit) return hit.point.y;
+    }
+    return null;
   }
 
   /** Point under the cursor: surface hit or the ground plane. */

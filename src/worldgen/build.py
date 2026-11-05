@@ -27,7 +27,8 @@ from worldgen.export.graphcore import graph_files
 from worldgen.export.instances import archetypes_glb
 from worldgen.export.locate import locate_files
 from worldgen.export.merge import merge_glbs
-from worldgen.export.ortho import ortho_baker
+from worldgen.export.ortho import imagery_hash, ortho_baker, tile_pixels
+from worldgen.export.pyramid import finish_levels, level_work, plan_levels, remove_stale_levels, state_key, top_level
 from worldgen.export.tiles import (
     LAYER_ORDER,
     tile_chunks,
@@ -47,7 +48,7 @@ from worldgen.progress import current
 from worldgen.sources.base import GEOTIFF_BLOCK_ROWS, SourceRecord, write_geotiff_rows
 from worldgen.sources.synthetic import load_fixture
 from worldgen.spatial.region import Region
-from worldgen.tiling.grid import TileGrid
+from worldgen.tiling.grid import TileGrid, parse_tile_id
 from worldgen.validation.checks import Report, validate_world
 from worldgen.vegetation.classify import CATEGORIES
 from worldgen.vegetation.placement import ARCHETYPES
@@ -189,6 +190,21 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
             floor = key_floor(np.concatenate(keys) if keys else np.zeros(0), budget.max_total)
         for result in runner.export(chunks, floor, whole):
             merger.merge(result)
+        # Coarser levels of detail (data mode, export/pyramid.py), from the finished level 0.
+        levels: dict[int, dict[tuple[int, int], list[tuple[int, int]]]] = {}
+        level_state: dict[int, dict[tuple[int, int], dict[str, Any]]] = {}
+        if mode == "data":
+            levels = plan_levels(tiles, top_level(cfg.export.lod_levels, cfg.tiling.tile_size,
+                                                  world.terrain.resolution))
+            leaves = {parse_tile_id(t): merger.hashes[t] for t in tiles}
+            items, level_state = level_work(levels, leaves, prev.get("levels", {}), out, opts.force,
+                                            {"quantum": cfg.height_quantum(), "imagery": imagery_hash(world)})
+            for level, key, state in runner.coarse(items):
+                level_state[level][key] = state
+            remove_stale_levels(out, levels)
+            if levels:
+                log.info("coarser levels: %s tiles, %d (re)built",
+                         "+".join(str(len(levels[k])) for k in sorted(levels)), len(items))
     if world.trees_deferred:
         world.trees = merger.finish()
     hashes, built, tile_entities = merger.hashes, merger.built, merger.tile_entities
@@ -208,9 +224,16 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
     if ortho_info is not None:
         world.stats["ortho"] = ortho_info
     if data:
+        finished = finish_levels(levels, tile_state, level_state, world.terrain.resolution)
+        level_ortho = {}
+        if baker is not None:
+            for level in finished:
+                size = cfg.tiling.tile_size * (1 << level)
+                px = tile_pixels(size, baker.effective_m_per_px, cfg.sources.imagery.tile_px_max)
+                level_ortho[level] = {"pixels": px, "m_per_px": round(size / px, 4)}
         tileset, subtrees = data_index(tiles, tile_state, cfg.tiling.tile_size, world.terrain.resolution,
                                        cfg.height_quantum(), LAYER_ORDER, ortho_info,
-                                       {str(k): v for k, v in LANDCOVER_CODES.items()})
+                                       {str(k): v for k, v in LANDCOVER_CODES.items()}, finished, level_ortho)
         tileset["archetypes"] = "tiles/archetypes.glb"
         tileset["trees"] = {"sections": ["TRE", "TOB"], "seed": cfg.vegetation.seed,
                             "cell_size": cfg.vegetation.cell_size, "archetypes": ARCHETYPES,
@@ -245,7 +268,11 @@ def export_world(world: CanonicalWorld, report: Report, opts: BuildOptions) -> t
                 "hash": hashes[t], "counts": st.get("counts", {}),
             })
         _write_json(out / "tiles" / "index.json", index, indent=1)
-    _write_json(state_path, {"world_key": _world_key(world), "tiles": tile_state}, indent=1)
+    state: dict[str, Any] = {"world_key": _world_key(world), "tiles": tile_state}
+    if data:
+        state["levels"] = {state_key(level, *key): level_state[level][key]
+                           for level in sorted(level_state) for key in levels[level]}
+    _write_json(state_path, state, indent=1)
 
     combined = out / "world.glb"
     if not data and _combined_glb_wanted(cfg, len(tiles)):

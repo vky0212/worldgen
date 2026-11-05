@@ -70,7 +70,7 @@ def trees_by_tile(world: CanonicalWorld) -> dict[str, np.ndarray]:
 
 
 # Configuration keys that never change a tile's files, kept out of the tile input hashes.
-NOT_TILE_INPUTS: dict[str, tuple[str, ...]] = {"export": ("combined_glb_max_tiles", "chunk_tiles")}
+NOT_TILE_INPUTS: dict[str, tuple[str, ...]] = {"export": ("combined_glb_max_tiles", "chunk_tiles", "lod_levels")}
 # Keys added after format 1.0, hashed only when set away from their default, so worlds built
 # with the defaults keep their tile hashes (and incremental rebuilds) across the upgrade.
 LATER_KEY_DEFAULTS: dict[str, dict[str, Any]] = {"export": {"mode": "baked"}, "terrain": {"height_quantum_m": 0.0}}
@@ -338,7 +338,8 @@ def build_tile_assets(world: CanonicalWorld, tid: str, pieces: list[Piece], terr
     ``entity_index`` (``world.entity_index()``) are computed once per export by the caller;
     without them they are derived here, which costs O(trees + entities) per tile. Without
     ``terrain_mesh`` (data-first tiles, whose terrain ships as a heightmap) the GLB has no
-    terrain layer; the terrain record and height range are still produced. With
+    terrain layer; the terrain record and height range are still produced, and ``lift``: the
+    largest height of the tile's other content above the terrain (for the coarser levels). With
     ``trees_as_data`` the GLB has no tree instances and meta.json no tree records: the trees
     ship as a ``TRE `` section built from ``tree_idx`` (rendered trees, in TRE order).
     ``buildings_as_data`` (the tile's ``buildings_by_tile`` entry) are buildings shipped as a
@@ -363,11 +364,13 @@ def build_tile_assets(world: CanonicalWorld, tid: str, pieces: list[Piece], terr
         zmin, zmax = float(win.min()), float(win.max())
     if cfg.export.collision:
         collision.add(hf.tile_mesh(x0, y0, x1, y1, stride=2, normals=terrain_normals), "collision", terrain_id)
+    lift = 0.0
     if buildings_as_data:
         for b in buildings_as_data:
             layers["buildings"].feature_index(b.id)
             bottom, top = building_extent(b, cfg.buildings)
             zmin, zmax = min(zmin, bottom), max(zmax, top)
+            lift = max(lift, top - bottom)
     for p in pieces:
         if p.layer == "collision":
             collision.add(p.mesh, p.material, p.feature_id)
@@ -384,6 +387,9 @@ def build_tile_assets(world: CanonicalWorld, tid: str, pieces: list[Piece], terr
         for m in prims.values():
             zmin = min(zmin, float(m.positions[:, 2].min()))
             zmax = max(zmax, float(m.positions[:, 2].max()))
+            if not terrain_mesh and len(m.positions):
+                p = m.positions
+                lift = max(lift, float((p[:, 2] - hf.sample(p[:, 0], p[:, 1])).max()))
         mi = gb.add_mesh(name, prims, origin, extras={"layer": name, "feature_ids": lb.features})
         if mi is not None:
             children.append(gb.add_node(name, mesh=mi, extras={"layer": name}))
@@ -411,6 +417,7 @@ def build_tile_assets(world: CanonicalWorld, tid: str, pieces: list[Piece], terr
                                                                          "instance_ids": ids}, extensions=ext))
             top = tr.ground_z[idx] + tr.height[idx]
             zmax = max(zmax, float(top.max()))
+            lift = max(lift, float(tr.height[idx].max()))
         if tree_children:
             children.append(gb.add_node("trees", children=tree_children, extras={"layer": "trees"}))
     gb.add_node(f"tile_{tid}", children=children, translation=(x0, 0.0, -y0),
@@ -435,7 +442,8 @@ def build_tile_assets(world: CanonicalWorld, tid: str, pieces: list[Piece], terr
         meta["entities"] = dict(sorted({**meta["entities"], terrain_id: terrain_record(world, tid)}.items()))
         counts["terrain"] = 1
     return {"glb": glb, "collision": col_bytes, "meta": meta, "counts": counts, "tree_idx": all_trees,
-            "zrange": [round(zmin, 3), round(zmax, 3)] if np.isfinite(zmin) else None}
+            "zrange": [round(zmin, 3), round(zmax, 3)] if np.isfinite(zmin) else None,
+            "lift": None if terrain_mesh else math.ceil(max(lift, 0.0) * 100.0) / 100.0}
 
 
 def _node_window(hf: Any, bounds: tuple[float, float, float, float]) -> tuple[slice, slice]:

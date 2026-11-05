@@ -268,7 +268,7 @@ export class PhotorealRenderer {
           return;
         }
         this.orthoTextures.set(id, tex);
-        this.setOrtho(tile, { texture: tex, bounds: tile.entry.bounds, metresPerPixel: this.orthoMpp });
+        this.setOrtho(tile, { texture: tex, bounds: tile.entry.bounds, metresPerPixel: tile.entry.orthoMpp ?? this.orthoMpp });
         const img = tex.image as { width?: number; height?: number } | undefined;
         this.onTileBytes?.(id, Math.round((img?.width ?? 0) * (img?.height ?? 0) * 4 * (4 / 3)));
       },

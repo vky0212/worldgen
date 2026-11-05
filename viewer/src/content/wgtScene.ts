@@ -4,6 +4,10 @@
  * node `tile_<i>_<j>` translated to the tile corner, layer children with
  * `userData.layer`, terrain feature id `terrain:<i>_<j>`), so the world model,
  * picking, colour modes and photoreal mode treat both formats alike.
+ *
+ * Tiles of a coarser level (format 2.4) hold terrain only, `2^level` times the
+ * size: root `tile_<level>/<i>_<j>`, a terrain mesh without feature ids
+ * (`userData.level` set), optional skirts and cells limited to what it covers.
  */
 import { BufferAttribute, BufferGeometry, Group, InstancedMesh, LinearSRGBColorSpace, Matrix4, Mesh, MeshStandardMaterial, Quaternion, Vector3 } from 'three';
 import type { Object3D } from 'three';
@@ -11,6 +15,7 @@ import type { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { decodeGrid, decodeHeights, readWgt } from './wgt.ts';
 import type { HeightGrid } from './wgt.ts';
 import { terrainArrays } from '../gen/terrainMesh.ts';
+import type { TerrainOptions } from '../gen/terrainMesh.ts';
 import { decodeTrees, treeIdAt, treeInstances, treeRecordAt } from './trees.ts';
 import type { TreeContext } from './trees.ts';
 import type { ArchetypeLibrary } from './archetypes.ts';
@@ -40,10 +45,12 @@ function tileRootOf(scene: Group, name: string): Object3D | null {
   return found;
 }
 
-export async function buildWgtScene(buffer: ArrayBuffer, loader: GLTFLoader, baseUrl: string, world: WgtWorld): Promise<Group> {
-  const tileSize = world.tileSize;
+export async function buildWgtScene(buffer: ArrayBuffer, loader: GLTFLoader, baseUrl: string, world: WgtWorld,
+  terrain: TerrainOptions = {}): Promise<Group> {
   const c = await readWgt(buffer);
-  const id = `${c.i}_${c.j}`;
+  // Level-0 tiles keep the 1.x ids; a coarser tile is 2^level times the size.
+  const tileSize = world.tileSize * 2 ** c.level;
+  const id = c.level ? `${c.level}/${c.i}_${c.j}` : `${c.i}_${c.j}`;
   const glb = c.sections.get('GLB');
   const scene = glb && glb.byteLength
     ? ((await loader.parseAsync(glb.buffer.slice(glb.byteOffset, glb.byteOffset + glb.byteLength) as ArrayBuffer, baseUrl)).scene as Group)
@@ -61,7 +68,7 @@ export async function buildWgtScene(buffer: ArrayBuffer, loader: GLTFLoader, bas
   if (!hgt) throw new Error(`tile ${id} has no HGT section`);
   const rgb = c.sections.get('RGB');
   const heights = decodeHeights(hgt);
-  const t = terrainArrays(heights, rgb ? decodeGrid(rgb, 3).data : null, c.i * tileSize, c.j * tileSize, tileSize);
+  const t = terrainArrays(heights, rgb ? decodeGrid(rgb, 3).data : null, c.i * tileSize, c.j * tileSize, tileSize, terrain);
 
   const geo = new BufferGeometry();
   geo.setAttribute('position', new BufferAttribute(t.positions, 3));
@@ -72,13 +79,14 @@ export async function buildWgtScene(buffer: ArrayBuffer, loader: GLTFLoader, bas
   geo.setIndex(new BufferAttribute(t.indices, 1));
   geo.computeBoundingBox();
   geo.computeBoundingSphere();
-  const featureIds = [`terrain:${id}`];
+  // A coarser tile stands for many level-0 tiles: no entity of its own.
+  const featureIds = c.level ? [] : [`terrain:${id}`];
   geo.userData = { layer: 'terrain', feature_ids: featureIds };
   // The baked terrain's glTF material: white base colour, roughness 0.95, vertex colours.
   const material = new MeshStandardMaterial({ name: 'terrain', color: 0xffffff, roughness: 0.95, metalness: 0, vertexColors: !!t.colors });
   const mesh = new Mesh(geo, material);
   mesh.name = 'terrain';
-  mesh.userData = { layer: 'terrain', feature_ids: featureIds };
+  mesh.userData = c.level ? { layer: 'terrain', feature_ids: featureIds, level: c.level } : { layer: 'terrain', feature_ids: featureIds };
   root.add(mesh);
   // Layer order as in baked tiles: terrain first.
   root.children.splice(root.children.indexOf(mesh), 1);

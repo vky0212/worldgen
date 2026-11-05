@@ -18,6 +18,11 @@ Major version 2 is the **data-first** layout (`export.mode: data`, see
 [Data-first tiles](#data-first-tiles-format-2x)): terrain ships as heightmaps that
 consumers mesh themselves. `export.mode: baked` (the default) keeps writing 1.x.
 
+* **2.4.0** — levels of detail: tiles of levels 1 to 4 (`export.lod_levels`), each
+  standing for `2^L × 2^L` level-0 tiles with terrain, colours, land cover and orthophoto
+  only, listed in the subtree files with their geometric and terrain errors
+  ([Levels of detail](#levels-of-detail-24)). The ortho URI template takes `{level}`.
+  Readers of 2.4 still accept 2.0–2.3 worlds (level 0 only).
 * **2.3.0** — `graph/core.wgt` + `graph/strings.json`, a binary copy of the road graph
   (`road_graph.json` is still written), listed as `manifest.files.graph_core` /
   `graph_strings`; the entity locator `tiles/locate/<bucket>.json` (`tileset.locate`).
@@ -260,20 +265,26 @@ tiles/
 ├── tileset.json                        # levels, URI templates, codes, subtree list
 ├── sub/<si>_<sj>.json                  # per 4096 m square: its tiles, columnar
 └── <level>/<si>_<sj>/<i>_<j>.wgt       # tile container (level 0 = 256 m tiles)
-    0/<si>_<sj>/<i>_<j>.meta.json|.collision.glb|.ortho.jpg   # as in 1.x, level 0 only
+    <level>/<si>_<sj>/<i>_<j>.ortho.jpg # orthophoto (with sources.imagery), every level
+    0/<si>_<sj>/<i>_<j>.meta.json|.collision.glb   # as in 1.x, level 0 only
 ```
 
-`(si, sj) = (floor(i / 16), floor(j / 16))`; tile `(i, j)` covers the same square as in 1.x.
+At level 0, `(si, sj) = (floor(i / 16), floor(j / 16))` and tile `(i, j)` covers the same
+square as in 1.x. A tile of level `L` covers `T·2^L` metres, tile `(i, j)` spanning
+`[i·T·2^L, (i+1)·T·2^L)`, and lies in subtree `(floor(i / 2^(4−L)), floor(j / 2^(4−L)))`.
 
 ### tiles/tileset.json
 
 ```jsonc
 {
-  "schema": "worldgen.tileset", "schema_version": "2.3.0",
+  "schema": "worldgen.tileset", "schema_version": "2.4.0",
   "tile_size": 256, "subtree_tiles": 16,
-  "levels": [{"level": 0, "size": 256, "spacing": 4.0, "geometric_error": 0.0}],
+  "levels": [{"level": 0, "size": 256, "spacing": 4.0, "geometric_error": 0.0},
+             // 2.4: coarser levels; geometric_error = the level's largest; ortho with imagery
+             {"level": 1, "size": 512, "spacing": 8.0, "geometric_error": 31.5, "tiles": 121,
+              "ortho": {"pixels": 64, "m_per_px": 8.0}}, ...],
   "uri": {"content": "tiles/{level}/{si}_{sj}/{i}_{j}.wgt", "meta": "…", "collision": "…",
-          "ortho": "…", "subtree": "tiles/sub/{si}_{sj}.json"},
+          "ortho": "tiles/{level}/{si}_{sj}/{i}_{j}.ortho.jpg", "subtree": "tiles/sub/{si}_{sj}.json"},
   "terrain": {"sections": ["HGT", "RGB", "LCC"], "quantum": 0.01, "apron": 1,
               "triangulation": "quad (i,j)-(i+1,j+1) diagonal"},
   "layers": [...], "landcover_codes": {"1": "forest", ...}, "ortho": {...} | null,
@@ -298,7 +309,9 @@ tiles/
 One entry per level, columnar arrays over the subtree's tiles:
 `i`, `j`, `zmin`, `zmax` (terrain and everything on it), `hash` (first 16 hex digits of the
 tile input hash, for cache busting), `flags` (bit 0: `meta.json`, bit 1: `ortho.jpg`,
-bit 2: `collision.glb`) and `counts` (per layer, like the 1.x index).
+bit 2: `collision.glb`) and `counts` (per layer, like the 1.x index). Levels 1 to 4 (2.4)
+have no `counts`; they add `err` (geometric error, m) and `terr` (terrain error, m), and
+their `zmin`/`zmax` cover everything their level-0 tiles hold.
 
 ### .wgt container
 
@@ -366,9 +379,43 @@ reference): one vertex per tile node; two triangles per cell, `(c,r)-(c+1,r)-(c+
 (glTF `v' = 1 − v`); colours from `RGB `. The terrain's feature id is `terrain:<i>_<j>`
 and its record is in the tile's `meta.json`.
 
+### Levels of detail (2.4)
+
+Levels 1 to 4 (`export.lod_levels`, default 4; `export/pyramid.py`) let a consumer draw a
+large world from afar without loading every tile. A tile of level `L` stands for the
+`2^L × 2^L` level-0 tiles of its square and exists where any of them does. Its `.wgt` holds
+`HGT `, `RGB ` and `LCC ` only (container `level` = `L`), with as many nodes per side as a
+level-0 tile, `2^L` times further apart:
+
+* **Heights:** the level-0 heights at every `2^L`-th node, so the levels are **nested**: a
+  coarse vertex is a level-0 vertex (bit for bit), and the apron follows the level-0 rule
+  one coarse node out. Mesh it like a level-0 tile with `T·2^L` for `T`.
+* **Colours:** what level 0 shows from above — the `RGB ` colour, with the water material's
+  colour blended over it at its opacity where the land-cover code is `water` — then `L`
+  halving steps, each a `[1, 2, 1] / 4` filter along both axes (array edges repeated)
+  followed by every other node; **land-cover codes** are the level-0 codes at the coarse nodes.
+* **Orthophoto** (with imagery): the imagery baked for the tile's square at
+  `levels[L].ortho.pixels`, with the level-0 colour levels.
+* **Coverage:** where some of its level-0 tiles do not exist (the region's edge), the tile
+  stands for the others only: leave out the cells whose centre lies in a missing tile.
+* **No entities:** no `meta.json`, no collision mesh, no feature ids.
+
+**Geometric error** `err` (m): how far drawing the tile may be from the full-detail world
+it stands for — the largest of its terrain error `terr` (the largest height difference
+between the level-0 heightmap and the coarse mesh at the level-0 nodes of its tiles), the
+height of what it leaves out (the largest height of its level-0 tiles' buildings, trees,
+bridges and other layers above the terrain) and half its node spacing, and never less than
+a child's. Refine a tile (draw its children instead) when `err` projects to more than your
+screen-space error threshold.
+
+**Cracks:** a coarse edge skips the level-0 nodes between its own, so neighbouring tiles of
+different levels leave small gaps. The bundled viewer hangs **skirts** under every tile edge
+that has a neighbour: as deep as the tile's own `terr` plus the largest `terr` of the
+neighbour's same-level tile and its coarser ancestors, plus 1 m.
+
 **Conformance:** `tests/conformance/` (written by `python -m worldgen.conformance`)
 holds `hash64.json`, `terrain_tiles.json` — containers with the exact vertex arrays of
-their baked terrain — `tree_tiles.json` — a tile's tree records with their ids,
+their baked terrain, a level-1 tile among them — `tree_tiles.json` — a tile's tree records with their ids,
 instance transforms and seeds — and `building_tiles.json` — footprint records of every
 roof type and fallback with the volume, roof and floor areas and height range of their
 baked meshes — `graph_core.json` — a small graph's binary files and the document they

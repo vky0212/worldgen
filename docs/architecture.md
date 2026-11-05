@@ -174,6 +174,17 @@ compiler.
     for any worker count (`tests/unit/test_parallel.py` for the compiled grids,
     `tests/integration/test_chunked_export.py` for the files; n25_179: every file, 1 vs 8
     workers).
+
+    **Levels of detail** (data mode, `export/pyramid.py`, `export.lod_levels`): after the
+    level-0 chunks, the tiles of levels 1 to 4 are written as pool tasks too
+    (`ChunkExporter.coarse_tile`): every `2^L`-th node of the compiled terrain, a binomial
+    colour pyramid computed in a window with a margin of `2^L` nodes (so any tile's window
+    gives a node the same colour), the orthophoto at the level's pixel size and the tile's
+    terrain error. A coarse tile's input hash covers its level-0 tiles and the ring around
+    them, so incremental builds rewrite only what changed. The build's process then sets the
+    geometric errors bottom up from the terrain errors and the `lift` of the level-0 tiles
+    (the height of their content above the terrain), and lists every level in the subtree
+    files. `worldgen validate` checks that coarse heights nest in level 0.
     `compile_world` called directly still places every tree, and
     `BuildOptions(keep_trees=True)` keeps them in `BuildResult.world.trees`.
     The whole-grid rasters (`terrain/heightfield.tif|.f32`, `terrain/landcover.tif`,

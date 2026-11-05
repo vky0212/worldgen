@@ -11,6 +11,7 @@ from __future__ import annotations
 import numpy as np
 
 from worldgen.export.container import HeightGrid, decode_grid, decode_heights, encode_grid, encode_heights
+from worldgen.export.gltf import MATERIALS
 from worldgen.geometry.mesh import Mesh
 from worldgen.terrain.heightfield import Heightfield
 from worldgen.tiling.grid import TileGrid
@@ -39,22 +40,89 @@ def _extrapolate_apron(n: np.ndarray, west: bool, east: bool, south: bool, north
     return n
 
 
+def level_node_range(hf: Heightfield, bounds: tuple[float, float, float, float], level: int
+                     ) -> tuple[int, int, int, int]:
+    """``tile_node_range`` of a tile of ``level``, checked to lie on that level's lattice (every
+    ``2**level``-th node). Holds whenever the grid starts at a tile corner and ``2**level``
+    divides the nodes per tile, which ``pyramid.top_level`` ensures."""
+    k = 1 << level
+    rng = tile_node_range(hf, bounds)
+    if any(v % k for v in rng):
+        raise ValueError(f"tile {bounds} is not on the level-{level} node lattice of the terrain grid")
+    return rng
+
+
+def _halve(a: np.ndarray) -> np.ndarray:
+    """One step of the colour pyramid: a [1, 2, 1] / 4 binomial filter along both axes (the
+    array's edges repeated), then every other node from the first."""
+    for axis in (0, 1):
+        n = a.shape[axis]
+        if n < 2:
+            continue
+        p = np.concatenate([a.take([0], axis), a, a.take([n - 1], axis)], axis=axis)
+        a = (p.take(range(0, n), axis) + 2.0 * p.take(range(1, n + 1), axis) + p.take(range(2, n + 2), axis)) / 4.0
+        a = a.take(range(0, n, 2), axis)
+    return a
+
+
+# Land-cover code of water (landcover.LANDCOVER_CODES): level-0 tiles draw a water surface there.
+WATER_CODE = 7
+
+
+def surface_colors(rgb: np.ndarray, codes: np.ndarray | None) -> np.ndarray:
+    """Colours a level-0 tile shows from above: the terrain colour, with the water surface (its
+    material's colour at its opacity, as a level-0 tile blends it) over water nodes."""
+    if codes is None:
+        return rgb
+    w = MATERIALS["water"].color
+    water = np.asarray(w[:3], dtype=np.float64)
+    return np.where((codes == WATER_CODE)[..., None], w[3] * water + (1.0 - w[3]) * rgb, rgb)
+
+
+def level_colors(rgba: np.ndarray, rng: tuple[int, int, int, int], level: int,
+                 codes: np.ndarray | None = None) -> np.ndarray:
+    """Colours (0..1, float64) at the level-``level`` nodes of the node range ``rng``: ``level``
+    halving steps (``_halve``) of the level-0 ``surface_colors``. Computed in a window with a
+    margin of ``2**level`` nodes, which covers the filters' reach (``2**level - 1`` nodes), so a
+    node gets the same colour from any tile's window; the grid's own edges are repeated as in
+    the window."""
+    k = 1 << level
+    r0, r1, c0, c1 = rng
+    rows, cols = rgba.shape[:2]
+    wr0, wr1 = max(r0 - k, 0), min(r1 + k, rows - 1)
+    wc0, wc1 = max(c0 - k, 0), min(c1 + k, cols - 1)
+    a = surface_colors(rgba[wr0:wr1 + 1, wc0:wc1 + 1, :3].astype(np.float64),
+                       codes[wr0:wr1 + 1, wc0:wc1 + 1] if codes is not None else None)
+    for _ in range(level):
+        a = _halve(a)
+    return a[(r0 - wr0) // k:(r1 - wr0) // k + 1, (c0 - wc0) // k:(c1 - wc0) // k + 1]
+
+
 def terrain_sections(hf: Heightfield, bounds: tuple[float, float, float, float], quantum: float,
-                     rgba: np.ndarray, codes: np.ndarray | None) -> list[tuple[str, bytes, bool]]:
-    """``HGT ``, ``RGB `` and ``LCC `` payloads of one tile (``hf`` already rounded to ``quantum``)."""
-    r0, r1, c0, c1 = tile_node_range(hf, bounds)
-    wr0, wr1 = max(r0 - 1, 0), min(r1 + 1, hf.rows - 1)
-    wc0, wc1 = max(c0 - 1, 0), min(c1 + 1, hf.cols - 1)
-    n = np.rint(hf.z[wr0:wr1 + 1, wc0:wc1 + 1] / quantum).astype(np.int64)
+                     rgba: np.ndarray, codes: np.ndarray | None, level: int = 0) -> list[tuple[str, bytes, bool]]:
+    """``HGT ``, ``RGB `` and ``LCC `` payloads of one tile (``hf`` already rounded to ``quantum``).
+
+    A tile of a coarser ``level`` (``pyramid``) takes every ``2**level``-th node: the level-0 heights
+    and land-cover codes there, its apron one coarse node out, and ``level_colors``."""
+    k = 1 << level
+    r0, r1, c0, c1 = rng = level_node_range(hf, bounds, level)
+    wr0 = r0 - k if r0 >= k else r0
+    wr1 = r1 + k if r1 + k <= hf.rows - 1 else r1
+    wc0 = c0 - k if c0 >= k else c0
+    wc1 = c1 + k if c1 + k <= hf.cols - 1 else c1
+    n = np.rint(hf.z[wr0:wr1 + 1:k, wc0:wc1 + 1:k] / quantum).astype(np.int64)
     heights = _extrapolate_apron(n, wc0 == c0, wc1 == c1, wr0 == r0, wr1 == r1)
     r = hf.resolution
-    x0 = hf.xmin + (c0 - 1) * r
-    y0 = hf.ymin + (r0 - 1) * r
-    sections = [("HGT", encode_heights(heights, r, quantum, x0, y0), True)]
-    col = np.clip(np.round(rgba[r0:r1 + 1, c0:c1 + 1, :3] * 255.0), 0, 255).astype(np.uint8)
+    x0 = hf.xmin + (c0 - k) * r
+    y0 = hf.ymin + (r0 - k) * r
+    sections = [("HGT", encode_heights(heights, r * k, quantum, x0, y0), True)]
+    if level:
+        col = np.clip(np.round(level_colors(rgba, rng, level, codes) * 255.0), 0, 255).astype(np.uint8)
+    else:
+        col = np.clip(np.round(rgba[r0:r1 + 1, c0:c1 + 1, :3] * 255.0), 0, 255).astype(np.uint8)
     sections.append(("RGB", encode_grid(col), True))
     if codes is not None:
-        sections.append(("LCC", encode_grid(codes[r0:r1 + 1, c0:c1 + 1]), True))
+        sections.append(("LCC", encode_grid(codes[r0:r1 + 1:k, c0:c1 + 1:k]), True))
     return sections
 
 

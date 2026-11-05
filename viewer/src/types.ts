@@ -99,13 +99,24 @@ export interface TileEntry {
   counts?: Record<string, number>;
   /** Content format: a baked GLB (default) or a data-first `.wgt` container (format 2.x). */
   format?: 'glb' | 'wgt';
+  /**
+   * Level of detail (format 2.4): 0 = the full-detail tiles, L = a coarser tile standing for
+   * 2^L x 2^L of them (terrain only, no meta.json). Absent = 0.
+   */
+  level?: number;
+  /** Coarser levels: metres the tile may differ from the full-detail world (refine above τ px). */
+  geometricError?: number;
+  /** Coarser levels: largest difference between its terrain and the level-0 terrain (m). */
+  terrainError?: number;
+  /** Ground size of a pixel of the tile's orthophoto when it differs from the world's (coarser levels). */
+  orthoMpp?: number;
 }
 
 /** tiles/tileset.json of a data-first world (format 2.x). */
 export interface TilesetDoc extends SchemaDoc {
   tile_size: number;
   subtree_tiles?: number;
-  levels?: { level: number; size: number; spacing?: number; geometric_error?: number }[];
+  levels?: { level: number; size: number; spacing?: number; geometric_error?: number; tiles?: number; ortho?: { pixels?: number; m_per_px?: number } }[];
   uri: { content: string; meta?: string; collision?: string; ortho?: string; subtree: string };
   terrain?: { sections?: string[]; quantum?: number; apron?: number; triangulation?: string };
   layers?: string[];
@@ -143,6 +154,9 @@ export interface SubtreeDoc extends SchemaDoc {
     /** bit 0: meta.json, bit 1: ortho.jpg, bit 2: collision.glb */
     flags?: number[];
     counts?: Record<string, number[]>;
+    /** Levels above 0 (format 2.4): geometric error and terrain error per tile (m). */
+    err?: number[];
+    terr?: number[];
   }[];
 }
 

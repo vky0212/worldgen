@@ -9,7 +9,7 @@ import { fillUri, indexFromTileset, tilesetFromIndex } from '../src/stream/tiles
 import type { SubtreeDoc, TilesetDoc } from '../src/types.ts';
 
 interface Expected { positions: number[]; normals: number[]; uvs: number[]; colors: number[]; indices: number[] }
-interface VectorTile { i: number; j: number; bounds: number[]; wgt_base64: string; expected: Expected }
+interface VectorTile { level?: number; i: number; j: number; size?: number; bounds: number[]; wgt_base64: string; expected: Expected }
 const vectors = JSON.parse(readFileSync(new URL('../../tests/conformance/terrain_tiles.json', import.meta.url), 'utf8')) as {
   tile_size: number;
   tiles: VectorTile[];
@@ -35,7 +35,9 @@ test('runtime terrain mesh equals the baked terrain of the conformance tiles', a
     const g = decodeHeights(c.sections.get('HGT')!);
     assert.equal(g.apron, 1);
     const rgb = decodeGrid(c.sections.get('RGB')!, 3);
-    const m = terrainArrays(g, rgb.data, t.i * vectors.tile_size, t.j * vectors.tile_size, vectors.tile_size);
+    assert.equal(c.level, t.level ?? 0);
+    const size = t.size ?? vectors.tile_size;
+    const m = terrainArrays(g, rgb.data, t.i * size, t.j * size, size);
     const e = t.expected;
     assert.deepEqual(Array.from(m.positions), e.positions, `positions of tile ${t.i}_${t.j}`);
     assert.deepEqual(Array.from(m.indices), e.indices, `indices of tile ${t.i}_${t.j}`);
