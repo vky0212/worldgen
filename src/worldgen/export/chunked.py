@@ -29,7 +29,8 @@ from worldgen.export.container import write_container
 from worldgen.export.footprints import building_sections
 from worldgen.export.heightmap import tile_terrain_sections
 from worldgen.export.instances import tree_sections
-from worldgen.export.ortho import ortho_baker
+from worldgen.export.ortho import OrthoBaker, ortho_baker
+from worldgen.export.pyramid import export_coarse_tile
 from worldgen.export.tiles import (
     NO_TREES,
     PieceSelector,
@@ -105,6 +106,7 @@ class ChunkExporter:
         self.etree = entity_strtree(world)
         self.chash = tile_config_hash(cfg)
         self.baker = ortho_baker(world)
+        self.level_bakers: dict[int, OrthoBaker | None] = {}
         self.selector: PieceSelector | None = None
         self.rgba = terrain_vertex_colors(world)
         self.arche = archetypes_for(world)
@@ -114,6 +116,16 @@ class ChunkExporter:
         self.check = self.deferred and cfg.validation.enabled and world.vegetation_grid is not None
         self.exclusions0 = vegetation_exclusions(world, 0.0) if self.check else None
         self.sample = IndependenceSample(world) if self.check else None
+
+    def coarse_tile(self, level: int, i: int, j: int, leaves: list[tuple[int, int]], h: str
+                    ) -> tuple[int, tuple[int, int], dict[str, Any]]:
+        """Writes one tile of a coarser level (``pyramid``); returns its build state."""
+        if level not in self.level_bakers:
+            self.level_bakers[level] = (ortho_baker(self.world, level, self.baker.levels)
+                                        if self.baker is not None else None)
+        state = export_coarse_tile(self.world, self.rgba, self.level_bakers[level], self.plan.output,
+                                   level, i, j, leaves, h)
+        return level, (i, j), state
 
     def budget_keys(self, bounds: tuple[float, float, float, float] | None) -> np.ndarray:
         """Budget keys of the chunk's trees that the per-tile budget renders (the key pass of a
@@ -192,6 +204,8 @@ class ChunkExporter:
             ortho.unlink()
         res.built[t] = {"hash": res.hashes[t], "counts": assets["counts"], "zrange": assets["zrange"],
                         "collision": assets["collision"] is not None, "ortho": self.baker is not None}
+        if self.data:
+            res.built[t]["lift"] = assets["lift"]
 
     def _tree_outputs(self, tr: Any, bounds: tuple[float, float, float, float] | None, tiles: list[str],
                       budget: Any) -> dict[str, Any]:
@@ -329,6 +343,14 @@ class ChunkRunner:
             return [_chunk_keys(self.exporter, b) for b in bounds]
         return list(self.pool.map(_chunk_keys, self.shared, bounds))  # type: ignore[arg-type]
 
+    def coarse(self, items: list[tuple[Any, ...]]) -> Iterator[tuple[int, tuple[int, int], dict[str, Any]]]:
+        """Coarse tiles (``pyramid.level_work`` items), in the pool when the export has one."""
+        if self.pool is None:
+            for item in items:
+                yield _run_coarse(self.exporter, item)
+            return
+        yield from self.pool.map(_run_coarse, self.shared, items)  # type: ignore[arg-type]
+
     def export(self, chunks: list[tuple[Any, list[str]]], floor: float | None, whole_world: bool
                ) -> Iterator[ChunkResult]:
         items = [(k, b, t, floor, whole_world) for k, (b, t) in enumerate(chunks)]
@@ -351,3 +373,8 @@ def _chunk_keys(exporter: ChunkExporter | None, bounds: tuple[float, float, floa
 def _run_chunk(exporter: ChunkExporter | None, item: tuple[Any, ...]) -> ChunkResult:
     assert exporter is not None
     return exporter.run(*item)
+
+
+def _run_coarse(exporter: ChunkExporter | None, item: tuple[Any, ...]) -> tuple[int, tuple[int, int], dict[str, Any]]:
+    assert exporter is not None
+    return exporter.coarse_tile(*item)

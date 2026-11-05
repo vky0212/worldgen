@@ -206,7 +206,7 @@ class OrthoBaker:
     """Bakes north-up per-tile orthophotos from one source raster (see module docstring)."""
 
     def __init__(self, imagery: GeoRaster, frame: LocalFrame, extent: tuple[float, float, float, float],
-                 tile_size: float, cfg: ImagerySourceConfig) -> None:
+                 tile_size: float, cfg: ImagerySourceConfig, levels: ColourLevels | None = None) -> None:
         self.cfg = cfg
         self.tile_size = float(tile_size)
         self.source_m_per_px = ground_m_per_px(imagery)
@@ -223,7 +223,8 @@ class OrthoBaker:
         self.transform = transform
         self._inv = ~transform
         self._to_src = Transformer.from_crs(frame.local_crs(), imagery.crs, always_xy=True)
-        self.levels = compute_levels(*self._region_pixels(data, valid, extent))
+        # Coarser levels of detail reuse the level-0 colour levels, so every level looks alike.
+        self.levels = levels if levels is not None else compute_levels(*self._region_pixels(data, valid, extent))
         if not valid.all():
             # Holes (no imagery anywhere) get the mean colour; bilinear sampling softens the edge.
             fill = data[:, valid].mean(axis=1) if valid.any() else np.full(3, 128.0)
@@ -312,8 +313,10 @@ def imagery_hash(world: CanonicalWorld) -> str | None:
     return world.imagery_hash
 
 
-def ortho_baker(world: CanonicalWorld) -> OrthoBaker | None:
+def ortho_baker(world: CanonicalWorld, level: int = 0, levels: ColourLevels | None = None) -> OrthoBaker | None:
+    """The orthophoto baker of tiles of ``level`` (``tile_size * 2**level`` metres; see
+    ``export.pyramid``), with the colour ``levels`` of level 0 for the coarser levels."""
     if world.imagery is None:
         return None
-    return OrthoBaker(world.imagery, world.region.frame, world.region.extent, world.config.tiling.tile_size,
-                      world.config.sources.imagery)
+    return OrthoBaker(world.imagery, world.region.frame, world.region.extent,
+                      world.config.tiling.tile_size * (1 << level), world.config.sources.imagery, levels)

@@ -5,9 +5,10 @@
 * ``hash64.json``: ``hashing.hash_u64`` / ``hash_unit`` cases (words as decimal strings,
   results as hex strings: JSON numbers cannot hold 64-bit integers).
 * ``terrain_tiles.json``: data-first tile containers (base64) of a small synthetic world,
-  one interior and one world-edge tile, with the exact vertex arrays the baked GLB terrain of
-  that tile would have (glTF axes, relative to the tile corner, as float32): positions,
-  normals, texture coordinates, colours (u8) and triangle indices.
+  one interior and one world-edge tile and the level-1 tile over all four tiles, with the exact
+  vertex arrays the baked GLB terrain of that tile would have (glTF axes, relative to the tile
+  corner, as float32): positions, normals, texture coordinates, colours (u8) and triangle
+  indices. The level-1 tile's mesh is that of the every-other-node heightfield.
 * ``tree_tiles.json``: a tile with tree records (TRE, TOB) and the ids, instance transforms and
   seeds a runtime derives from them.
 * ``building_tiles.json``: a tile with building footprint records (BLD, IDS) and the volume,
@@ -32,7 +33,7 @@ import numpy as np
 
 from worldgen.export.container import write_container
 from worldgen.export.gltf import enu_to_gltf
-from worldgen.export.heightmap import terrain_sections
+from worldgen.export.heightmap import level_colors, terrain_sections
 from worldgen.hashing import hash_u64, hash_unit
 from worldgen.terrain.heightfield import Heightfield
 
@@ -88,8 +89,16 @@ def terrain_vectors() -> dict[str, Any]:
     for i, j in ((0, 0), (1, 1)):
         bounds = (i * TILE, j * TILE, (i + 1) * TILE, (j + 1) * TILE)
         wgt = write_container(0, i, j, terrain_sections(hf, bounds, QUANTUM, rgba, codes))
-        tiles.append({"i": i, "j": j, "bounds": list(bounds), "wgt_base64": base64.b64encode(wgt).decode("ascii"),
-                      "expected": _expected_mesh(hf, rgba, bounds)})
+        tiles.append({"level": 0, "i": i, "j": j, "size": TILE, "bounds": list(bounds),
+                      "wgt_base64": base64.b64encode(wgt).decode("ascii"), "expected": _expected_mesh(hf, rgba, bounds)})
+    # Level 1: every other node of the same grid, the colours of export.heightmap.level_colors.
+    bounds = (0.0, 0.0, 2 * TILE, 2 * TILE)
+    wgt = write_container(1, 0, 0, terrain_sections(hf, bounds, QUANTUM, rgba, codes, level=1))
+    coarse = Heightfield(0.0, 0.0, 2 * SPACING, hf.z[::2, ::2])
+    col = level_colors(rgba, (0, hf.rows - 1, 0, hf.cols - 1), 1, codes)
+    crgba = np.concatenate([col, np.ones(col.shape[:2] + (1,))], axis=2)
+    tiles.append({"level": 1, "i": 0, "j": 0, "size": 2 * TILE, "bounds": list(bounds),
+                  "wgt_base64": base64.b64encode(wgt).decode("ascii"), "expected": _expected_mesh(coarse, crgba, bounds)})
     return {"schema": "worldgen.conformance.terrain_tiles", "tile_size": TILE, "spacing": SPACING,
             "quantum": QUANTUM, "note": "normals: compare within 1e-6 (central differences, float32)",
             "tiles": tiles}

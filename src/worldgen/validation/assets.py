@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 import trimesh
 
-from worldgen.export.container import decode_heights, read_container
+from worldgen.export.container import HeightGrid, decode_heights, read_container
 from worldgen.export.footprints import decode_buildings
 from worldgen.export.gltf import read_glb_json
 from worldgen.hashing import sha256_file
@@ -56,15 +56,15 @@ def validate_outputs(world: Path) -> dict[str, Any]:
     tiles = _tile_files(world, m)
     degenerate = bad_normals = 0
     feature_errors = bad_buildings = n_buildings = 0
-    heights: dict[tuple[int, int], np.ndarray] = {}
+    heights: dict[tuple[int, int, int], HeightGrid] = {}
     for t in tiles:
         data = (world / t["content"]).read_bytes()
         record_ids: list[str] = []
         if t["data"]:
             c = read_container(data)
             data = c.sections.get("GLB", b"")
-            heights[(c.i, c.j)] = decode_heights(c.sections["HGT"]).z[1:-1, 1:-1]
-            if not np.isfinite(heights[(c.i, c.j)]).all():
+            heights[(c.level, c.i, c.j)] = g = decode_heights(c.sections["HGT"])
+            if not np.isfinite(g.z).all():
                 errors += 1
                 lines.append(f"ERROR non-finite terrain heights in {t['content']}")
             if "BLD" in c.sections:
@@ -74,6 +74,8 @@ def validate_outputs(world: Path) -> dict[str, Any]:
                 bad_buildings += int(len(record_ids) != len(rec)) + int((rec["bottom"] >= rec["top"]).sum())
                 bad_buildings += int((rec["vertices"] < 3).sum()) + int((rec["eave"] > rec["top"][
                     np.repeat(np.arange(len(rec)), rec["polygons"])] + 1e-3).sum())
+        if t["meta"] is None:  # a coarser level's tile: terrain only
+            continue
         meta = json.loads((world / t["meta"]).read_text(encoding="utf-8"))
         feature_errors += sum(1 for fid in record_ids if fid not in meta["entities"])
         if not data:
@@ -95,7 +97,7 @@ def validate_outputs(world: Path) -> dict[str, Any]:
         errors += 1
         lines.append(f"ERROR {feature_errors} feature ids without metadata")
     else:
-        lines.append(f"ok    {len(tiles)} tiles: every feature id has metadata")
+        lines.append(f"ok    {sum(1 for t in tiles if t['meta'])} tiles: every feature id has metadata")
     if n_buildings or bad_buildings:
         if bad_buildings:
             errors += 1
@@ -103,15 +105,25 @@ def validate_outputs(world: Path) -> dict[str, Any]:
         else:
             lines.append(f"ok    {n_buildings} building records")
     if heights:
-        seams = sum(1 for (i, j), z in heights.items() for (di, dj) in ((1, 0), (0, 1))
-                    if (i + di, j + dj) in heights and not np.array_equal(
-                        z[:, -1] if di else z[-1, :], heights[(i + di, j + dj)][:, 0] if di
-                        else heights[(i + di, j + dj)][0, :]))
+        inner = {k: g.z[g.apron:-g.apron, g.apron:-g.apron] for k, g in heights.items()}
+        seams = sum(1 for (lv, i, j), z in inner.items() for (di, dj) in ((1, 0), (0, 1))
+                    if (lv, i + di, j + dj) in inner and not np.array_equal(
+                        z[:, -1] if di else z[-1, :], inner[(lv, i + di, j + dj)][:, 0] if di
+                        else inner[(lv, i + di, j + dj)][0, :]))
         if seams:
             errors += 1
             lines.append(f"ERROR {seams} heightmap tile seams with different edge heights")
         else:
             lines.append(f"ok    heightmaps: {len(heights)} tiles, shared edges identical")
+        coarse = [k for k in heights if k[0] > 0]
+        if coarse:
+            bad = _unnested(heights, inner, coarse)
+            if bad:
+                errors += 1
+                lines.append(f"ERROR {bad} coarser-level tiles differ from level 0 at the nodes they share")
+            else:
+                levels = sorted({k[0] for k in coarse})
+                lines.append(f"ok    {len(coarse)} tiles of levels {levels[0]}-{levels[-1]}: heights nest in level 0")
     if bad_normals:
         errors += 1
         lines.append(f"ERROR {bad_normals} vertices with invalid normals")
@@ -129,8 +141,34 @@ def validate_outputs(world: Path) -> dict[str, Any]:
     return {"errors": errors, "warnings": warnings, "lines": lines}
 
 
+def _unnested(heights: dict[tuple[int, int, int], HeightGrid], inner: dict[tuple[int, int, int], np.ndarray],
+              coarse: list[tuple[int, int, int]]) -> int:
+    """Coarse tiles whose heights differ from the level-0 heights at a node both have."""
+    bad = 0
+    for lv, i, j in coarse:
+        g, zc = heights[(lv, i, j)], inner[(lv, i, j)]
+        k = 1 << lv
+        cx, cy = g.x0 + g.apron * g.spacing, g.y0 + g.apron * g.spacing
+        for a in range(i * k, (i + 1) * k):
+            for b in range(j * k, (j + 1) * k):
+                f = heights.get((0, a, b))
+                if f is None:
+                    continue
+                z0 = inner[(0, a, b)][::k, ::k]
+                c0 = int(round((f.x0 + f.apron * f.spacing - cx) / g.spacing))
+                r0 = int(round((f.y0 + f.apron * f.spacing - cy) / g.spacing))
+                part = zc[r0:r0 + z0.shape[0], c0:c0 + z0.shape[1]]
+                if r0 < 0 or c0 < 0 or part.shape != z0.shape or not np.array_equal(part, z0):
+                    bad += 1
+                    break
+            else:
+                continue
+            break
+    return bad
+
+
 def _tile_files(world: Path, manifest: dict[str, Any]) -> list[dict[str, Any]]:
-    """Every tile's content and meta paths, for either export mode."""
+    """Every tile's content and meta paths (None for the coarser levels), for either export mode."""
     tiling = manifest.get("tiling", {})
     if tiling.get("tileset"):
         tileset = json.loads((world / tiling["tileset"]).read_text(encoding="utf-8"))
@@ -141,8 +179,8 @@ def _tile_files(world: Path, manifest: dict[str, Any]) -> list[dict[str, Any]]:
             for lvl in sub["levels"]:
                 for i, j in zip(lvl["i"], lvl["j"]):
                     keys = {"level": lvl["level"], "si": st["si"], "sj": st["sj"], "i": i, "j": j}
-                    out.append({"content": uri["content"].format(**keys), "meta": uri["meta"].format(**keys),
-                                "data": True})
+                    out.append({"content": uri["content"].format(**keys),
+                                "meta": uri["meta"].format(**keys) if lvl["level"] == 0 else None, "data": True})
         return out
     index = json.loads((world / tiling.get("index", "tiles/index.json")).read_text(encoding="utf-8"))
     return [{"content": t["glb"], "meta": t["meta"], "data": False} for t in index["tiles"]]

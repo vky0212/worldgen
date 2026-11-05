@@ -486,6 +486,10 @@ class ExportConfig:
     # placement needs memory for its area, and small chunks balance worker processes.
     # Outputs do not depend on it (0: one chunk).
     chunk_tiles: int = 4
+    # Data mode: coarser levels of detail above the tiles, for viewing large worlds from afar.
+    # Level L tiles cover 2^L x 2^L tiles at 2^L times the terrain spacing; up to 4 (one tile
+    # per 4096 m subtree square). 0: tiles only. See docs/output-format.md.
+    lod_levels: int = 4
 
 
 @dataclass
@@ -548,6 +552,8 @@ class WorldConfig:
             raise ConfigError("tiling.tile_size and terrain.resolution must be positive")
         if self.export.chunk_tiles < 0 or self.parallel.workers < 0:
             raise ConfigError("export.chunk_tiles and parallel.workers must be >= 0")
+        if not 0 <= self.export.lod_levels <= 4:
+            raise ConfigError("export.lod_levels must be between 0 and 4")
         cells = t / r
         if abs(cells - round(cells)) > 1e-9:
             raise ConfigError(

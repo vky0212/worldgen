@@ -247,7 +247,9 @@ export class ColorModeManager {
       table[k * 3 + 1] = tmp.g;
       table[k * 3 + 2] = tmp.b;
     });
+    // Terrain without a record (coarser levels of detail have none) is muted like the rest.
     const fallback = new Color(UNKNOWN);
+    if (mute) fallback.lerp(TERRAIN_MUTE, TERRAIN_MUTE_AMOUNT);
 
     const n = fid.count;
     let attr = this.generatedColor.get(geometry);

@@ -73,6 +73,8 @@ export function resolveEntityHit(hit: Intersection, world: WorldModel): EntityHi
   const obj = hit.object;
   const tileId = world.tileIdOf(obj);
   const pickable = world.pickableFor(obj);
+  // Tiles of a coarser level of detail stand for many tiles and hold no entities.
+  if (tileId && (world.tiles.get(tileId)?.entry.level ?? 0) > 0) return null;
 
   if (obj instanceof InstancedMesh && hit.instanceId !== undefined) {
     const ids = pickable?.instanceIds ?? instanceIdsOf(obj);

@@ -391,7 +391,8 @@ export class TileStreamer {
     const data = await res.arrayBuffer();
     if (signal.aborted) throw new DOMException('aborted', 'AbortError');
     const scene = entry.format === 'wgt'
-      ? await buildWgtScene(data, this.gltf, new URL('.', url).href, { tileSize: this.tileset.tileSize, ...this.opts.dataWorld })
+      ? await buildWgtScene(data, this.gltf, new URL('.', url).href, { tileSize: this.tileset.tileSize, ...this.opts.dataWorld },
+        { skirts: node.skirts, covers: node.partial ? this.tileset.leafAt : null })
       : ((await this.gltf.parseAsync(data, new URL('.', url).href)).scene as Group);
     if (signal.aborted) {
       disposeTree(scene);

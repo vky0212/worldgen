@@ -18,8 +18,8 @@ from worldgen.validation.assets import validate_outputs
 pytestmark = pytest.mark.slow
 
 
-def _build(out: Path, mode: str = "data", **kw):  # noqa: ANN003, ANN202
-    cfg = load_config("basic", overrides=[f"export.mode={mode}"], region=fixture_region("demo_town"))
+def _build(out: Path, mode: str = "data", overrides: tuple[str, ...] = (), **kw):  # noqa: ANN003, ANN202
+    cfg = load_config("basic", overrides=[f"export.mode={mode}", *overrides], region=fixture_region("demo_town"))
     return build(cfg, BuildOptions(out, fixture="demo_town", **kw))
 
 
@@ -152,6 +152,68 @@ def test_incremental_and_mode_switch(tmp_path):
     assert not (out / "tiles" / "index.json").exists()
     assert not [p for p in (out / "tiles").glob("*_*.glb")]                  # no baked tile files left
     assert validate_outputs(out)["errors"] == 0
+    # Coarser levels come and go with export.lod_levels; tiles of level 0 stay as they are.
+    assert (out / "tiles" / "2").is_dir()
+    one = _build(out, overrides=("export.lod_levels=1",))
+    assert one.tiles_written == [] and (out / "tiles" / "1").is_dir() and not (out / "tiles" / "2").exists()
+    none = _build(out, overrides=("export.lod_levels=0",))
+    assert none.tiles_written == [] and not [p for p in (out / "tiles").iterdir() if p.name in "1234"]
+    state = json.loads((out / "build_state.json").read_text(encoding="utf-8"))
+    ts = json.loads((out / "tiles" / "tileset.json").read_text(encoding="utf-8"))
+    assert state["levels"] == {} and len(ts["levels"]) == 1
+    assert validate_outputs(out)["errors"] == 0
+
+
+def test_coarser_levels(data_world):
+    from worldgen.export.container import encode_heights, write_container
+    from worldgen.export.pyramid import plan_levels, top_level
+
+    out, res = data_world
+    world, cfg = res.world, res.world.config
+    ts = json.loads((out / "tiles" / "tileset.json").read_text(encoding="utf-8"))
+    state = json.loads((out / "build_state.json").read_text(encoding="utf-8"))
+    tiles = list(state["tiles"])
+    plan = plan_levels(tiles, top_level(cfg.export.lod_levels, cfg.tiling.tile_size, world.terrain.resolution))
+    assert sorted(plan) == [lv["level"] for lv in ts["levels"][1:]] == [1, 2]
+    assert all(st["lift"] >= 0 for st in state["tiles"].values())
+    assert max(st["lift"] for st in state["tiles"].values()) > 10            # buildings and trees
+    assert ts["uri"]["ortho"] == "tiles/{level}/{si}_{sj}/{i}_{j}.ortho.jpg"
+    seen = 0
+    for st in ts["subtrees"]:
+        sub = json.loads((out / ts["uri"]["subtree"].format(**st)).read_text(encoding="utf-8"))
+        for lv in sub["levels"][1:]:
+            level = lv["level"]
+            floor = world.terrain.resolution * (1 << level) / 2
+            for k, (i, j) in enumerate(zip(lv["i"], lv["j"])):
+                assert (i, j) in plan[level]
+                assert lv["err"][k] >= max(lv["terr"][k], floor)
+                keys = {"level": level, "si": st["si"], "sj": st["sj"], "i": i, "j": j}
+                c = read_container((out / ts["uri"]["content"].format(**keys)).read_bytes())
+                assert (c.level, c.i, c.j) == (level, i, j) and sorted(c.sections) == ["HGT", "LCC", "RGB"]
+                assert decode_heights(c.sections["HGT"]).spacing == world.terrain.resolution * (1 << level)
+                seen += 1
+    assert seen == sum(len(v) for v in plan.values())
+    assert state["levels"] and all(k.split("/")[0] in ("1", "2") for k in state["levels"])
+    v = validate_outputs(out)
+    assert any("heights nest in level 0" in line for line in v["lines"]), v["lines"]
+
+    # The validator notices a coarse tile that disagrees with level 0.
+    level, (i, j) = 1, next(iter(plan[1]))
+    keys = {"level": level, "si": i >> 3, "sj": j >> 3, "i": i, "j": j}
+    path = out / ts["uri"]["content"].format(**keys)
+    original = path.read_bytes()
+    try:
+        c = read_container(original)
+        g = decode_heights(c.sections["HGT"])
+        n = np.rint(g.z / g.quantum).astype(np.int64)
+        n[3, 3] += 25
+        sections = [("HGT", encode_heights(n, g.spacing, g.quantum, g.x0, g.y0), True),
+                    ("RGB", c.sections["RGB"], True), ("LCC", c.sections["LCC"], True)]
+        path.write_bytes(write_container(level, i, j, sections))
+        lines = validate_outputs(out)["lines"]
+        assert any("coarser-level tiles differ from level 0" in line for line in lines), lines
+    finally:
+        path.write_bytes(original)
 
 
 def test_building_records_replace_meshes(data_world):
