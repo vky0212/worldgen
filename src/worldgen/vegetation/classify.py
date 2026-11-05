@@ -15,12 +15,12 @@ from dataclasses import dataclass, field
 import numpy as np
 from affine import Affine
 from rasterio import features as rfeatures
-from scipy import ndimage
 
 from worldgen.config import VegetationConfig
 from worldgen.noise import value_noise
 from worldgen.spatial.raster import GeoRaster, rasterize_window
 from worldgen.spatial.region import Region
+from worldgen.spatial.windows import box_filter
 from worldgen.world.model import LandcoverArea, Waterbody
 
 CATEGORIES = ["none", "dense_forest", "sparse_woodland", "shrubland", "grassland", "agricultural",
@@ -83,6 +83,9 @@ def _rasterize(grid_shape: tuple[int, int], transform: Affine, geoms: list, valu
                                fill=0, dtype="uint8").astype(bool)
 
 
+# Rows per block when sampling sources onto the grid.
+ROW_BLOCK = 256
+
 # Feature size of the canopy-height variation where no canopy-height raster covers a cell.
 CANOPY_NOISE_WAVELENGTH_M = 100.0
 
@@ -99,8 +102,13 @@ def classify_vegetation(
     transform = Affine(res, 0.0, xmin, 0.0, res, ymin)
     xs = xmin + (np.arange(cols) + 0.5) * res
     ys = ymin + (np.arange(rows) + 0.5) * res
-    gx, gy = np.meshgrid(xs, ys)
     local_crs = region.frame.local_crs()
+    # Sources are sampled and cells combined in row blocks (each cell on its own, or with the
+    # rows its box filter reads): no whole-grid coordinate or sampling arrays.
+    blocks = [(r0, min(r0 + ROW_BLOCK, rows)) for r0 in range(0, rows, ROW_BLOCK)]
+
+    def coords(r0: int, r1: int) -> tuple[np.ndarray, np.ndarray]:
+        return np.meshgrid(xs, ys[r0:r1])
 
     # WorldCover layer.
     wc_cat = np.zeros(shape, dtype=np.uint8)
@@ -110,22 +118,29 @@ def classify_vegetation(
     if has_wc:
         # Supersample 3x3 inside each cell for class fractions.
         sub = np.array([-1 / 3, 0.0, 1 / 3]) * res
-        counts_tree = np.zeros(shape)
-        counts_built = np.zeros(shape)
-        center = worldcover.sample_nearest(gx.ravel(), gy.ravel(), src_crs=local_crs).reshape(shape)
-        for dx in sub:
-            for dy in sub:
-                v = worldcover.sample_nearest((gx + dx).ravel(), (gy + dy).ravel(), src_crs=local_crs).reshape(shape)
-                counts_tree += v == 10
-                counts_built += v == 50
-        tree_frac = (counts_tree / 9.0).astype(np.float32)
-        built_frac = (counts_built / 9.0).astype(np.float32)
-        for code, name in WORLDCOVER_CATEGORY.items():
-            wc_cat[center == code] = CAT[name]
-        # Tree cover embedded in built-up surroundings is urban tree canopy.
-        built_ctx = ndimage.uniform_filter(built_frac, size=5)
-        urban = (wc_cat == CAT["dense_forest"]) & (built_ctx > 0.35)
-        wc_cat[urban] = CAT["urban_trees"]
+        for r0, r1 in blocks:
+            gx, gy = coords(r0, r1)
+            counts_tree = np.zeros(gx.shape)
+            counts_built = np.zeros(gx.shape)
+            center = worldcover.sample_nearest(gx.ravel(), gy.ravel(), src_crs=local_crs).reshape(gx.shape)
+            for dx in sub:
+                for dy in sub:
+                    v = worldcover.sample_nearest((gx + dx).ravel(), (gy + dy).ravel(),
+                                                  src_crs=local_crs).reshape(gx.shape)
+                    counts_tree += v == 10
+                    counts_built += v == 50
+            tree_frac[r0:r1] = (counts_tree / 9.0).astype(np.float32)
+            built_frac[r0:r1] = (counts_built / 9.0).astype(np.float32)
+            wc_block = wc_cat[r0:r1]
+            for code, name in WORLDCOVER_CATEGORY.items():
+                wc_block[center == code] = CAT[name]
+        # Tree cover embedded in built-up surroundings is urban tree canopy (5 x 5 cell box;
+        # fractions are multiples of 1/225, never within rounding of the threshold).
+        for r0, r1 in blocks:
+            h0, h1 = max(r0 - 2, 0), min(r1 + 2, rows)
+            built_ctx = box_filter(built_frac[h0:h1], 5)[r0 - h0:r1 - h0]
+            wc_block = wc_cat[r0:r1]
+            wc_block[(wc_block == CAT["dense_forest"]) & (built_ctx > 0.35)] = CAT["urban_trees"]
 
     # OSM layer (larger polygons first so nested features win).
     osm_cat = np.zeros(shape, dtype=np.uint8)
@@ -170,49 +185,59 @@ def classify_vegetation(
             source[sel] = SRC_WORLDCOVER
     agree = (osm_cat > 0) & (osm_cat == wc_cat)
     source[agree] = SRC_BOTH
+    del osm_cat, wc_cat, agree
 
     # Water is never vegetated.
     water_mask = _rasterize(shape, transform, [w.geometry for w in water if w.is_area])
     category[water_mask] = 0
     source[water_mask] = SRC_NONE
+    del water_mask
 
-    # Canopy field.
+    # Canopy field, coverage and confidence, cell by cell.
     cats = cfg.categories
-    default_h = np.zeros(shape, dtype=np.float32)
-    default_cov = np.zeros(shape, dtype=np.float32)
-    for name, cc in cats.items():
-        if name in CAT:
-            sel = category == CAT[name]
-            default_h[sel] = cc.canopy_height
-            default_cov[sel] = cc.coverage
-    # World-space noise: the same at a position whatever region or window is classified.
-    noise = value_noise(gx, gy, CANOPY_NOISE_WAVELENGTH_M, cfg.seed * 7919 + 17)
-    est_h = default_h * (1.0 + 0.2 * noise)
-    canopy_h = est_h.astype(np.float32)
+    tree_codes = [CAT[c] for c in TREE_CATEGORIES]
+    canopy_h = np.empty(shape, dtype=np.float32)
     observed = np.zeros(shape, dtype=bool)
-    if canopy is not None and cfg.use_canopy_height:
-        ch = canopy.sample_bilinear(gx.ravel(), gy.ravel(), src_crs=local_crs).reshape(shape)
-        ok = np.isfinite(ch) & (category > 0)
-        canopy_h = np.where(ok, ch, canopy_h).astype(np.float32)
-        observed = ok
-    coverage = default_cov.copy()
-    if has_wc:
-        treeish_cat = np.isin(category, [CAT[c] for c in TREE_CATEGORIES])
-        coverage = np.where(treeish_cat, np.maximum(np.nan_to_num(tree_frac, nan=0.0), 0.15 * default_cov),
-                            default_cov).astype(np.float32)
-        coverage = np.where(category == CAT["sparse_woodland"], np.minimum(coverage, 0.5), coverage)
-    if observed.any():
-        # Very low measured canopy means no trees regardless of class.
-        low = observed & (canopy_h < 2.0) & np.isin(category, [CAT[c] for c in TREE_CATEGORIES])
-        coverage = np.where(low, coverage * 0.2, coverage)
-    coverage = np.clip(coverage, 0.0, 1.0).astype(np.float32)
-    canopy_h = np.where(category > 0, canopy_h, 0.0).astype(np.float32)
-
-    conf = np.zeros(shape, dtype=np.float32)
-    conf[source == SRC_WORLDCOVER] = 0.55
-    conf[source == SRC_OSM] = 0.6
-    conf[source == SRC_BOTH] = 0.8
-    conf = np.where(observed, np.minimum(conf + 0.1, 1.0), conf)
+    coverage = np.empty(shape, dtype=np.float32)
+    conf = np.empty(shape, dtype=np.float32)
+    for r0, r1 in blocks:
+        cat, src = category[r0:r1], source[r0:r1]
+        default_h = np.zeros(cat.shape, dtype=np.float32)
+        default_cov = np.zeros(cat.shape, dtype=np.float32)
+        for name, cc in cats.items():
+            if name in CAT:
+                sel = cat == CAT[name]
+                default_h[sel] = cc.canopy_height
+                default_cov[sel] = cc.coverage
+        gx, gy = coords(r0, r1)
+        # World-space noise: the same at a position whatever region or window is classified.
+        noise = value_noise(gx, gy, CANOPY_NOISE_WAVELENGTH_M, cfg.seed * 7919 + 17)
+        est_h = default_h * (1.0 + 0.2 * noise)
+        ch_b = est_h.astype(np.float32)
+        obs = np.zeros(cat.shape, dtype=bool)
+        if canopy is not None and cfg.use_canopy_height:
+            ch = canopy.sample_bilinear(gx.ravel(), gy.ravel(), src_crs=local_crs).reshape(cat.shape)
+            ok = np.isfinite(ch) & (cat > 0)
+            ch_b = np.where(ok, ch, ch_b).astype(np.float32)
+            obs = ok
+        cov = default_cov.copy()
+        if has_wc:
+            treeish_cat = np.isin(cat, tree_codes)
+            cov = np.where(treeish_cat, np.maximum(np.nan_to_num(tree_frac[r0:r1], nan=0.0), 0.15 * default_cov),
+                           default_cov).astype(np.float32)
+            cov = np.where(cat == CAT["sparse_woodland"], np.minimum(cov, 0.5), cov)
+        if obs.any():
+            # Very low measured canopy means no trees regardless of class.
+            low = obs & (ch_b < 2.0) & np.isin(cat, tree_codes)
+            cov = np.where(low, cov * 0.2, cov)
+        coverage[r0:r1] = np.clip(cov, 0.0, 1.0).astype(np.float32)
+        canopy_h[r0:r1] = np.where(cat > 0, ch_b, 0.0).astype(np.float32)
+        observed[r0:r1] = obs
+        c = np.zeros(cat.shape, dtype=np.float32)
+        c[src == SRC_WORLDCOVER] = 0.55
+        c[src == SRC_OSM] = 0.6
+        c[src == SRC_BOTH] = 0.8
+        conf[r0:r1] = np.where(obs, np.minimum(c + 0.1, 1.0), c)
 
     return VegetationGrid(xmin, ymin, res, category, source, canopy_h, observed, coverage, conf,
                           tree_frac, leaf, meta={"worldcover": has_wc, "canopy_observed_fraction":

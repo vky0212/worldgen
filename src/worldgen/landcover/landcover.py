@@ -16,6 +16,9 @@ LANDCOVER_CODES: dict[int, str] = {
     7: "water", 8: "wetland", 9: "park", 10: "sand", 11: "snow_ice", 12: "mangrove",
 }
 
+# Rows per block when sampling sources onto a grid.
+ROW_BLOCK = 256
+
 WORLDCOVER_TO_CODE = {10: 1, 20: 2, 30: 3, 40: 4, 50: 5, 60: 6, 70: 11, 80: 7, 90: 8, 95: 12, 100: 3}
 
 OSM_CLASS_TO_CODE = {
@@ -37,10 +40,16 @@ def classify_terrain(hf: Heightfield, region: Region, worldcover: GeoRaster | No
     """Per terrain node land-cover code. OSM polygons override WorldCover; water wins last."""
     codes = np.zeros(hf.z.shape, dtype=np.uint8)
     if worldcover is not None:
-        gx, gy = hf.node_coords()
-        wc = worldcover.sample_nearest(gx.ravel(), gy.ravel(), src_crs=region.frame.local_crs()).reshape(hf.z.shape)
-        for k, v in WORLDCOVER_TO_CODE.items():
-            codes[wc == k] = v
+        # Sampled in row blocks (each node on its own): no whole-grid coordinate arrays.
+        xs = hf.xmin + np.arange(hf.cols) * hf.resolution
+        crs = region.frame.local_crs()
+        for r0 in range(0, hf.rows, ROW_BLOCK):
+            r1 = min(r0 + ROW_BLOCK, hf.rows)
+            gx, gy = np.meshgrid(xs, hf.ymin + np.arange(r0, r1) * hf.resolution)
+            wc = worldcover.sample_nearest(gx.ravel(), gy.ravel(), src_crs=crs).reshape(gx.shape)
+            block = codes[r0:r1]
+            for k, v in WORLDCOVER_TO_CODE.items():
+                block[wc == k] = v
     # Larger polygons first so nested small features (a park in a residential zone) win.
     for lc in sorted(landcover, key=lambda a: -a.geometry.area):
         code = OSM_CLASS_TO_CODE.get(str(lc.properties.get("class")))

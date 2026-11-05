@@ -401,6 +401,54 @@ def _segments(geom: BaseGeometry) -> np.ndarray:
     return np.concatenate(out) if out else np.zeros((0, 2, 2))
 
 
+def _near_other_side(inside: np.ndarray, radius_cells: float) -> np.ndarray:
+    """Nodes within ``radius_cells`` (Euclidean) of a node on the other side of ``inside``.
+
+    The nearest node of the other side always has a neighbour (8-connected) on this side, so
+    marking a disk around the boundary nodes of each side finds exactly those nodes, with
+    work and memory following the outline rather than the grid."""
+    rows, cols = inside.shape
+    near = np.zeros(inside.shape, dtype=bool)
+    k = int(np.floor(radius_cells))
+    offsets = [(dy, dx) for dy in range(-k, k + 1) for dx in range(-k, k + 1)
+               if dy * dy + dx * dx <= radius_cells * radius_cells]
+    ring = np.ones((3, 3), dtype=bool)
+    for side in (inside, ~inside):
+        br, bc = np.nonzero(side & ndimage.binary_dilation(~side, structure=ring))
+        for dy, dx in offsets:
+            r, c = br + dy, bc + dx
+            ok = (r >= 0) & (r < rows) & (c >= 0) & (c < cols)
+            r, c = r[ok], c[ok]
+            near[r[~side[r, c]], c[~side[r, c]]] = True
+    return near
+
+
+def _shore_blur(shape: tuple[int, int], rr: np.ndarray, cc: np.ndarray, est: np.ndarray, value: np.ndarray,
+                sigma: float) -> tuple[np.ndarray, np.ndarray]:
+    """At nodes (rr, cc): the Gaussian blur of ``value`` placed at the ``est`` nodes (zero
+    elsewhere) and of their indicator, as whole-grid ``gaussian_filter``s would give, computed
+    over windows around the nodes only."""
+    halo = gauss_radius(sigma)
+    G = np.zeros(len(rr))
+    W = np.zeros(len(rr))
+    er, ec, ev = rr[est], cc[est], value[est]
+    for win, core_w, core in grid_windows(shape, WINDOW_NODES, halo):
+        here = (rr >= core[0].start) & (rr < core[0].stop) & (cc >= core[1].start) & (cc < core[1].stop)
+        if not here.any():
+            continue
+        r0, c0 = win[0].start, win[1].start
+        inw = (er >= r0) & (er < win[0].stop) & (ec >= c0) & (ec < win[1].stop)
+        g = np.zeros((win[0].stop - r0, win[1].stop - c0))
+        w = np.zeros_like(g)
+        g[er[inw] - r0, ec[inw] - c0] = ev[inw]
+        w[er[inw] - r0, ec[inw] - c0] = 1.0
+        g = ndimage.gaussian_filter(g, sigma, mode="nearest")
+        w = ndimage.gaussian_filter(w, sigma, mode="nearest")
+        G[here] = g[rr[here] - r0, cc[here] - c0]
+        W[here] = w[rr[here] - r0, cc[here] - c0]
+    return G, W
+
+
 def shape_shorelines(hf: Heightfield, items: list[tuple[BaseGeometry, float, float]],
                      extent: BaseGeometry | None, slope_min: float, slope_max: float) -> int:
     """Carve water areas so the terrain meets the water surface exactly on their outline.
@@ -432,8 +480,8 @@ def shape_shorelines(hf: Heightfield, items: list[tuple[BaseGeometry, float, flo
         return int((hf.z != z0).sum())
     band, ramp, shoulder = 1.5 * r, 3.0 * r, 2.0 * r
     reach = band + max(ramp, shoulder)
-    grid_d = np.where(inside, ndimage.distance_transform_edt(inside), ndimage.distance_transform_edt(~inside)) * r
-    rr, cc = np.nonzero(grid_d <= reach + 1.5 * r)
+    # Nodes within reach + 1.5 cells of the other side of the outline (on the grid).
+    rr, cc = np.nonzero(_near_other_side(inside, (reach + 1.5 * r) / r))
     if len(rr) == 0:
         return int((hf.z != z0).sum())
     px = hf.xmin + cc * r
@@ -459,14 +507,9 @@ def shape_shorelines(hf: Heightfield, items: list[tuple[BaseGeometry, float, flo
     # Bank gradient from the original terrain just off the shore, smoothed along it.
     est = (sd > 0.5 * r) & (sd <= band + shoulder)
     graw = np.clip((zo - surf) / np.maximum(sd, 1e-6), slope_min, slope_max)
-    G = np.zeros(hf.z.shape)
-    W = np.zeros(hf.z.shape)
-    G[rr[est], cc[est]] = graw[est]
-    W[rr[est], cc[est]] = 1.0
-    G = ndimage.gaussian_filter(G, 2.0, mode="nearest")
-    W = ndimage.gaussian_filter(W, 2.0, mode="nearest")
+    Gs, Ws = _shore_blur(hf.z.shape, rr, cc, est, graw, 2.0)
     default = float(np.clip(0.15, slope_min, slope_max))
-    g = np.where(W[rr, cc] > 1e-3, G[rr, cc] / np.maximum(W[rr, cc], 1e-9), default)
+    g = np.where(Ws > 1e-3, Gs / np.maximum(Ws, 1e-9), default)
     g = np.clip(g, slope_min, slope_max)
 
     lin = surf + g * sd

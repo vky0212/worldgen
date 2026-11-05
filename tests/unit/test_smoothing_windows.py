@@ -88,3 +88,33 @@ def test_windows_give_the_whole_grid_result(monkeypatch, name):
     monkeypatch.setattr(pipeline, "refine_vegetation", vegetation)
     compile_world(region, cfg, bundle_from_fixture(load_fixture(name, region.center)), place_trees=False)
     assert calls == ["landcover", "vegetation"]
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_shore_band_and_blur_equal_whole_grid_versions(monkeypatch, seed):
+    """The shoreline helpers give what the whole-grid distance transforms and Gaussian blurs
+    they replace gave."""
+    from scipy import ndimage
+
+    from worldgen.landcover.smoothing import _near_other_side, _shore_blur
+
+    rng = np.random.default_rng(seed)
+    inside = ndimage.gaussian_filter(rng.normal(size=(150, 130)), 6.0) > 0.02
+    radius = 6.0
+    d = np.where(inside, ndimage.distance_transform_edt(inside), ndimage.distance_transform_edt(~inside))
+    assert np.array_equal(_near_other_side(inside, radius), d <= radius)
+    rr, cc = np.nonzero(d <= radius)
+    est = rng.random(len(rr)) < 0.4
+    value = rng.normal(size=len(rr))
+    G = np.zeros(inside.shape)
+    W = np.zeros(inside.shape)
+    G[rr[est], cc[est]] = value[est]
+    W[rr[est], cc[est]] = 1.0
+    G = ndimage.gaussian_filter(G, 2.0, mode="nearest")[rr, cc]
+    W = ndimage.gaussian_filter(W, 2.0, mode="nearest")[rr, cc]
+    import worldgen.landcover.smoothing as smoothing
+
+    for window in (40, 10**9):
+        monkeypatch.setattr(smoothing, "WINDOW_NODES", window)
+        g, w = _shore_blur(inside.shape, rr, cc, est, value, 2.0)
+        assert np.array_equal(g, G) and np.array_equal(w, W)
